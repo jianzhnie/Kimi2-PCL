@@ -412,12 +412,17 @@ class MoEGate(nn.Module):
         self.topk_method = config.topk_method
         self.n_group = config.n_group
         self.topk_group = config.topk_group
+        self.moe_router_enable_expert_bias = getattr(
+            config, 'moe_router_enable_expert_bias', False)
+        self.moe_router_dtype = getattr(config, 'moe_router_dtype', 'fp32')
 
         # topk selection algorithm
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
         self.weight = nn.Parameter(
             torch.empty((self.n_routed_experts, self.gating_dim)))
+        self.bias = (nn.Parameter(torch.empty((self.n_routed_experts)))
+                     if self.moe_router_enable_expert_bias else None)
         if self.topk_method == 'noaux_tc':
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((self.n_routed_experts)))
@@ -427,13 +432,27 @@ class MoEGate(nn.Module):
         import torch.nn.init as init
 
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            init.zeros_(self.bias)
 
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(hidden_states.type(torch.float32),
-                          self.weight.type(torch.float32), None)
+        if self.moe_router_dtype == 'fp32':
+            router_dtype = torch.float32
+        elif self.moe_router_dtype == 'bf16':
+            router_dtype = torch.bfloat16
+        elif self.moe_router_dtype == 'fp16':
+            router_dtype = torch.float16
+        else:
+            raise ValueError(
+                f'Unsupported moe_router_dtype: {self.moe_router_dtype}')
+        logits = F.linear(
+            hidden_states.to(router_dtype),
+            self.weight.to(router_dtype),
+            self.bias.to(router_dtype) if self.bias is not None else None,
+        ).to(torch.float32)
         if self.scoring_func == 'sigmoid':
             scores = logits.sigmoid()
         else:
@@ -443,7 +462,6 @@ class MoEGate(nn.Module):
 
         ### select top-k experts
         if self.topk_method == 'noaux_tc':
-            assert not self.training
             scores_for_choice = scores.view(
                 bsz * seq_len, -1) + self.e_score_correction_bias.unsqueeze(0)
             group_scores = (scores_for_choice.view(
@@ -491,10 +509,16 @@ class DeepseekV3MoE(nn.Module):
         self.num_experts_per_tok = config.num_experts_per_tok
 
         if hasattr(config, 'ep_size') and config.ep_size > 1:
-            assert config.ep_size == dist.get_world_size()
             self.ep_size = config.ep_size
             self.experts_per_rank = config.n_routed_experts // config.ep_size
-            self.ep_rank = dist.get_rank()
+            if dist.is_available() and dist.is_initialized():
+                if config.ep_size != dist.get_world_size():
+                    raise ValueError(
+                        f'config.ep_size ({config.ep_size}) must equal torch.distributed world size ({dist.get_world_size()})'
+                    )
+                self.ep_rank = dist.get_rank()
+            else:
+                self.ep_rank = 0
             self.experts = nn.ModuleList([
                 (DeepseekV3MLP(config,
                                intermediate_size=config.moe_intermediate_size)
@@ -523,12 +547,40 @@ class DeepseekV3MoE(nn.Module):
         topk_idx, topk_weight = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         flat_topk_idx = topk_idx.view(-1)
-        if not self.training:
-            y = self.moe_infer(hidden_states, topk_idx,
-                               topk_weight).view(*orig_shape)
+        if self.training:
+            if self.ep_size != 1:
+                raise NotImplementedError(
+                    'DeepseekV3MoE training forward does not support ep_size > 1'
+                )
+            y = self.moe_forward(hidden_states, topk_idx,
+                                 topk_weight).view(*orig_shape)
+        else:
+            if self.ep_size > 1 and not (dist.is_available()
+                                         and dist.is_initialized()):
+                y = self.moe_forward(hidden_states, topk_idx,
+                                     topk_weight).view(*orig_shape)
+            else:
+                y = self.moe_infer(hidden_states, topk_idx,
+                                   topk_weight).view(*orig_shape)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(identity)
         return y
+
+    def moe_forward(self, x, topk_ids, topk_weight):
+        out = x.new_zeros(x.shape)
+        for expert_id, expert in enumerate(self.experts):
+            if expert is None:
+                continue
+            mask = (topk_ids == expert_id)
+            if not mask.any():
+                continue
+            token_idx, which = mask.nonzero(as_tuple=True)
+            expert_in = x[token_idx]
+            expert_out = expert(expert_in)
+            expert_w = topk_weight[token_idx, which].to(expert_out.dtype)
+            out[token_idx] = out[token_idx] + expert_out * expert_w.unsqueeze(
+                -1)
+        return out
 
     @torch.no_grad()
     def moe_infer(self, x, topk_ids, topk_weight):
@@ -635,6 +687,7 @@ class DeepseekV3Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
 
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
@@ -668,7 +721,7 @@ class DeepseekV3Attention(nn.Module):
         self.kv_a_layernorm = DeepseekV3RMSNorm(config.kv_lora_rank)
         self.kv_b_proj = nn.Linear(
             config.kv_lora_rank,
-            self.num_heads *
+            self.num_kv_heads *
             (self.q_head_dim - self.qk_rope_head_dim + self.v_head_dim),
             bias=False,
         )
@@ -757,7 +810,11 @@ class DeepseekV3Attention(nn.Module):
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            if self.config.qk_layernorm:
+                q = self.q_b_proj(
+                    self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            else:
+                q = self.q_b_proj(self.q_a_proj(hidden_states))
         q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -766,9 +823,13 @@ class DeepseekV3Attention(nn.Module):
         compressed_kv, k_pe = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
-        kv = (self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
-            bsz, q_len, self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2))
+        if self.config.qk_layernorm:
+            kv_core = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
+        else:
+            kv_core = self.kv_b_proj(compressed_kv)
+        kv = kv_core.view(
+            bsz, q_len, self.num_kv_heads,
+            self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
 
         k_nope, value_states = torch.split(
             kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -789,11 +850,14 @@ class DeepseekV3Attention(nn.Module):
                                       self.q_head_dim)
         query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
         query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
-
-        key_states = k_pe.new_empty(bsz, self.num_heads, q_len,
-                                    self.q_head_dim)
-        key_states[:, :, :, :self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
+        k_pe = k_pe.expand(bsz, self.num_kv_heads, q_len, self.qk_rope_head_dim)
+        key_states_kv = k_pe.new_empty(bsz, self.num_kv_heads, q_len,
+                                       self.q_head_dim)
+        key_states_kv[:, :, :, :self.qk_nope_head_dim] = k_nope
+        key_states_kv[:, :, :, self.qk_nope_head_dim:] = k_pe
+        n_rep = self.num_heads // self.num_kv_heads
+        key_states = repeat_kv(key_states_kv, n_rep)
+        value_states = repeat_kv(value_states, n_rep)
         if past_key_value is not None:
             cache_kwargs = {'sin': sin, 'cos': cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(
@@ -887,7 +951,11 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            if self.config.qk_layernorm:
+                q = self.q_b_proj(
+                    self.q_a_layernorm(self.q_a_proj(hidden_states)))
+            else:
+                q = self.q_b_proj(self.q_a_proj(hidden_states))
         q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -899,9 +967,13 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         compressed_kv, k_pe = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
-        kv = (self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
-            bsz, q_len, self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2))
+        if self.config.qk_layernorm:
+            kv_core = self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
+        else:
+            kv_core = self.kv_b_proj(compressed_kv)
+        kv = kv_core.view(
+            bsz, q_len, self.num_kv_heads,
+            self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
 
         k_nope, value_states = torch.split(
             kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
@@ -919,11 +991,14 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                                       self.q_head_dim)
         query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
         query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
-
-        key_states = k_pe.new_empty(bsz, self.num_heads, q_len,
-                                    self.q_head_dim)
-        key_states[:, :, :, :self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
+        k_pe = k_pe.expand(bsz, self.num_kv_heads, q_len, self.qk_rope_head_dim)
+        key_states_kv = k_pe.new_empty(bsz, self.num_kv_heads, q_len,
+                                       self.q_head_dim)
+        key_states_kv[:, :, :, :self.qk_nope_head_dim] = k_nope
+        key_states_kv[:, :, :, self.qk_nope_head_dim:] = k_pe
+        n_rep = self.num_heads // self.num_kv_heads
+        key_states = repeat_kv(key_states_kv, n_rep)
+        value_states = repeat_kv(value_states, n_rep)
 
         if self.q_head_dim != self.v_head_dim:
             value_states = F.pad(value_states,
@@ -1025,7 +1100,8 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in DeepseekV3FlashAttention2 __init__.
             causal = self.is_causal and query_length != 1
 
-        # Contains at least one padding token in the sequence
+        if self.config.mla_fa_without_pad:
+            attention_mask = None
         if attention_mask is not None:
             batch_size = query_states.shape[0]
             (
