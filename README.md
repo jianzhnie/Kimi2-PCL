@@ -1,10 +1,10 @@
 # Kimi2-PCL
 
-`Kimi2-PCL` 是一个基于 kimi2 模型进行修改的模型架构仓库：
+`Kimi2-PCL` 是一个基于 kimi2 模型进行修改的模型架构仓库, 模型定义代码参考 Huggingface 模型[Kimi-K2-Base](https://huggingface.co/moonshotai/Kimi-K2-Base), 权重转换脚本参考 Mindspeed-LLM 脚本[DeppSeek](https://gitcode.com/Ascend/MindSpeed-LLM/blob/2.2.0/examples/mcore/deepseek3/convert_ckpt_deepseek3.py)：
 
 - [models](./models) 提供模型的定义与配置（Hugging Face 风格的 config / generation config + Python 实现）。
 - [utils](./utils) 提供权重格式转换脚本（HF safetensors ↔ Megatron-Core/MCore checkpoint）。
-- [scripts](./scripts) 提供预训练启动脚本示例（torchrun + Megatron/MindSpeed 生态）。
+- [scripts](./scripts) 提供预训练启动脚本（torchrun + Megatron/MindSpeed 生态）。
 
 ## 目录结构
 
@@ -15,7 +15,6 @@ Kimi2-PCL/
     generation_config.json
     configuration_model.py
     modeling_deepseek.py
-    modeling_deepseek copy.py
   utils/
     convert_ckpt_hf2mcore.py
     convert_ckpt_mcore2hf.py
@@ -28,8 +27,7 @@ Kimi2-PCL/
 
 - `config.json` / `generation_config.json`：Hugging Face 模型配置与 generation 配置。
 - `configuration_model.py`：定义了 `DeepseekV3Config`（`model_type = "kimi_k2"`）。
-- `modeling_deepseek.py`：一个轻量版的 PyTorch 实现（包含 RMSNorm / RoPE / MoE MLP 等核心结构）。
-- `modeling_deepseek copy.py`：更完整的 DeepSeek HF 实现代码副本（文件名包含空格，默认无法作为 Python 模块直接 import）。
+- `modeling_deepseek.py`：完整的 DeepSeek HF 实现代码（包含 RMSNorm / RoPE / MoE MLP 等核心结构）。
 
 注意：`config.json` 中的 `auto_map` 指向 `configuration_deepseek.*` / `modeling_deepseek.*` 的类名与文件名。若你希望直接通过 `transformers.AutoModel*` + `trust_remote_code=True` 加载本地模型目录，需要保证 `auto_map` 指向的文件名与类名在 `models/` 下可被正确解析（当前仓库的文件命名与类名可能需要对齐）。
 
