@@ -1,24 +1,13 @@
 #!/usr/bin/env bash
-set -euo pipefail
+source ~/.bashrc
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-ASCEND_ENV="${ASCEND_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
-if [[ -f "${ASCEND_ENV}" ]]; then
-  source "${ASCEND_ENV}"
-fi
+REPO_ROOT="/llm_workspace_1P/robin/Kimi2-PCL"
+LOAD_DIR="/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2-base-1T_4k_k8s_mfu33_L32_1024_Arc_Opt2_no_recompute_6144_dies/aea8dbbd-0011-4170-8176-e6c7627132ff"
+SAVE_DIR="/llm_workspace_1P/robin/hfhub/kimi2-mcore2hf"
 
-export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
-
-LOAD_DIR="${1:-${CKPT_LOAD_DIR:-}}"
-SAVE_DIR="${2:-${HF_SAVE_DIR:-}}"
-
-if [[ -z "${LOAD_DIR}" || -z "${SAVE_DIR}" ]]; then
-  echo "Usage: $(basename "$0") <mcore_ckpt_dir> <hf_save_dir>" >&2
-  echo "  or: CKPT_LOAD_DIR=... HF_SAVE_DIR=... $(basename "$0")" >&2
-  exit 2
-fi
 
 TP="${TP:-2}"
 PP="${PP:-8}"
@@ -55,7 +44,7 @@ if [[ -n "${VPP_STAGE:-}" ]]; then
   EXTRA_ARGS+=(--vpp-stage "${VPP_STAGE}")
 fi
 
-python -u "${REPO_ROOT}/utils/convert_ckpt_mcore2hf.py" \
+python "${REPO_ROOT}/utils/convert_ckpt_mcore2hf.py" \
   --load-dir "${LOAD_DIR}" \
   --save-dir "${SAVE_DIR}" \
   --num-layers "${NUM_LAYERS}" \
