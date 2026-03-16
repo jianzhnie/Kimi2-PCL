@@ -5,12 +5,12 @@ PP=8
 EP=64
 CP=1
 CP_TYPE='ulysses_cp_algo'
-NUM_LAYERS=48
+NUM_LAYERS=32
 SEQ_LEN=4096
 MBS=1
-GBS=65536
-TRAIN_ITERS=30000
-SAVE_ITERS=3
+GBS=98304
+TRAIN_ITERS=20000
+SAVE_ITERS=100
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $LOCAL_WORLD_SIZE \
@@ -32,28 +32,30 @@ MLA_ARGS="
 "
 
 MOE_ARGS="
+    --moe-shared-expert-overlap \
     --moe-grouped-gemm \
     --moe-token-dispatcher-type alltoall \
     --use-fused-moe-token-permute-and-unpermute \
     --moe-permutation-async-comm \
-    --first-k-dense-replace 3 \
+    --first-k-dense-replace 2 \
     --moe-layer-freq 1 \
     --n-shared-experts 1 \
     --num-experts 128 \
     --moe-router-topk 2 \
-    --moe-ffn-hidden-size 8192 \
+    --moe-ffn-hidden-size 12288 \
     --moe-router-load-balancing-type aux_loss \
     --moe-router-num-groups 8 \
     --moe-router-group-topk 2 \
     --moe-router-topk-scaling-factor 2.827 \
-    --moe-aux-loss-coeff 0.001 \
+    --moe-aux-loss-coeff 0.01 \
+    --moe-z-loss-coeff 0.001 \
     --seq-aux \
     --norm-topk-prob \
     --moe-router-score-function sigmoid \
     --moe-router-enable-expert-bias \
     --moe-router-dtype fp32 \
-    --moe-shared-expert-overlap
 "
+
 BALANCE_ARGS="
     --balanced-moe-experts \
 "
@@ -67,8 +69,8 @@ SWA_ARGS="
 GQA_ARGS="
     --kv-channels 128 \
     --qk-layernorm \
-    --num-attention-heads 112 \
-    --num-query-groups 4 \
+    --num-attention-heads 64 \
+    --num-query-groups 2 \
     --group-query-attention \
 "
 
@@ -95,8 +97,9 @@ GPT_ARGS="
     --swap-optimizer \
     --recompute-granularity full \
     --recompute-method block \
-    --recompute-num-layers 4 \
-    --noop-layers 47 \
+    --recompute-num-layers 1 \
+    --recompute-activation-function \
+    --moe-zero-memory level0 \
     --expert-tensor-parallel-size 1 \
     --no-shared-storage \
     --use-distributed-optimizer \
@@ -136,8 +139,8 @@ GPT_ARGS="
     --swiglu \
     --no-masked-softmax-fusion \
     --attention-softmax-in-fp32 \
-    --min-lr 1.0e-7 \
-    --weight-decay 1e-2 \
+    --min-lr 1.0e-5 \
+    --weight-decay 1e-1 \
     --lr-warmup-iters 2000 \
     --clip-grad 1.0 \
     --adam-beta1 0.9 \
@@ -147,18 +150,14 @@ GPT_ARGS="
     --padded-vocab-size 163840 \
     --rotary-base 50000 \
     --norm-epsilon 1e-6 \
-    --no-load-optim \
-    --no-load-rng \
     --seed 2233 \
     --bf16 \
     --distributed-timeout-minutes 120 \
 "
 
-
 DATA_ARGS="
     --data-path $DATA_PREFIXES \
     --data-cache-path ${DATA_DIR}/cache3 \
-    --num-dataset-builder-threads 4 \
     --split 100,0,0 \
 "
 
@@ -192,6 +191,7 @@ torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
     $MOE_ARGS \
     $OUTPUT_ARGS \
     $DATA_ARGS \
+    --load ${CKPT_LOAD_DIR} \
     --save ${CKPT_SAVE_DIR} \
     --distributed-backend nccl \
     2>&1 | tee ${TRAIN_LOG_PATH}
