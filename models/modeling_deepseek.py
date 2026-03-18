@@ -784,10 +784,13 @@ class DeepseekV3Attention(nn.Module):
 
         query_states = self.q_proj(hidden_states).view(
             bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len,
+                                                     self.num_key_value_heads,
+                                                     self.head_dim).transpose(
+                                                         1, 2)
         value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            bsz, q_len, self.num_key_value_heads,
+            self.head_dim).transpose(1, 2)
 
         if self.q_layernorm is not None:
             query_states = self.q_layernorm(query_states)
@@ -877,10 +880,13 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
 
         query_states = self.q_proj(hidden_states).view(
             bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len,
+                                                     self.num_key_value_heads,
+                                                     self.head_dim).transpose(
+                                                         1, 2)
         value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            bsz, q_len, self.num_key_value_heads,
+            self.head_dim).transpose(1, 2)
 
         if self.q_layernorm is not None:
             query_states = self.q_layernorm(query_states)
@@ -939,8 +945,8 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             softmax_scale=self.softmax_scale,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len,
-                                          self.num_heads * self.head_dim).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads *
+                                          self.head_dim).contiguous()
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
