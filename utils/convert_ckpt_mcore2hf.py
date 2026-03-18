@@ -147,8 +147,8 @@ class MgCkptConvert:
         self._build_rank_dir_map()
         if self.verbose:
             logger.info('Rank dir map size=%d', len(self._rank_dir_map))
-            sample_keys = sorted(self._rank_dir_map.keys())[:min(
-                12, len(self._rank_dir_map))]
+            sample_keys = sorted(
+                self._rank_dir_map.keys())[:min(12, len(self._rank_dir_map))]
             for k in sample_keys:
                 eps = self._rank_dir_map[k]
                 logger.info('Rank dir map sample tp=%d pp=%d: ep_count=%d',
@@ -347,8 +347,10 @@ class MgCkptConvert:
             candidates.append(
                 _mp_prefix(tp_rank, pp_rank, ep_rank, self.tp_size,
                            self.pp_size, self.ep_size))
-            candidates.append(f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_rank:03}')
-            candidates.append(f'mp_rank_{tp_rank:02}_{ep_rank:03}_{pp_rank:03}')
+            candidates.append(
+                f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_rank:03}')
+            candidates.append(
+                f'mp_rank_{tp_rank:02}_{ep_rank:03}_{pp_rank:03}')
             candidates.append(f'mp_rank_{tp_rank:02}_{ep_rank:03}')
         else:
             candidates.append(f'mp_rank_{tp_rank:02}_{pp_rank:03}_000')
@@ -370,22 +372,110 @@ class MgCkptConvert:
         if self.verbose:
             logger.info('Loading models for stage: pp_rank=%d vpp_rank=%s',
                         pp_rank, vpp_rank)
+
         for tp_rank in range(self.tp_size):
             eps = self._rank_dir_map.get((tp_rank, pp_rank), [])
-            base_ep = eps[0] if eps else None
-            if base_ep is not None:
-                state = self._load_rank_state(tp_rank, pp_rank, base_ep,
-                                              vpp_rank)
-                models[(tp_rank, base_ep)] = state.copy()
-                models[(tp_rank, 0)] = state
-            for ep_rank in eps:
-                if (tp_rank, ep_rank) not in models:
-                    models[(tp_rank, ep_rank)] = self._load_rank_state(
-                        tp_rank, pp_rank, ep_rank, vpp_rank)
+            if not eps:
+                continue
+            base_ep = eps[0]
+            state = self._load_rank_state(tp_rank, pp_rank, base_ep, vpp_rank)
+            models[(tp_rank, base_ep)] = state
+            models[(tp_rank, 0)] = state
+
         if self.verbose:
-            logger.info('Loaded models for stage: pp_rank=%d vpp_rank=%s keys=%d',
-                        pp_rank, vpp_rank, len(models))
+            logger.info(
+                'Loaded models for stage: pp_rank=%d vpp_rank=%s keys=%d',
+                pp_rank, vpp_rank, len(models))
         return models
+
+    def _tp_ranks_for_ep(self, pp_rank: int, ep_rank: int) -> list[int]:
+        tps: list[int] = []
+        for tp_rank in range(self.tp_size):
+            eps = self._rank_dir_map.get((tp_rank, pp_rank), [])
+            if ep_rank in eps:
+                tps.append(tp_rank)
+        return tps
+
+    def _load_sparse_ep_state(self, tp_rank: int, pp_rank: int, ep_rank: int,
+                              vpp_rank: int | None) -> dict[str, torch.Tensor]:
+        state = self._load_rank_state(tp_rank, pp_rank, ep_rank, vpp_rank)
+        keep: dict[str, torch.Tensor] = {}
+        for k, v in state.items():
+            if '.mlp.experts.' in k or '.mlp.router.' in k:
+                keep[k] = v
+        return keep
+
+    def _reconstruct_router_lazy(self,
+                                 base_models: dict[tuple[int, int],
+                                                   dict[str, torch.Tensor]],
+                                 pp_rank: int,
+                                 vpp_rank: int | None,
+                                 key: str) -> torch.Tensor:
+        for tp_rank in range(self.tp_size):
+            d = base_models.get((tp_rank, 0))
+            if d is None:
+                continue
+            t = d.get(key)
+            if t is not None and t.shape[0] == self.num_experts:
+                return t.clone()
+
+        sample = None
+        for tp_rank in range(self.tp_size):
+            d = base_models.get((tp_rank, 0))
+            if d is None:
+                continue
+            if key in d:
+                sample = d[key]
+                break
+        if sample is None:
+            tps = self._tp_ranks_for_ep(pp_rank, 0)
+            if not tps:
+                raise ValueError(f'找不到 ep=0 的权重: pp={pp_rank} key={key}')
+            d0 = self._load_sparse_ep_state(tps[0], pp_rank, 0, vpp_rank)
+            if key not in d0:
+                raise ValueError(f'找不到 router 权重: pp={pp_rank} key={key}')
+            sample = d0[key]
+            del d0
+
+        out = torch.empty((self.num_experts, ) + sample.shape[1:],
+                          dtype=sample.dtype)
+        num_local = self.num_experts // self.ep_size
+
+        import gc
+
+        for ep in range(self.ep_size):
+            owners = self._tp_ranks_for_ep(pp_rank, ep)
+            if not owners:
+                raise ValueError(
+                    f'找不到 ep={ep} 的权重目录: pp={pp_rank} key={key}')
+            if len(owners) != 1:
+                raise ValueError(
+                    f'router 不支持跨 TP 分片重建: pp={pp_rank} ep={ep} owners={owners}'
+                )
+            tp = owners[0]
+            d = self._load_sparse_ep_state(tp, pp_rank, ep, vpp_rank)
+            if key in d:
+                part = d[key]
+            else:
+                d_full = self._load_rank_state(tp, pp_rank, ep, vpp_rank)
+                if key not in d_full:
+                    raise ValueError(
+                        f'找不到 router 权重: pp={pp_rank} ep={ep} key={key}')
+                part = d_full[key]
+                del d_full
+            if part.shape[0] == self.num_experts:
+                out = part.clone()
+                del d
+                gc.collect()
+                break
+            if part.shape[0] != num_local:
+                raise ValueError(
+                    f'router 分片形状异常: pp={pp_rank} ep={ep} key={key} shape={part.shape}'
+                )
+            out[ep * num_local:(ep + 1) * num_local] = part
+            del d
+            gc.collect()
+        return out
 
     def _gather_tp_row(self,
                        models: dict[tuple[int, int], dict[str, torch.Tensor]],
@@ -574,26 +664,44 @@ class MgCkptConvert:
     def _reconstruct_router(self, models: dict[tuple[int, int],
                                                dict[str, torch.Tensor]],
                             key: str) -> torch.Tensor:
-        t = models[(0, 0)].get(key)
+        t = models.get((0, 0), {}).get(key)
         if t is not None and t.shape[0] == self.num_experts:
             return models[(0, 0)].pop(key).clone()
 
-        if t is not None and t.shape[0] != self.num_experts:
-            out = torch.empty((self.num_experts, ) + t.shape[1:],
-                              dtype=t.dtype)
-        else:
-            sample = models[(0, 0)].pop(key)
-            out = torch.empty((self.num_experts, ) + sample.shape[1:],
-                              dtype=sample.dtype)
-            models[(0, 0)][key] = sample
+        for _, v in models.items():
+            if key in v:
+                if v[key].shape[0] == self.num_experts:
+                    return v.pop(key).clone()
+
+        sample = None
+        for _, v in models.items():
+            if key in v:
+                sample = v[key]
+                break
+
+        if sample is None:
+            raise ValueError(
+                f'Router weight {key} not found in any loaded model')
+
+        out = torch.empty((self.num_experts, ) + sample.shape[1:],
+                          dtype=sample.dtype)
 
         num_local = self.num_experts // self.ep_size
         for ep_rank in range(self.ep_size):
-            part = models[(0, ep_rank)].pop(key)
-            if part.shape[0] == num_local:
-                out[ep_rank * num_local:(ep_rank + 1) * num_local] = part
-            else:
-                raise ValueError(f'{key} 分片形状异常: {part.shape}')
+            target_tp = -1
+            for tp in range(self.tp_size):
+                if (tp, ep_rank) in models and key in models[(tp, ep_rank)]:
+                    target_tp = tp
+                    break
+
+            if target_tp != -1:
+                part = models[(target_tp, ep_rank)].pop(key)
+                if part.shape[0] == num_local:
+                    out[ep_rank * num_local:(ep_rank + 1) * num_local] = part
+                else:
+                    raise ValueError(
+                        f'{key} rank {ep_rank} shape mismatch: {part.shape}')
+
         return out
 
     def _set_layer_mlp(self, hf: dict[str, torch.Tensor],
@@ -609,9 +717,14 @@ class MgCkptConvert:
             hf[f'model.layers.{hf_layer}.mlp.down_proj.weight'] = fc2.clone()
             return
 
-        router = self._reconstruct_router(models, f'{prefix}.router.weight')
-        router_bias = self._reconstruct_router(models,
-                                               f'{prefix}.router.expert_bias')
+        pp_rank = self.layer2loc[hf_layer][0] if self.vpp_size is None else self.layer2loc_vpp[
+            hf_layer][0]
+        vpp_rank = None if self.vpp_size is None else self.layer2loc_vpp[
+            hf_layer][1]
+        router = self._reconstruct_router_lazy(models, pp_rank, vpp_rank,
+                                               f'{prefix}.router.weight')
+        router_bias = self._reconstruct_router_lazy(
+            models, pp_rank, vpp_rank, f'{prefix}.router.expert_bias')
 
         hf[f'model.layers.{hf_layer}.mlp.gate.weight'] = router.clone()
         hf[f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'] = router_bias.clone(
@@ -629,47 +742,38 @@ class MgCkptConvert:
         hf[f'model.layers.{hf_layer}.mlp.shared_experts.down_proj.weight'] = shared_fc2.clone(
         )
 
+        import gc
+
         if self.moe_grouped_gemm:
             w1_key = f'{prefix}.experts.weight1'
             w2_key = f'{prefix}.experts.weight2'
             if self.moe_tp_extend_ep:
-                shards_w1: list[torch.Tensor] = []
-                shards_w2: list[torch.Tensor] = []
-                for ep_rank in range(self.ep_size):
-                    for tp_rank in range(self.tp_size):
-                        shards_w1.append(models[(tp_rank,
-                                                 ep_rank)].pop(w1_key))
-                        shards_w2.append(models[(tp_rank,
-                                                 ep_rank)].pop(w2_key))
-                full_w1 = torch.cat(shards_w1, dim=1)
-                full_w2 = torch.cat(shards_w2, dim=0)
-                w1_3d = full_w1.view(self.hidden_size, self.num_experts,
-                                     -1).permute(1, 0, 2).contiguous()
-                w2_3d = full_w2.view(self.num_experts, -1, self.hidden_size)
-                for expert in range(self.num_experts):
-                    fc1_t = w1_3d[expert]
-                    fc1 = fc1_t.t()
-                    gate, up = torch.chunk(fc1, 2, dim=0)
-                    down = w2_3d[expert].t()
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
-                    )
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
-                    )
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down.clone(
-                    )
+                raise ValueError('moe_tp_extend_ep 暂不支持稀疏专家目录格式')
             else:
                 num_local = self.num_experts // self.ep_size
                 for ep_rank in range(self.ep_size):
-                    parts_w1 = [
-                        models[(tp_rank, ep_rank)].pop(w1_key)
-                        for tp_rank in range(self.tp_size)
-                    ]
-                    parts_w2 = [
-                        models[(tp_rank, ep_rank)].pop(w2_key)
-                        for tp_rank in range(self.tp_size)
-                    ]
-                    local_w1 = torch.cat(parts_w1, dim=1)
-                    local_w2 = torch.cat(parts_w2, dim=0)
+                    owners = self._tp_ranks_for_ep(pp_rank, ep_rank)
+                    if not owners:
+                        raise ValueError(
+                            f'找不到 ep={ep_rank} 的权重目录: pp={pp_rank}')
+                    shards_w1: list[torch.Tensor] = []
+                    shards_w2: list[torch.Tensor] = []
+                    for tp_rank in owners:
+                        d = self._load_sparse_ep_state(tp_rank, pp_rank,
+                                                       ep_rank, vpp_rank)
+                        if w1_key not in d or w2_key not in d:
+                            raise ValueError(
+                                f'找不到 moe 权重: pp={pp_rank} ep={ep_rank} tp={tp_rank}'
+                            )
+                        shards_w1.append(d[w1_key])
+                        shards_w2.append(d[w2_key])
+                        del d
+                        gc.collect()
+
+                    local_w1 = shards_w1[0] if len(
+                        shards_w1) == 1 else torch.cat(shards_w1, dim=1)
+                    local_w2 = shards_w2[0] if len(
+                        shards_w2) == 1 else torch.cat(shards_w2, dim=0)
                     w1_3d = local_w1.view(self.hidden_size, num_local,
                                           -1).permute(1, 0, 2).contiguous()
                     w2_3d = local_w2.view(num_local, -1, self.hidden_size)
@@ -687,24 +791,52 @@ class MgCkptConvert:
         else:
             num_local = self.num_experts // self.ep_size
             for ep_rank in range(self.ep_size):
+                owners = self._tp_ranks_for_ep(pp_rank, ep_rank)
+                if not owners:
+                    raise ValueError(
+                        f'找不到 ep={ep_rank} 的权重目录: pp={pp_rank}')
+                local_states: dict[int, dict[str, torch.Tensor]] = {}
+                for tp_rank in owners:
+                    local_states[tp_rank] = self._load_sparse_ep_state(
+                        tp_rank, pp_rank, ep_rank, vpp_rank)
+
                 for li in range(num_local):
                     expert = ep_rank * num_local + li
                     local_prefix = f'{prefix}.experts.local_experts.{li}'
-                    fc1 = self._gather_tp_row(
-                        models,
-                        f'{local_prefix}.linear_fc1.weight',
-                        ep_rank=ep_rank)
-                    fc2 = self._gather_tp_col(
-                        models,
-                        f'{local_prefix}.linear_fc2.weight',
-                        ep_rank=ep_rank)
-                    gate, up = torch.chunk(fc1, 2, dim=0)
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
-                    )
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
-                    )
-                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2.clone(
-                    )
+                    fc1_key = f'{local_prefix}.linear_fc1.weight'
+                    fc2_key = f'{local_prefix}.linear_fc2.weight'
+
+                    if len(owners) == 1:
+                        tp_rank = owners[0]
+                        fc1 = local_states[tp_rank].pop(fc1_key)
+                        fc2 = local_states[tp_rank].pop(fc2_key)
+                        gate, up = torch.chunk(fc1, 2, dim=0)
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
+                        )
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
+                        )
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2.clone(
+                        )
+                    else:
+                        fc1_parts = [
+                            local_states[tp].pop(fc1_key) for tp in owners
+                        ]
+                        fc2_parts = [
+                            local_states[tp].pop(fc2_key) for tp in owners
+                        ]
+                        fc1 = torch.cat(fc1_parts, dim=0)
+                        fc2 = torch.cat(fc2_parts, dim=1)
+                        gate, up = torch.chunk(fc1, 2, dim=0)
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
+                        )
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
+                        )
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2.clone(
+                        )
+
+                for _, st in local_states.items():
+                    del st
+                gc.collect()
 
     def _save_shard(self, tensors: dict[str, torch.Tensor], shard_idx: int,
                     total_shards: int) -> None:
@@ -712,14 +844,20 @@ class MgCkptConvert:
         path = os.path.join(self.hf_save_dir, name)
         for k in tensors.keys():
             self.weight_map[k] = name
-        safetensors.torch.save_file(tensors, path, metadata={'format': 'pt'})
+        packed: dict[str, torch.Tensor] = {}
+        for k, v in tensors.items():
+            if not v.is_contiguous():
+                packed[k] = v.contiguous()
+            else:
+                packed[k] = v
+        safetensors.torch.save_file(packed, path, metadata={'format': 'pt'})
         if self.verbose:
             logger.info('Saved shard %d/%d: %s (tensors=%d)', shard_idx,
                         total_shards, path, len(tensors))
 
     def run(self) -> None:
         total_shards = self.num_real_layers + 2
-        shard_idx = 1
+
         if self.verbose:
             logger.info(
                 'Start converting: layers=%d real_layers=%d tp=%d pp=%d ep=%d vpp=%s dualpipe=%s save_dir=%s',
@@ -727,70 +865,91 @@ class MgCkptConvert:
                 self.pp_size, self.ep_size, self.vpp_size, self.dualpipe,
                 self.hf_save_dir)
 
-        if self.vpp_size is None:
-            models0 = self._load_models_for_stage(pp_rank=0, vpp_rank=None)
-            base_tensors: dict[str, torch.Tensor] = {}
-            self._set_preprocess(base_tensors, models0)
-            self._save_shard(base_tensors, shard_idx, total_shards)
-            shard_idx += 1
+        import gc
 
-            for hf_layer in range(self.num_real_layers):
-                pp_rank, local_idx = self.layer2loc[hf_layer]
-                if self.verbose:
-                    logger.info('Converting layer %d/%d: pp_rank=%d local_idx=%d',
-                                hf_layer, self.num_real_layers - 1, pp_rank,
-                                local_idx)
+        if self.vpp_size is None:
+            for pp_rank in range(self.pp_size):
                 models = self._load_models_for_stage(pp_rank=pp_rank,
                                                      vpp_rank=None)
-                layer_tensors: dict[str, torch.Tensor] = {}
-                self._set_layer_norm(layer_tensors, models, hf_layer,
-                                     local_idx)
-                self._set_layer_attn(layer_tensors, models, hf_layer,
-                                     local_idx)
-                self._set_layer_mlp(layer_tensors, models, hf_layer, local_idx)
-                self._save_shard(layer_tensors, shard_idx, total_shards)
-                shard_idx += 1
 
-            models_last = self._load_models_for_stage(pp_rank=self.pp_size - 1,
-                                                      vpp_rank=None)
-            tail_tensors: dict[str, torch.Tensor] = {}
-            self._set_postprocess(tail_tensors, models_last)
-            self._save_shard(tail_tensors, shard_idx, total_shards)
+                if pp_rank == 0:
+                    base_tensors: dict[str, torch.Tensor] = {}
+                    self._set_preprocess(base_tensors, models)
+                    self._save_shard(base_tensors, 1, total_shards)
+
+                layers = self.pprank_layer_idxs[pp_rank]
+                for hf_layer in layers:
+                    local_idx = self.layer2loc[hf_layer][1]
+                    if self.verbose:
+                        logger.info(
+                            'Converting layer %d/%d: pp_rank=%d local_idx=%d',
+                            hf_layer, self.num_real_layers - 1, pp_rank,
+                            local_idx)
+
+                    layer_tensors: dict[str, torch.Tensor] = {}
+                    self._set_layer_norm(layer_tensors, models, hf_layer,
+                                         local_idx)
+                    self._set_layer_attn(layer_tensors, models, hf_layer,
+                                         local_idx)
+                    self._set_layer_mlp(layer_tensors, models, hf_layer,
+                                        local_idx)
+                    self._save_shard(layer_tensors, hf_layer + 2, total_shards)
+
+                if pp_rank == self.pp_size - 1:
+                    tail_tensors: dict[str, torch.Tensor] = {}
+                    self._set_postprocess(tail_tensors, models)
+                    self._save_shard(tail_tensors, total_shards, total_shards)
+
+                del models
+                gc.collect()
+
         else:
-            models00 = self._load_models_for_stage(pp_rank=0, vpp_rank=0)
-            base_tensors: dict[str, torch.Tensor] = {}
-            self._set_preprocess(base_tensors, models00)
-            self._save_shard(base_tensors, shard_idx, total_shards)
-            shard_idx += 1
+            for pp_rank in range(self.pp_size):
+                for vpp_rank in range(self.vpp_size):
+                    models = self._load_models_for_stage(pp_rank=pp_rank,
+                                                         vpp_rank=vpp_rank)
 
-            for hf_layer in range(self.num_real_layers):
-                pp_rank, vpp_rank, local_idx = self.layer2loc_vpp[hf_layer]
-                if self.verbose:
-                    logger.info(
-                        'Converting layer %d/%d: pp_rank=%d vpp_rank=%d local_idx=%d',
-                        hf_layer, self.num_real_layers - 1, pp_rank, vpp_rank,
-                        local_idx)
-                models = self._load_models_for_stage(pp_rank=pp_rank,
-                                                     vpp_rank=vpp_rank)
-                layer_tensors: dict[str, torch.Tensor] = {}
-                self._set_layer_norm(layer_tensors, models, hf_layer,
-                                     local_idx)
-                self._set_layer_attn(layer_tensors, models, hf_layer,
-                                     local_idx)
-                self._set_layer_mlp(layer_tensors, models, hf_layer, local_idx)
-                self._save_shard(layer_tensors, shard_idx, total_shards)
-                shard_idx += 1
+                    if pp_rank == 0 and vpp_rank == 0:
+                        base_tensors: dict[str, torch.Tensor] = {}
+                        self._set_preprocess(base_tensors, models)
+                        self._save_shard(base_tensors, 1, total_shards)
 
-            if self.dualpipe:
-                models01 = self._load_models_for_stage(pp_rank=0, vpp_rank=1)
-                tail_tensors: dict[str, torch.Tensor] = {}
-                self._set_postprocess(tail_tensors, models01)
-            else:
-                models_last = self._load_models_for_stage(
-                    pp_rank=self.pp_size - 1, vpp_rank=self.vpp_size - 1)
-                tail_tensors = {}
-                self._set_postprocess(tail_tensors, models_last)
-            self._save_shard(tail_tensors, shard_idx, total_shards)
+                    if pp_rank in self.vpprank_layer_idxs and vpp_rank in self.vpprank_layer_idxs[
+                            pp_rank]:
+                        layers = self.vpprank_layer_idxs[pp_rank][vpp_rank]
+                        for hf_layer in layers:
+                            local_idx = self.layer2loc_vpp[hf_layer][2]
+                            if self.verbose:
+                                logger.info(
+                                    'Converting layer %d/%d: pp_rank=%d vpp_rank=%d local_idx=%d',
+                                    hf_layer, self.num_real_layers - 1,
+                                    pp_rank, vpp_rank, local_idx)
+                            layer_tensors: dict[str, torch.Tensor] = {}
+                            self._set_layer_norm(layer_tensors, models,
+                                                 hf_layer, local_idx)
+                            self._set_layer_attn(layer_tensors, models,
+                                                 hf_layer, local_idx)
+                            self._set_layer_mlp(layer_tensors, models,
+                                                hf_layer, local_idx)
+                            self._save_shard(layer_tensors, hf_layer + 2,
+                                             total_shards)
+
+                    is_post = False
+                    if self.dualpipe:
+                        if pp_rank == 0 and vpp_rank == self.vpp_size - 1:
+                            is_post = True
+                    else:
+                        if pp_rank == self.pp_size - 1 and vpp_rank == self.vpp_size - 1:
+                            is_post = True
+
+                    if is_post:
+                        tail_tensors: dict[str, torch.Tensor] = {}
+                        self._set_postprocess(tail_tensors, models)
+                        self._save_shard(tail_tensors, total_shards,
+                                         total_shards)
+
+                    del models
+                    gc.collect()
 
         index_path = os.path.join(self.hf_save_dir,
                                   'model.safetensors.index.json')
