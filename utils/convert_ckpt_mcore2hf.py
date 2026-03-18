@@ -2,6 +2,7 @@ import argparse
 import json
 import logging as logger
 import os
+import time
 from collections import defaultdict
 from typing import Optional
 
@@ -78,9 +79,14 @@ class MgCkptConvert:
         rotary_base: float,
         q_lora_rank: int,
     ):
+        self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
+        self.log_rank_load = os.environ.get('CKPT_CONVERT_LOG_RANK',
+                                            '1') != '0'
         self.mg_load_dir = mg_load_dir
         self.hf_save_dir = hf_save_dir
         self.iter_dir = _resolve_iter_dir(mg_load_dir)
+        if self.verbose:
+            logger.info('Resolved iter_dir: %s', self.iter_dir)
 
         self.num_layers = num_layers
         self.tp_size = tp_size
@@ -107,6 +113,9 @@ class MgCkptConvert:
         os.makedirs(self.hf_save_dir, exist_ok=True)
 
         self.vpp_size, self._vpp_model_keys = self._detect_vpp()
+        if self.verbose:
+            logger.info('Detected vpp_size=%s dualpipe=%s', self.vpp_size,
+                        self.dualpipe)
         if self.vpp_size is not None and self.vpp_stage is None:
             if self.dualpipe:
                 layers_each_pp = self.num_layers // self.pp_size
@@ -134,6 +143,23 @@ class MgCkptConvert:
         self.inv_freq = inv_freq
 
         self.weight_map: dict[str, str] = {}
+        self._rank_dir_map: dict[tuple[int, int], list[int]] = {}
+        self._build_rank_dir_map()
+        if self.verbose:
+            logger.info('Rank dir map size=%d', len(self._rank_dir_map))
+            sample_keys = sorted(self._rank_dir_map.keys())[:min(
+                12, len(self._rank_dir_map))]
+            for k in sample_keys:
+                eps = self._rank_dir_map[k]
+                logger.info('Rank dir map sample tp=%d pp=%d: ep_count=%d',
+                            k[0], k[1], len(eps))
+            missing = []
+            for tp in range(self.tp_size):
+                for pp in range(self.pp_size):
+                    if (tp, pp) not in self._rank_dir_map:
+                        missing.append((tp, pp))
+            if missing:
+                logger.info('Missing (tp,pp) in rank dirs: %s', missing[:20])
 
     def _validate(self) -> None:
         if self.num_layers <= 0:
@@ -146,8 +172,9 @@ class MgCkptConvert:
             raise ValueError('dualpipev 需要 vpp checkpoint (model0/model1)')
 
     def _detect_vpp(self) -> tuple[int | None, list[str] | None]:
-        prefix = _mp_prefix(0, 0, 0, self.tp_size, self.pp_size, self.ep_size)
-        ckpt_path = os.path.join(self.iter_dir, prefix, 'model_optim_rng.pt')
+        ckpt_path = self._resolve_rank_ckpt_path(0, 0, None)
+        if self.verbose:
+            logger.info('Detecting vpp from: %s', ckpt_path)
         state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         model_keys = sorted([
             k for k in state.keys() if k.startswith('model') and k != 'model'
@@ -155,6 +182,48 @@ class MgCkptConvert:
         if 'model0' in state and 'model1' in state:
             return len(model_keys), model_keys
         return None, None
+
+    def _build_rank_dir_map(self) -> None:
+        mp_dirs: list[str] = []
+        try:
+            for d in os.listdir(self.iter_dir):
+                if d.startswith('mp_rank_'):
+                    mp_dirs.append(d)
+        except FileNotFoundError:
+            mp_dirs = []
+        rank_map: dict[tuple[int, int], set[int]] = defaultdict(set)
+        for d in mp_dirs:
+            parts = d.split('_')
+            if len(parts) < 3:
+                continue
+            try:
+                tp = int(parts[2])
+            except ValueError:
+                continue
+            idxs = []
+            for p in parts[3:]:
+                try:
+                    idxs.append(int(p))
+                except ValueError:
+                    idxs.append(None)
+            pp = None
+            ep = None
+            for v in idxs:
+                if v is None:
+                    continue
+                if pp is None and v < self.pp_size:
+                    pp = v
+                    continue
+                if ep is None and v < self.ep_size:
+                    ep = v
+            if pp is None and self.pp_size == 1:
+                pp = 0
+            if ep is None and self.ep_size == 1:
+                ep = 0
+            if pp is None or ep is None:
+                continue
+            rank_map[(tp, pp)].add(ep)
+        self._rank_dir_map = {k: sorted(list(v)) for k, v in rank_map.items()}
 
     def _build_pprank_layer_map(self) -> None:
         layers_each_pp = [self.num_layers // self.pp_size] * self.pp_size
@@ -255,24 +324,67 @@ class MgCkptConvert:
                     self.layer2loc_vpp[hf_layer] = (pp_rank, vpp_rank,
                                                     local_idx)
 
-    def _load_rank_state(self, tp_rank: int, pp_rank: int, ep_rank: int,
+    def _load_rank_state(self, tp_rank: int, pp_rank: int, ep_rank: int | None,
                          vpp_rank: int | None) -> dict[str, torch.Tensor]:
-        prefix = _mp_prefix(tp_rank, pp_rank, ep_rank, self.tp_size,
-                            self.pp_size, self.ep_size)
-        ckpt_path = os.path.join(self.iter_dir, prefix, 'model_optim_rng.pt')
+        ckpt_path = self._resolve_rank_ckpt_path(tp_rank, pp_rank, ep_rank)
+        t0 = time.perf_counter()
+        if self.verbose and self.log_rank_load:
+            logger.info('Loading rank ckpt: tp=%d pp=%d ep=%s vpp=%s path=%s',
+                        tp_rank, pp_rank, ep_rank, vpp_rank, ckpt_path)
         state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        if self.verbose and self.log_rank_load:
+            dt = time.perf_counter() - t0
+            logger.info('Loaded rank ckpt: tp=%d pp=%d ep=%s vpp=%s in %.2fs',
+                        tp_rank, pp_rank, ep_rank, vpp_rank, dt)
         if vpp_rank is None:
             return state['model']
         return state[f'model{vpp_rank}']
+
+    def _resolve_rank_ckpt_path(self, tp_rank: int, pp_rank: int,
+                                ep_rank: int | None) -> str:
+        candidates: list[str] = []
+        if ep_rank is not None:
+            candidates.append(
+                _mp_prefix(tp_rank, pp_rank, ep_rank, self.tp_size,
+                           self.pp_size, self.ep_size))
+            candidates.append(f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_rank:03}')
+            candidates.append(f'mp_rank_{tp_rank:02}_{ep_rank:03}_{pp_rank:03}')
+            candidates.append(f'mp_rank_{tp_rank:02}_{ep_rank:03}')
+        else:
+            candidates.append(f'mp_rank_{tp_rank:02}_{pp_rank:03}_000')
+            candidates.append(f'mp_rank_{tp_rank:02}_{pp_rank:03}_001')
+            candidates.append(f'mp_rank_{tp_rank:02}_{pp_rank:03}')
+            candidates.append(f'mp_rank_{tp_rank:02}')
+        for p in candidates:
+            path = os.path.join(self.iter_dir, p, 'model_optim_rng.pt')
+            if os.path.isfile(path):
+                return path
+        raise FileNotFoundError(
+            f'无法定位 rank 文件: tp={tp_rank}, pp={pp_rank}, ep={ep_rank}, iter_dir={self.iter_dir}'
+        )
 
     def _load_models_for_stage(
         self, pp_rank: int, vpp_rank: int | None
     ) -> dict[tuple[int, int], dict[str, torch.Tensor]]:
         models: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+        if self.verbose:
+            logger.info('Loading models for stage: pp_rank=%d vpp_rank=%s',
+                        pp_rank, vpp_rank)
         for tp_rank in range(self.tp_size):
-            for ep_rank in range(self.ep_size):
-                models[(tp_rank, ep_rank)] = self._load_rank_state(
-                    tp_rank, pp_rank, ep_rank, vpp_rank)
+            eps = self._rank_dir_map.get((tp_rank, pp_rank), [])
+            base_ep = eps[0] if eps else None
+            if base_ep is not None:
+                state = self._load_rank_state(tp_rank, pp_rank, base_ep,
+                                              vpp_rank)
+                models[(tp_rank, base_ep)] = state.copy()
+                models[(tp_rank, 0)] = state
+            for ep_rank in eps:
+                if (tp_rank, ep_rank) not in models:
+                    models[(tp_rank, ep_rank)] = self._load_rank_state(
+                        tp_rank, pp_rank, ep_rank, vpp_rank)
+        if self.verbose:
+            logger.info('Loaded models for stage: pp_rank=%d vpp_rank=%s keys=%d',
+                        pp_rank, vpp_rank, len(models))
         return models
 
     def _gather_tp_row(self,
@@ -601,10 +713,19 @@ class MgCkptConvert:
         for k in tensors.keys():
             self.weight_map[k] = name
         safetensors.torch.save_file(tensors, path, metadata={'format': 'pt'})
+        if self.verbose:
+            logger.info('Saved shard %d/%d: %s (tensors=%d)', shard_idx,
+                        total_shards, path, len(tensors))
 
     def run(self) -> None:
         total_shards = self.num_real_layers + 2
         shard_idx = 1
+        if self.verbose:
+            logger.info(
+                'Start converting: layers=%d real_layers=%d tp=%d pp=%d ep=%d vpp=%s dualpipe=%s save_dir=%s',
+                self.num_layers, self.num_real_layers, self.tp_size,
+                self.pp_size, self.ep_size, self.vpp_size, self.dualpipe,
+                self.hf_save_dir)
 
         if self.vpp_size is None:
             models0 = self._load_models_for_stage(pp_rank=0, vpp_rank=None)
@@ -615,6 +736,10 @@ class MgCkptConvert:
 
             for hf_layer in range(self.num_real_layers):
                 pp_rank, local_idx = self.layer2loc[hf_layer]
+                if self.verbose:
+                    logger.info('Converting layer %d/%d: pp_rank=%d local_idx=%d',
+                                hf_layer, self.num_real_layers - 1, pp_rank,
+                                local_idx)
                 models = self._load_models_for_stage(pp_rank=pp_rank,
                                                      vpp_rank=None)
                 layer_tensors: dict[str, torch.Tensor] = {}
@@ -640,6 +765,11 @@ class MgCkptConvert:
 
             for hf_layer in range(self.num_real_layers):
                 pp_rank, vpp_rank, local_idx = self.layer2loc_vpp[hf_layer]
+                if self.verbose:
+                    logger.info(
+                        'Converting layer %d/%d: pp_rank=%d vpp_rank=%d local_idx=%d',
+                        hf_layer, self.num_real_layers - 1, pp_rank, vpp_rank,
+                        local_idx)
                 models = self._load_models_for_stage(pp_rank=pp_rank,
                                                      vpp_rank=vpp_rank)
                 layer_tensors: dict[str, torch.Tensor] = {}
