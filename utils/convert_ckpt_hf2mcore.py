@@ -7,6 +7,7 @@ from typing import Optional
 
 import safetensors.torch
 import torch
+from safetensors import safe_open
 
 logger.basicConfig(format='')
 logger.getLogger().setLevel(logger.INFO)
@@ -14,7 +15,7 @@ logger.getLogger().setLevel(logger.INFO)
 HIDDEN_SIZE = 7168
 NUM_EXPERTS = 128
 FIRST_K_DENSE_REPLACE = 3
-NUM_ATTENTION_HEADS = 112
+NUM_ATTENTION_HEADS = 64
 QK_HEAD_DIM = 128
 QK_POS_EMB_HEAD_DIM = 64
 V_HEAD_DIM = 128
@@ -118,6 +119,12 @@ class CkptConvert:
             self.vpp_size = None
 
         self._validate()
+        self.weight_map = self._read_weight_map()
+        self.layer_keys_map: dict[int, list[str]] = defaultdict(list)
+        for k in self.weight_map.keys():
+            if k.startswith('model.layers.'):
+                layer_id = int(k.split('model.layers.')[1].split('.')[0])
+                self.layer_keys_map[layer_id].append(k)
         self.iter_path = _ensure_iter_path(self.mg_save_path)
 
         if self.vpp_stage is None:
@@ -142,19 +149,34 @@ class CkptConvert:
             raise ValueError('first-k-dense-replace 非法')
         if self.num_experts % self.ep_size != 0:
             raise ValueError('num_experts 必须能整除 ep_size')
-        if self.dualpipe and self.tp_size > 1 and not self.moe_tp_extend_ep:
-            raise ValueError('dualpipev 下 tp>1 需要开启 moe-tp-extend-ep')
         if self.num_layer_list is not None and self.vpp_stage is not None:
             raise ValueError('num-layer-list 与 vpp/dualpipev 不可同时配置')
 
     def _read_weight_map(self) -> dict[str, str]:
         index_path = os.path.join(self.hf_model_path,
                                   'model.safetensors.index.json')
-        with open(index_path) as f:
-            return json.load(f)['weight_map']
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                return json.load(f)['weight_map']
+
+        single = os.path.join(self.hf_model_path, 'model.safetensors')
+        if os.path.isfile(single):
+            with safe_open(single, framework='pt', device='cpu') as f:
+                return {k: 'model.safetensors' for k in f.keys()}
+
+        raise FileNotFoundError(
+            f'找不到 HF safetensors index 或单文件: {self.hf_model_path}')
+
+    def _assert_consumed(self, weights: dict[str, torch.Tensor],
+                         context: str) -> None:
+        if not weights:
+            return
+        keys = sorted(weights.keys())
+        head = keys[:20]
+        raise ValueError(f'{context} 未被消费的 HF 权重={len(keys)}: {head}')
 
     def _get_layer_files_map(self) -> dict[object, set[str]]:
-        weight_map = self._read_weight_map()
+        weight_map = self.weight_map
         layer_files_map: dict[object, set[str]] = defaultdict(set)
         for k, v in weight_map.items():
             if k.startswith('model.layers.'):
@@ -257,37 +279,53 @@ class CkptConvert:
                 pp_rank += 1
                 vpp_rank = 0
 
-    def _load_safetensors(self, filename: str) -> dict[str, torch.Tensor]:
+    def _load_safetensors_keys(self, filename: str,
+                               keys: list[str]) -> dict[str, torch.Tensor]:
         path = os.path.join(self.hf_model_path, filename)
-        return safetensors.torch.load_file(path)
+        out: dict[str, torch.Tensor] = {}
+        with safe_open(path, framework='pt', device='cpu') as f:
+            for k in keys:
+                out[k] = f.get_tensor(k)
+        return out
 
     def _load_matched_hf_weights(
             self, pp_rank: int,
             vpp_rank: int | None) -> dict[str, torch.Tensor]:
-        layer_files_map = self._get_layer_files_map()
         if vpp_rank is None:
             layer_list = self.pprank_layer_idxs[pp_rank]
         else:
             layer_list = self.vpprank_layer_idxs[pp_rank][vpp_rank]
 
-        st_files: list[str] = []
+        need_pre = pp_rank == 0 and (vpp_rank is None or vpp_rank == 0)
+        need_post = False
+        if self.dualpipe:
+            need_post = pp_rank == 0 and (vpp_rank is not None) and (vpp_rank
+                                                                     == self.vpp_size
+                                                                     - 1)
+        else:
+            need_post = pp_rank == self.pp_size - 1 and (vpp_rank is None
+                                                         or vpp_rank
+                                                         == self.vpp_size - 1)
+
+        required: set[str] = set()
         for layer in layer_list:
-            st_files.extend(list(layer_files_map[layer]))
+            required.update(self.layer_keys_map.get(layer, []))
+        if need_pre:
+            required.add('model.embed_tokens.weight')
+        if need_post:
+            required.add('model.norm.weight')
+            required.add('lm_head.weight')
 
-        if pp_rank == 0:
-            st_files.extend(list(layer_files_map['model.embed_tokens.weight']))
-            if self.dualpipe:
-                st_files.extend(list(layer_files_map['lm_head.weight']))
-                st_files.extend(list(layer_files_map['model.norm.weight']))
+        files_to_keys: dict[str, list[str]] = defaultdict(list)
+        for k in required:
+            fn = self.weight_map.get(k)
+            if fn is None:
+                raise KeyError(f'HF weight_map 缺少 key: {k}')
+            files_to_keys[fn].append(k)
 
-        if pp_rank == self.pp_size - 1 and not self.dualpipe:
-            st_files.extend(list(layer_files_map['model.norm.weight']))
-            st_files.extend(list(layer_files_map['lm_head.weight']))
-
-        st_files = sorted(set(st_files))
         all_weights: dict[str, torch.Tensor] = {}
-        for fn in st_files:
-            all_weights.update(self._load_safetensors(fn))
+        for fn, ks in files_to_keys.items():
+            all_weights.update(self._load_safetensors_keys(fn, ks))
         return all_weights
 
     def _maybe_quant_nf4(self, state: dict[str, torch.Tensor], key: str,
@@ -310,11 +348,11 @@ class CkptConvert:
             mg_model: dict[int, dict[int, dict[str, torch.Tensor]]]) -> None:
         emb = weights.pop('model.embed_tokens.weight')
         emb_tp = torch.chunk(emb, self.tp_size, dim=0)
+        emb_shards = [t.clone() for t in emb_tp]
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
                 mg_model[ep_rank][tp_rank][
-                    'embedding.word_embeddings.weight'] = emb_tp[
-                        tp_rank].clone()
+                    'embedding.word_embeddings.weight'] = emb_shards[tp_rank]
 
     def _set_postprocess(
             self, weights: dict[str, torch.Tensor],
@@ -322,15 +360,16 @@ class CkptConvert:
         final_norm = weights.pop('model.norm.weight')
         lm_head = weights.pop('lm_head.weight')
         lm_head_tp = torch.chunk(lm_head, self.tp_size, dim=0)
+        lm_head_shards = [t.clone() for t in lm_head_tp]
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
                 mg_model[ep_rank][tp_rank][
-                    'decoder.final_layernorm.weight'] = final_norm.clone()
-                mg_model[ep_rank][tp_rank]['output_layer.weight'] = lm_head_tp[
-                    tp_rank].clone()
+                    'decoder.final_layernorm.weight'] = final_norm
+                mg_model[ep_rank][tp_rank][
+                    'output_layer.weight'] = lm_head_shards[tp_rank]
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                       'output_layer.weight',
-                                      lm_head_tp[tp_rank].clone())
+                                      lm_head_shards[tp_rank])
 
     def _set_layer_norm(
         self,
@@ -346,11 +385,9 @@ class CkptConvert:
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
                 mg_model[ep_rank][tp_rank][
-                    f'decoder.layers.{local_layer_idx}.input_layernorm.weight'] = in_norm.clone(
-                    )
+                    f'decoder.layers.{local_layer_idx}.input_layernorm.weight'] = in_norm
                 mg_model[ep_rank][tp_rank][
-                    f'decoder.layers.{local_layer_idx}.pre_mlp_layernorm.weight'] = post_norm.clone(
-                    )
+                    f'decoder.layers.{local_layer_idx}.pre_mlp_layernorm.weight'] = post_norm
 
     def _set_layer_attn(
         self,
@@ -389,6 +426,13 @@ class CkptConvert:
             q_norm_key = f'{prefix}.q_layernorm.weight'
             kv_norm_key = f'{prefix}.kv_layernorm.weight'
 
+            qk_nope_shards: list[torch.Tensor] | None = None
+            qk_rope_shards: list[torch.Tensor] | None = None
+            kv_nope_shards: list[torch.Tensor] | None = None
+            linear_v_shards: list[torch.Tensor] | None = None
+            q_b_shards: list[torch.Tensor] | None = None
+            kv_b_shards: list[torch.Tensor] | None = None
+
             if self.mla_mm_split:
                 qk_nope_key = f'{prefix}.linear_qk_nope.weight'
                 qk_rope_key = f'{prefix}.linear_qk_rope.weight'
@@ -415,38 +459,45 @@ class CkptConvert:
                 qk_rope_tp = torch.chunk(qk_rope, self.tp_size, dim=0)
                 kv_nope_tp = torch.chunk(kv_nope, self.tp_size, dim=0)
                 linear_v_tp = torch.chunk(linear_v, self.tp_size, dim=0)
+                qk_nope_shards = [t.clone() for t in qk_nope_tp]
+                qk_rope_shards = [t.clone() for t in qk_rope_tp]
+                kv_nope_shards = [t.clone() for t in kv_nope_tp]
+                linear_v_shards = [t.clone() for t in linear_v_tp]
             else:
                 q_up_key = f'{prefix}.linear_q_up_proj.weight'
                 kv_up_key = f'{prefix}.linear_kv_up_proj.weight'
                 q_b_tp = torch.chunk(q_b_proj, self.tp_size, dim=0)
                 kv_b_tp = torch.chunk(kv_b_proj, self.tp_size, dim=0)
+                q_b_shards = [t.clone() for t in q_b_tp]
+                kv_b_shards = [t.clone() for t in kv_b_tp]
 
             o_proj_tp = torch.chunk(o_proj, self.tp_size, dim=1)
+            o_proj_shards = [t.clone() for t in o_proj_tp]
             for ep_rank in range(self.ep_size):
                 for tp_rank in range(self.tp_size):
-                    mg_model[ep_rank][tp_rank][qkv_key] = qkv_weight.clone()
-                    mg_model[ep_rank][tp_rank][proj_key] = o_proj_tp[
-                        tp_rank].clone()
-                    mg_model[ep_rank][tp_rank][q_norm_key] = q_ln.clone()
-                    mg_model[ep_rank][tp_rank][kv_norm_key] = kv_ln.clone()
+                    mg_model[ep_rank][tp_rank][qkv_key] = qkv_weight
+                    mg_model[ep_rank][tp_rank][
+                        proj_key] = o_proj_shards[tp_rank]
+                    mg_model[ep_rank][tp_rank][q_norm_key] = q_ln
+                    mg_model[ep_rank][tp_rank][kv_norm_key] = kv_ln
 
                     if self.mla_mm_split:
-                        mg_model[ep_rank][tp_rank][qk_nope_key] = qk_nope_tp[
-                            tp_rank].clone()
-                        mg_model[ep_rank][tp_rank][qk_rope_key] = qk_rope_tp[
-                            tp_rank].clone()
-                        mg_model[ep_rank][tp_rank][kv_nope_key] = kv_nope_tp[
-                            tp_rank].clone()
-                        mg_model[ep_rank][tp_rank][linear_v_key] = linear_v_tp[
-                            tp_rank].clone()
+                        mg_model[ep_rank][tp_rank][
+                            qk_nope_key] = qk_nope_shards[tp_rank]
+                        mg_model[ep_rank][tp_rank][
+                            qk_rope_key] = qk_rope_shards[tp_rank]
+                        mg_model[ep_rank][tp_rank][
+                            kv_nope_key] = kv_nope_shards[tp_rank]
+                        mg_model[ep_rank][tp_rank][
+                            linear_v_key] = linear_v_shards[tp_rank]
                     else:
-                        mg_model[ep_rank][tp_rank][q_up_key] = q_b_tp[
-                            tp_rank].clone()
-                        mg_model[ep_rank][tp_rank][kv_up_key] = kv_b_tp[
-                            tp_rank].clone()
+                        mg_model[ep_rank][tp_rank][
+                            q_up_key] = q_b_shards[tp_rank]
+                        mg_model[ep_rank][tp_rank][
+                            kv_up_key] = kv_b_shards[tp_rank]
 
                     self._maybe_quant_nf4(mg_model[ep_rank][tp_rank], proj_key,
-                                          o_proj_tp[tp_rank].clone())
+                                          o_proj_shards[tp_rank])
             return
 
         q_weight = weights.pop(
@@ -471,18 +522,21 @@ class CkptConvert:
         k_tp = torch.chunk(k_weight, self.tp_size, dim=0)
         v_tp = torch.chunk(v_weight, self.tp_size, dim=0)
         o_proj_tp = torch.chunk(o_proj, self.tp_size, dim=1)
+        qkv_shards = [
+            torch.cat([q_tp[i], k_tp[i], v_tp[i]], dim=0)
+            for i in range(self.tp_size)
+        ]
+        o_proj_shards = [t.clone() for t in o_proj_tp]
 
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
-                mg_model[ep_rank][tp_rank][qkv_key] = torch.cat(
-                    [q_tp[tp_rank], k_tp[tp_rank], v_tp[tp_rank]],
-                    dim=0).clone()
-                mg_model[ep_rank][tp_rank][proj_key] = o_proj_tp[
-                    tp_rank].clone()
-                mg_model[ep_rank][tp_rank][q_norm_key] = q_ln.clone()
-                mg_model[ep_rank][tp_rank][k_norm_key] = k_ln.clone()
+                mg_model[ep_rank][tp_rank][qkv_key] = qkv_shards[tp_rank]
+                mg_model[ep_rank][tp_rank][
+                    proj_key] = o_proj_shards[tp_rank]
+                mg_model[ep_rank][tp_rank][q_norm_key] = q_ln
+                mg_model[ep_rank][tp_rank][k_norm_key] = k_ln
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank], proj_key,
-                                      o_proj_tp[tp_rank].clone())
+                                      o_proj_shards[tp_rank])
 
     def _set_layer_mlp(
         self,
@@ -501,27 +555,33 @@ class CkptConvert:
             fc1 = torch.cat([gate, up], dim=0)
             fc1_tp = torch.chunk(fc1, self.tp_size, dim=0)
             fc2_tp = torch.chunk(down, self.tp_size, dim=1)
+            fc1_shards = [t.clone() for t in fc1_tp]
+            fc2_shards = [t.clone() for t in fc2_tp]
             for ep_rank in range(self.ep_size):
                 for tp_rank in range(self.tp_size):
                     mg_model[ep_rank][tp_rank][
-                        f'{prefix}.linear_fc1.weight'] = fc1_tp[tp_rank].clone(
-                        )
+                        f'{prefix}.linear_fc1.weight'] = fc1_shards[tp_rank]
                     mg_model[ep_rank][tp_rank][
-                        f'{prefix}.linear_fc2.weight'] = fc2_tp[tp_rank].clone(
-                        )
+                        f'{prefix}.linear_fc2.weight'] = fc2_shards[tp_rank]
                     self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                           f'{prefix}.linear_fc1.weight',
-                                          fc1_tp[tp_rank].clone())
+                                          fc1_shards[tp_rank])
                     self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                           f'{prefix}.linear_fc2.weight',
-                                          fc2_tp[tp_rank].clone())
+                                          fc2_shards[tp_rank])
             return
 
-        router_w = weights.pop(
-            f'model.layers.{hf_layer}.mlp.gate.weight')[:self.num_experts, :]
-        router_b = weights.pop(
-            f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'
-        )[:self.num_experts]
+        router_w_raw = weights.pop(f'model.layers.{hf_layer}.mlp.gate.weight')
+        if router_w_raw.shape[0] != self.num_experts:
+            router_w = router_w_raw[:self.num_experts, :].clone()
+        else:
+            router_w = router_w_raw
+        router_b_raw = weights.pop(
+            f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias')
+        if router_b_raw.shape[0] != self.num_experts:
+            router_b = router_b_raw[:self.num_experts].clone()
+        else:
+            router_b = router_b_raw
 
         shared_gate = weights.pop(
             f'model.layers.{hf_layer}.mlp.shared_experts.gate_proj.weight')
@@ -533,6 +593,8 @@ class CkptConvert:
         shared_fc1 = torch.cat([shared_gate, shared_up], dim=0)
         shared_fc1_tp = torch.chunk(shared_fc1, self.tp_size, dim=0)
         shared_fc2_tp = torch.chunk(shared_down, self.tp_size, dim=1)
+        shared_fc1_shards = [t.clone() for t in shared_fc1_tp]
+        shared_fc2_shards = [t.clone() for t in shared_fc2_tp]
 
         experts_linear_fc1_list: list[torch.Tensor] = []
         experts_linear_fc2_list: list[torch.Tensor] = []
@@ -564,18 +626,18 @@ class CkptConvert:
 
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
-                mg_model[ep_rank][tp_rank][router_key] = router_w.clone()
-                mg_model[ep_rank][tp_rank][router_bias_key] = router_b.clone()
-                mg_model[ep_rank][tp_rank][shared_fc1_key] = shared_fc1_tp[
-                    tp_rank].clone()
-                mg_model[ep_rank][tp_rank][shared_fc2_key] = shared_fc2_tp[
-                    tp_rank].clone()
+                mg_model[ep_rank][tp_rank][router_key] = router_w
+                mg_model[ep_rank][tp_rank][router_bias_key] = router_b
+                mg_model[ep_rank][tp_rank][
+                    shared_fc1_key] = shared_fc1_shards[tp_rank]
+                mg_model[ep_rank][tp_rank][
+                    shared_fc2_key] = shared_fc2_shards[tp_rank]
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                       shared_fc1_key,
-                                      shared_fc1_tp[tp_rank].clone())
+                                      shared_fc1_shards[tp_rank])
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                       shared_fc2_key,
-                                      shared_fc2_tp[tp_rank].clone())
+                                      shared_fc2_shards[tp_rank])
 
         if self.moe_grouped_gemm:
             gemm_fc1 = torch.cat(experts_linear_fc1_list).view(
@@ -644,22 +706,24 @@ class CkptConvert:
                     local_fc2 = experts_linear_fc2_list[global_idx].t()
                     local_fc1_tp = torch.chunk(local_fc1, self.tp_size, dim=0)
                     local_fc2_tp = torch.chunk(local_fc2, self.tp_size, dim=1)
+                    local_fc1_shards = [t.clone() for t in local_fc1_tp]
+                    local_fc2_shards = [t.clone() for t in local_fc2_tp]
                     local_prefix = f'{prefix}.experts.local_experts.{local_idx}'
                     for tp_rank in range(self.tp_size):
                         mg_model[ep_rank][tp_rank][
-                            f'{local_prefix}.linear_fc1.weight'] = local_fc1_tp[
-                                tp_rank].clone()
+                            f'{local_prefix}.linear_fc1.weight'] = local_fc1_shards[
+                                tp_rank]
                         mg_model[ep_rank][tp_rank][
-                            f'{local_prefix}.linear_fc2.weight'] = local_fc2_tp[
-                                tp_rank].clone()
+                            f'{local_prefix}.linear_fc2.weight'] = local_fc2_shards[
+                                tp_rank]
                         self._maybe_quant_nf4(
                             mg_model[ep_rank][tp_rank],
                             f'{local_prefix}.linear_fc1.weight',
-                            local_fc1_tp[tp_rank].clone())
+                            local_fc1_shards[tp_rank])
                         self._maybe_quant_nf4(
                             mg_model[ep_rank][tp_rank],
                             f'{local_prefix}.linear_fc2.weight',
-                            local_fc2_tp[tp_rank].clone())
+                            local_fc2_shards[tp_rank])
 
     def _save_pp_rank(
         self,
@@ -713,6 +777,7 @@ class CkptConvert:
                                         mg_model)
                 if pp_rank == self.pp_size - 1 and not self.dualpipe:
                     self._set_postprocess(weights, mg_model)
+                self._assert_consumed(weights, f'pp_rank={pp_rank}')
                 self._save_pp_rank(pp_rank, mg_model, vpp=False)
             return
 
@@ -747,6 +812,8 @@ class CkptConvert:
                 if (not self.dualpipe) and (pp_rank == self.pp_size - 1) and (
                         vpp_rank == self.vpp_size - 1):
                     self._set_postprocess(weights, mg_model[vpp_rank])
+                self._assert_consumed(weights,
+                                      f'pp_rank={pp_rank} vpp_rank={vpp_rank}')
 
             self._save_pp_rank(pp_rank, mg_model, vpp=True)
 

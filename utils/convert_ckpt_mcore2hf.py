@@ -2,6 +2,7 @@ import argparse
 import json
 import logging as logger
 import os
+import shutil
 import time
 from collections import defaultdict
 from typing import Optional
@@ -20,6 +21,11 @@ QK_HEAD_DIM = 128
 QK_POS_EMB_HEAD_DIM = 64
 V_HEAD_DIM = 128
 Q_LORA_RANK = 1536
+KV_LORA_RANK = 512
+NUM_QUERY_GROUPS = 2
+FFN_HIDDEN_SIZE = 18432
+MOE_FFN_HIDDEN_SIZE = 12288
+VOCAB_SIZE = 163840
 
 
 def _parse_int_list(value: Optional[str]) -> Optional[list[int]]:
@@ -78,6 +84,12 @@ class MgCkptConvert:
         noop_layers: str | None,
         rotary_base: float,
         q_lora_rank: int,
+        kv_lora_rank: int | None = None,
+        num_query_groups: int | None = None,
+        vocab_size: int | None = None,
+        ffn_hidden_size: int | None = None,
+        moe_ffn_hidden_size: int | None = None,
+        hf_config_template: str | None = None,
     ):
         self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
         self.log_rank_load = os.environ.get('CKPT_CONVERT_LOG_RANK',
@@ -109,6 +121,12 @@ class MgCkptConvert:
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
         self.rotary_base = rotary_base
         self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.num_query_groups = num_query_groups
+        self.vocab_size = vocab_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.moe_ffn_hidden_size = moe_ffn_hidden_size
+        self.hf_config_template = hf_config_template
 
         os.makedirs(self.hf_save_dir, exist_ok=True)
 
@@ -143,6 +161,7 @@ class MgCkptConvert:
         self.inv_freq = inv_freq
 
         self.weight_map: dict[str, str] = {}
+        self.total_size_bytes = 0
         self._rank_dir_map: dict[tuple[int, int], list[int]] = {}
         self._build_rank_dir_map()
         if self.verbose:
@@ -160,6 +179,73 @@ class MgCkptConvert:
                         missing.append((tp, pp))
             if missing:
                 logger.info('Missing (tp,pp) in rank dirs: %s', missing[:20])
+
+    def _repo_models_dir(self) -> str:
+        return os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', 'models'))
+
+    def _select_config_template(self) -> str:
+        if self.hf_config_template:
+            return self.hf_config_template
+        models_dir = self._repo_models_dir()
+        cfg_1t = os.path.join(models_dir, 'config_1t.json')
+        if os.path.isfile(cfg_1t):
+            try:
+                with open(cfg_1t) as f:
+                    d = json.load(f)
+                if int(d.get('hidden_size', -1)) == self.hidden_size and int(
+                        d.get('num_hidden_layers', -1)) == self.num_real_layers:
+                    return cfg_1t
+            except Exception:
+                pass
+        return os.path.join(models_dir, 'config.json')
+
+    def _write_hf_artifacts(self) -> None:
+        models_dir = self._repo_models_dir()
+        os.makedirs(self.hf_save_dir, exist_ok=True)
+
+        cfg_path = self._select_config_template()
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+
+        cfg['hidden_size'] = self.hidden_size
+        cfg['num_hidden_layers'] = self.num_real_layers
+        cfg['num_attention_heads'] = self.num_attention_heads
+        cfg['qk_nope_head_dim'] = self.qk_head_dim
+        cfg['qk_rope_head_dim'] = self.qk_pos_emb_head_dim
+        cfg['v_head_dim'] = self.v_head_dim
+        cfg['q_lora_rank'] = self.q_lora_rank
+        cfg['rope_theta'] = float(self.rotary_base)
+        cfg['ep_size'] = self.ep_size
+        cfg['first_k_dense_replace'] = self.first_k_dense_replace
+
+        if self.kv_lora_rank is not None:
+            cfg['kv_lora_rank'] = self.kv_lora_rank
+        if self.num_query_groups is not None:
+            cfg['num_query_groups'] = self.num_query_groups
+            cfg['group_query_attention'] = self.num_query_groups > 0
+            if cfg['group_query_attention']:
+                cfg['num_key_value_heads'] = self.num_attention_heads // self.num_query_groups
+        if self.vocab_size is not None:
+            cfg['vocab_size'] = self.vocab_size
+        if self.ffn_hidden_size is not None:
+            cfg['intermediate_size'] = self.ffn_hidden_size
+        if self.moe_ffn_hidden_size is not None:
+            cfg['moe_intermediate_size'] = self.moe_ffn_hidden_size
+
+        with open(os.path.join(self.hf_save_dir, 'config.json'), 'w') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+        gen_cfg = os.path.join(models_dir, 'generation_config.json')
+        if os.path.isfile(gen_cfg):
+            shutil.copyfile(gen_cfg,
+                            os.path.join(self.hf_save_dir,
+                                         'generation_config.json'))
+
+        for fn in ['configuration_deepseek.py', 'modeling_deepseek.py', '__init__.py']:
+            src = os.path.join(models_dir, fn)
+            if os.path.isfile(src):
+                shutil.copyfile(src, os.path.join(self.hf_save_dir, fn))
 
     def _validate(self) -> None:
         if self.num_layers <= 0:
@@ -504,28 +590,28 @@ class MgCkptConvert:
             models[(tp_rank, 0)]['embedding.word_embeddings.weight']
             for tp_rank in range(self.tp_size)
         ]
-        hf['model.embed_tokens.weight'] = torch.cat(parts, dim=0).clone()
+        hf['model.embed_tokens.weight'] = torch.cat(parts, dim=0)
 
     def _set_postprocess(
             self, hf: dict[str, torch.Tensor],
             models: dict[tuple[int, int], dict[str, torch.Tensor]]) -> None:
-        hf['model.norm.weight'] = models[(
-            0, 0)]['decoder.final_layernorm.weight'].clone()
+        hf['model.norm.weight'] = models[(0, 0)].pop(
+            'decoder.final_layernorm.weight')
         parts = [
-            models[(tp_rank, 0)]['output_layer.weight']
+            models[(tp_rank, 0)].pop('output_layer.weight')
             for tp_rank in range(self.tp_size)
         ]
-        hf['lm_head.weight'] = torch.cat(parts, dim=0).clone()
+        hf['lm_head.weight'] = torch.cat(parts, dim=0)
 
     def _set_layer_norm(self, hf: dict[str, torch.Tensor],
                         models: dict[tuple[int, int], dict[str, torch.Tensor]],
                         hf_layer: int, local_idx: int) -> None:
         in_key = f'decoder.layers.{local_idx}.input_layernorm.weight'
         mlp_key = f'decoder.layers.{local_idx}.pre_mlp_layernorm.weight'
-        hf[f'model.layers.{hf_layer}.input_layernorm.weight'] = models[(
-            0, 0)].pop(in_key).clone()
+        hf[f'model.layers.{hf_layer}.input_layernorm.weight'] = models[(0, 0)].pop(
+            in_key)
         hf[f'model.layers.{hf_layer}.post_attention_layernorm.weight'] = models[
-            (0, 0)].pop(mlp_key).clone()
+            (0, 0)].pop(mlp_key)
 
     def _set_layer_attn(self, hf: dict[str, torch.Tensor],
                         models: dict[tuple[int, int], dict[str, torch.Tensor]],
@@ -553,8 +639,7 @@ class MgCkptConvert:
             q_per_tp = (self.num_attention_heads // self.tp_size) * head_dim
 
             for tp_rank in range(self.tp_size):
-                linear_proj_list.append(models[(tp_rank,
-                                                0)].pop(proj_key).clone())
+                linear_proj_list.append(models[(tp_rank, 0)].pop(proj_key))
                 qkv_shard = models[(tp_rank, 0)].pop(qkv_key)
                 rem = qkv_shard.shape[0] - q_per_tp
                 if rem < 0 or rem % 2 != 0:
@@ -565,23 +650,22 @@ class MgCkptConvert:
                 q_r, k_r, v_r = torch.split(qkv_shard,
                                             [q_per_tp, kv_per_tp, kv_per_tp],
                                             dim=0)
-                q_parts.append(q_r.clone())
-                k_parts.append(k_r.clone())
-                v_parts.append(v_r.clone())
+                q_parts.append(q_r)
+                k_parts.append(k_r)
+                v_parts.append(v_r)
 
             o_proj = torch.cat(linear_proj_list, dim=1)
             hf[f'model.layers.{hf_layer}.self_attn.q_proj.weight'] = torch.cat(
-                q_parts, dim=0).clone()
+                q_parts, dim=0)
             hf[f'model.layers.{hf_layer}.self_attn.k_proj.weight'] = torch.cat(
-                k_parts, dim=0).clone()
+                k_parts, dim=0)
             hf[f'model.layers.{hf_layer}.self_attn.v_proj.weight'] = torch.cat(
-                v_parts, dim=0).clone()
-            hf[f'model.layers.{hf_layer}.self_attn.o_proj.weight'] = o_proj.clone(
-            )
+                v_parts, dim=0)
+            hf[f'model.layers.{hf_layer}.self_attn.o_proj.weight'] = o_proj
             hf[f'model.layers.{hf_layer}.self_attn.q_layernorm.weight'] = models[
-                (0, 0)].pop(q_norm_key).clone()
+                (0, 0)].pop(q_norm_key)
             hf[f'model.layers.{hf_layer}.self_attn.k_layernorm.weight'] = models[
-                (0, 0)].pop(k_norm_key).clone()
+                (0, 0)].pop(k_norm_key)
             hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone(
             )
             return
@@ -595,7 +679,7 @@ class MgCkptConvert:
         linear_v_list: list[torch.Tensor] = []
 
         for tp_rank in range(self.tp_size):
-            linear_proj_list.append(models[(tp_rank, 0)].pop(proj_key).clone())
+            linear_proj_list.append(models[(tp_rank, 0)].pop(proj_key))
             if self.mla_mm_split:
                 qk_nope_list.append(
                     models[(tp_rank,
@@ -609,10 +693,8 @@ class MgCkptConvert:
                 linear_v_list.append(
                     models[(tp_rank, 0)].pop(f'{prefix}.linear_v.weight'))
             else:
-                linear_qb_list.append(models[(tp_rank,
-                                              0)].pop(q_up_key).clone())
-                linear_kvb_list.append(models[(tp_rank,
-                                               0)].pop(kv_up_key).clone())
+                linear_qb_list.append(models[(tp_rank, 0)].pop(q_up_key))
+                linear_kvb_list.append(models[(tp_rank, 0)].pop(kv_up_key))
 
         o_proj = torch.cat(linear_proj_list, dim=1)
 
@@ -646,8 +728,8 @@ class MgCkptConvert:
             raise ValueError(
                 f'linear_qkv.weight 行数 {qkv.shape[0]} 小于 q_lora_rank={self.q_lora_rank}'
             )
-        q_a_proj = qkv[:self.q_lora_rank, :].clone()
-        kv_a_proj = qkv[self.q_lora_rank:, :].clone()
+        q_a_proj = qkv[:self.q_lora_rank, :]
+        kv_a_proj = qkv[self.q_lora_rank:, :]
         q_a_ln = models[(0, 0)].pop(q_norm_key)
         kv_a_ln = models[(0, 0)].pop(kv_norm_key)
 
@@ -712,9 +794,9 @@ class MgCkptConvert:
             fc1 = self._gather_tp_row(models, f'{prefix}.linear_fc1.weight')
             fc2 = self._gather_tp_col(models, f'{prefix}.linear_fc2.weight')
             gate, up = torch.chunk(fc1, 2, dim=0)
-            hf[f'model.layers.{hf_layer}.mlp.gate_proj.weight'] = gate.clone()
-            hf[f'model.layers.{hf_layer}.mlp.up_proj.weight'] = up.clone()
-            hf[f'model.layers.{hf_layer}.mlp.down_proj.weight'] = fc2.clone()
+            hf[f'model.layers.{hf_layer}.mlp.gate_proj.weight'] = gate
+            hf[f'model.layers.{hf_layer}.mlp.up_proj.weight'] = up
+            hf[f'model.layers.{hf_layer}.mlp.down_proj.weight'] = fc2
             return
 
         pp_rank = self.layer2loc[hf_layer][0] if self.vpp_size is None else self.layer2loc_vpp[
@@ -726,21 +808,17 @@ class MgCkptConvert:
         router_bias = self._reconstruct_router_lazy(
             models, pp_rank, vpp_rank, f'{prefix}.router.expert_bias')
 
-        hf[f'model.layers.{hf_layer}.mlp.gate.weight'] = router.clone()
-        hf[f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'] = router_bias.clone(
-        )
+        hf[f'model.layers.{hf_layer}.mlp.gate.weight'] = router
+        hf[f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'] = router_bias
 
         shared_fc1 = self._gather_tp_row(
             models, f'{prefix}.shared_experts.linear_fc1.weight')
         shared_fc2 = self._gather_tp_col(
             models, f'{prefix}.shared_experts.linear_fc2.weight')
         shared_gate, shared_up = torch.chunk(shared_fc1, 2, dim=0)
-        hf[f'model.layers.{hf_layer}.mlp.shared_experts.gate_proj.weight'] = shared_gate.clone(
-        )
-        hf[f'model.layers.{hf_layer}.mlp.shared_experts.up_proj.weight'] = shared_up.clone(
-        )
-        hf[f'model.layers.{hf_layer}.mlp.shared_experts.down_proj.weight'] = shared_fc2.clone(
-        )
+        hf[f'model.layers.{hf_layer}.mlp.shared_experts.gate_proj.weight'] = shared_gate
+        hf[f'model.layers.{hf_layer}.mlp.shared_experts.up_proj.weight'] = shared_up
+        hf[f'model.layers.{hf_layer}.mlp.shared_experts.down_proj.weight'] = shared_fc2
 
         import gc
 
@@ -782,12 +860,9 @@ class MgCkptConvert:
                         fc1 = w1_3d[li].t()
                         gate, up = torch.chunk(fc1, 2, dim=0)
                         down = w2_3d[li].t()
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
-                        )
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
-                        )
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down.clone(
-                        )
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down
         else:
             num_local = self.num_experts // self.ep_size
             for ep_rank in range(self.ep_size):
@@ -811,12 +886,9 @@ class MgCkptConvert:
                         fc1 = local_states[tp_rank].pop(fc1_key)
                         fc2 = local_states[tp_rank].pop(fc2_key)
                         gate, up = torch.chunk(fc1, 2, dim=0)
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
-                        )
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
-                        )
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2.clone(
-                        )
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2
                     else:
                         fc1_parts = [
                             local_states[tp].pop(fc1_key) for tp in owners
@@ -827,12 +899,9 @@ class MgCkptConvert:
                         fc1 = torch.cat(fc1_parts, dim=0)
                         fc2 = torch.cat(fc2_parts, dim=1)
                         gate, up = torch.chunk(fc1, 2, dim=0)
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate.clone(
-                        )
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up.clone(
-                        )
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2.clone(
-                        )
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up
+                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2
 
                 for _, st in local_states.items():
                     del st
@@ -850,6 +919,8 @@ class MgCkptConvert:
                 packed[k] = v.contiguous()
             else:
                 packed[k] = v
+            self.total_size_bytes += packed[k].nelement(
+            ) * packed[k].element_size()
         safetensors.torch.save_file(packed, path, metadata={'format': 'pt'})
         if self.verbose:
             logger.info('Saved shard %d/%d: %s (tensors=%d)', shard_idx,
@@ -951,10 +1022,18 @@ class MgCkptConvert:
                     del models
                     gc.collect()
 
+        self._write_hf_artifacts()
         index_path = os.path.join(self.hf_save_dir,
                                   'model.safetensors.index.json')
         with open(index_path, 'w') as f:
-            json.dump({'metadata': {}, 'weight_map': self.weight_map}, f)
+            json.dump(
+                {
+                    'metadata': {
+                        'total_size': self.total_size_bytes
+                    },
+                    'weight_map': self.weight_map
+                },
+                f)
 
 
 def get_args():
@@ -1058,6 +1137,30 @@ def get_args():
                         type=int,
                         default=Q_LORA_RANK,
                         help='q LoRA rank used by MLA.')
+    parser.add_argument('--kv-lora-rank',
+                        type=int,
+                        default=None,
+                        help='Override kv LoRA rank used by MLA.')
+    parser.add_argument('--num-query-groups',
+                        type=int,
+                        default=None,
+                        help='Override num query groups (GQA).')
+    parser.add_argument('--vocab-size',
+                        type=int,
+                        default=None,
+                        help='Override vocab size.')
+    parser.add_argument('--ffn-hidden-size',
+                        type=int,
+                        default=None,
+                        help='Override dense FFN intermediate size.')
+    parser.add_argument('--moe-ffn-hidden-size',
+                        type=int,
+                        default=None,
+                        help='Override MoE expert intermediate size.')
+    parser.add_argument('--hf-config-template',
+                        type=str,
+                        default=None,
+                        help='HF config json path used as template.')
 
     args = parser.parse_args()
     return args
@@ -1095,6 +1198,12 @@ def main() -> None:
         noop_layers=args.noop_layers,
         rotary_base=args.rotary_base,
         q_lora_rank=args.q_lora_rank,
+        kv_lora_rank=args.kv_lora_rank,
+        num_query_groups=args.num_query_groups,
+        vocab_size=args.vocab_size,
+        ffn_hidden_size=args.ffn_hidden_size,
+        moe_ffn_hidden_size=args.moe_ffn_hidden_size,
+        hf_config_template=args.hf_config_template,
     )
     converter.run()
 
