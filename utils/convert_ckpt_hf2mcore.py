@@ -932,12 +932,15 @@ def main() -> None:
         raise ValueError('无法从 HF config 推断 num_layers，请显式传入 --num-layers')
     hidden_size = args.hidden_size or hf_cfg.get('hidden_size') or HIDDEN_SIZE
     num_experts = args.num_experts or hf_cfg.get('num_experts') or hf_cfg.get(
-        'n_experts') or NUM_EXPERTS
+        'n_experts') or hf_cfg.get('n_routed_experts') or NUM_EXPERTS
     num_attention_heads = args.num_attention_heads or hf_cfg.get(
         'num_attention_heads') or NUM_ATTENTION_HEADS
-    qk_head_dim = args.qk_head_dim or QK_HEAD_DIM
-    v_head_dim = args.v_head_dim or V_HEAD_DIM
-    qk_pos_emb_head_dim = args.qk_pos_emb_head_dim or QK_POS_EMB_HEAD_DIM
+    qk_head_dim = args.qk_head_dim or hf_cfg.get('qk_nope_head_dim') or hf_cfg.get(
+        'qk_head_dim') or QK_HEAD_DIM
+    v_head_dim = args.v_head_dim or hf_cfg.get('v_head_dim') or V_HEAD_DIM
+    qk_pos_emb_head_dim = args.qk_pos_emb_head_dim or hf_cfg.get(
+        'qk_rope_head_dim') or hf_cfg.get('qk_pos_emb_head_dim'
+                                          ) or QK_POS_EMB_HEAD_DIM
     converter = CkptConvert(
         hf_model_path=args.load_dir,
         mg_save_path=args.save_dir,
