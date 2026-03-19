@@ -14,7 +14,7 @@ logger.getLogger().setLevel(logger.INFO)
 
 HIDDEN_SIZE = 7168
 NUM_EXPERTS = 128
-FIRST_K_DENSE_REPLACE = 3
+FIRST_K_DENSE_REPLACE = 2
 NUM_ATTENTION_HEADS = 64
 QK_HEAD_DIM = 128
 QK_POS_EMB_HEAD_DIM = 64
@@ -854,7 +854,7 @@ def get_args():
                         help='Use moe grouped gemm.')
     parser.add_argument('--noop-layers',
                         type=str,
-                        default='47',
+                        default='',
                         help='Specity the noop layers.')
     parser.add_argument('--mtp-num-layers',
                         type=int,
@@ -866,11 +866,11 @@ def get_args():
         help='a list of number of layers, separated by comma; e.g., 4,4,4,4')
     parser.add_argument('--num-layers',
                         type=int,
-                        default=48,
+                        default=None,
                         help='Number of transformer layers.')
     parser.add_argument('--first-k-dense-replace',
                         type=int,
-                        default=3,
+                        default=FIRST_K_DENSE_REPLACE,
                         help='Customizing the number of dense layers.')
     parser.add_argument('--hidden-size',
                         type=int,
@@ -926,6 +926,10 @@ def main() -> None:
     args = get_args()
     logger.info('Arguments: %s', args)
     hf_cfg = _read_hf_config(args.load_dir)
+    num_layers = args.num_layers or hf_cfg.get('num_hidden_layers') or hf_cfg.get(
+        'num_layers') or hf_cfg.get('n_layer')
+    if not num_layers:
+        raise ValueError('无法从 HF config 推断 num_layers，请显式传入 --num-layers')
     hidden_size = args.hidden_size or hf_cfg.get('hidden_size') or HIDDEN_SIZE
     num_experts = args.num_experts or hf_cfg.get('num_experts') or hf_cfg.get(
         'n_experts') or NUM_EXPERTS
@@ -937,7 +941,7 @@ def main() -> None:
     converter = CkptConvert(
         hf_model_path=args.load_dir,
         mg_save_path=args.save_dir,
-        num_layers=args.num_layers,
+        num_layers=int(num_layers),
         tp_size=args.target_tensor_parallel_size,
         pp_size=args.target_pipeline_parallel_size,
         ep_size=args.target_expert_parallel_size,

@@ -15,8 +15,8 @@ logger.getLogger().setLevel(logger.INFO)
 
 HIDDEN_SIZE = 7168
 NUM_EXPERTS = 128
-FIRST_K_DENSE_REPLACE = 3
-NUM_ATTENTION_HEADS = 112
+FIRST_K_DENSE_REPLACE = 2
+NUM_ATTENTION_HEADS = 64
 QK_HEAD_DIM = 128
 QK_POS_EMB_HEAD_DIM = 64
 V_HEAD_DIM = 128
@@ -1071,7 +1071,7 @@ def get_args():
                         help='Use moe grouped gemm.')
     parser.add_argument('--noop-layers',
                         type=str,
-                        default='47',
+                        default='',
                         help='Specity the noop layers.')
     parser.add_argument('--mtp-num-layers',
                         type=int,
@@ -1099,11 +1099,11 @@ def get_args():
         help='An innovative bidirectional pipeline parallelism algorithm.')
     parser.add_argument('--num-layers',
                         type=int,
-                        default=48,
+                        default=32,
                         help='Number of transformer layers.')
     parser.add_argument('--first-k-dense-replace',
                         type=int,
-                        default=3,
+                        default=FIRST_K_DENSE_REPLACE,
                         help='Customizing the number of dense layers.')
     parser.add_argument('--rotary-base',
                         type=float,
