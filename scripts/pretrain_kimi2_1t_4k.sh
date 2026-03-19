@@ -20,17 +20,6 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 
-MLA_ARGS="
-    --multi-latent-attention \
-    --qk-pos-emb-head-dim 64 \
-    --qk-head-dim 128 \
-    --q-lora-rank 1536 \
-    --kv-lora-rank 512 \
-    --v-head-dim 128 \
-    --qk-layernorm \
-    --mla-fa-without-pad \
-"
-
 MOE_ARGS="
     --moe-shared-expert-overlap \
     --moe-grouped-gemm \
