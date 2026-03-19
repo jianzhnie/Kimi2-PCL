@@ -50,6 +50,7 @@ class DeepseekV3Config(PretrainedConfig):
         rms_norm_eps=1e-6,
         use_cache=True,
         mla_fa_without_pad=True,
+        fa_without_pad=None,
         pad_token_id=None,
         bos_token_id=163584,
         eos_token_id=163585,
@@ -108,6 +109,10 @@ class DeepseekV3Config(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.mla_fa_without_pad = mla_fa_without_pad
+        # Backward-compatible alias: prefer `fa_without_pad` if provided, otherwise fall back to `mla_fa_without_pad`.
+        self.fa_without_pad = (fa_without_pad
+                               if fa_without_pad is not None else
+                               mla_fa_without_pad)
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
