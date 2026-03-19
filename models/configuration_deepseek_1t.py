@@ -26,8 +26,6 @@ class DeepseekV3Config(PretrainedConfig):
         n_routed_experts=128,
         ep_size=1,
         routed_scaling_factor=2.827,
-        kv_lora_rank=512,
-        q_lora_rank=1536,
         qk_rope_head_dim=64,
         v_head_dim=128,
         qk_nope_head_dim=128,
@@ -40,7 +38,7 @@ class DeepseekV3Config(PretrainedConfig):
         first_k_dense_replace=2,
         norm_topk_prob=True,
         scoring_func='sigmoid',
-        aux_loss_alpha=0.001,
+        aux_loss_alpha=0.01,
         seq_aux=True,
         moe_router_enable_expert_bias=True,
         moe_router_dtype='fp32',
@@ -49,7 +47,6 @@ class DeepseekV3Config(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         use_cache=True,
-        mla_fa_without_pad=True,
         fa_without_pad=None,
         pad_token_id=None,
         bos_token_id=163584,
@@ -76,8 +73,6 @@ class DeepseekV3Config(PretrainedConfig):
         self.n_routed_experts = n_routed_experts
         self.ep_size = ep_size
         self.routed_scaling_factor = routed_scaling_factor
-        self.kv_lora_rank = kv_lora_rank
-        self.q_lora_rank = q_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.qk_nope_head_dim = qk_nope_head_dim
@@ -108,11 +103,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.mla_fa_without_pad = mla_fa_without_pad
-        # Backward-compatible alias: prefer `fa_without_pad` if provided, otherwise fall back to `mla_fa_without_pad`.
-        self.fa_without_pad = (fa_without_pad
-                               if fa_without_pad is not None else
-                               mla_fa_without_pad)
+        self.fa_without_pad = fa_without_pad
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,

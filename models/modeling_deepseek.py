@@ -896,8 +896,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
 
             attention_mask = kwargs.pop('padding_mask')
 
-        if getattr(self.config, 'fa_without_pad',
-                   getattr(self.config, 'mla_fa_without_pad', False)):
+        if getattr(self.config, 'fa_without_pad', False):
             attention_mask = None
 
         output_attentions = False
@@ -905,14 +904,11 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads,
-                                                       self.q_head_dim).transpose(
-                                                           1, 2)
+                                                       self.q_head_dim)
         key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.q_head_dim).transpose(
-                1, 2)
+            bsz, q_len, self.num_key_value_heads, self.q_head_dim)
         value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.v_head_dim).transpose(
-                1, 2)
+            bsz, q_len, self.num_key_value_heads, self.v_head_dim)
 
         if self.q_layernorm is not None:
             query_states = self.q_layernorm(query_states)
@@ -924,7 +920,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         k_nope, k_pe = torch.split(
             key_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        kv_seq_len = value_states.shape[-2]
+        kv_seq_len = value_states.shape[1]
         if past_key_value is not None:
             if hasattr(past_key_value, 'get_usable_length'):
                 kv_seq_len += past_key_value.get_usable_length(
@@ -933,31 +929,25 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                 kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids, unsqueeze_dim=2)
 
-        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
-        query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
-
-        key_states = k_pe.new_empty(bsz, self.num_key_value_heads, q_len,
-                                    self.q_head_dim)
-        key_states[:, :, :, :self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
+        query_states = torch.cat([q_nope, q_pe], dim=-1)
+        key_states = torch.cat([k_nope, k_pe], dim=-1)
 
         if self.q_head_dim != self.v_head_dim:
             value_states = F.pad(value_states, [0, self.q_head_dim - self.v_head_dim])
 
         if past_key_value is not None:
+            # past_key_value expects (bsz, num_heads, seq_len, head_dim) or similar
+            # DeepseekV3Cache usually handles the format.
+            # We transpose to (bsz, heads, q_len, head_dim) for cache update if needed
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
             cache_kwargs = {'sin': sin, 'cos': cos}
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
 
         dropout_rate = self.attention_dropout if self.training else 0.0
 
