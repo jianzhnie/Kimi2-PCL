@@ -71,10 +71,8 @@ class CkptConvert:
         num_attention_heads: int,
         qk_head_dim: int,
         v_head_dim: int,
-        qk_pos_emb_head_dim: int,
         moe_grouped_gemm: bool,
         moe_tp_extend_ep: bool,
-        mla_mm_split: bool,
         schedules_method: str | None,
         vpp_stage: int | None,
         num_layer_list: str | None,
@@ -93,10 +91,8 @@ class CkptConvert:
         self.num_attention_heads = num_attention_heads
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
-        self.qk_pos_emb_head_dim = qk_pos_emb_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
         self.moe_tp_extend_ep = moe_tp_extend_ep
-        self.mla_mm_split = mla_mm_split
         self.schedules_method = schedules_method
         self.dualpipe = schedules_method == 'dualpipev'
         self.vpp_stage = vpp_stage
@@ -400,105 +396,8 @@ class CkptConvert:
         qkv_key = f'{prefix}.linear_qkv.weight'
         proj_key = f'{prefix}.linear_proj.weight'
 
-        q_a_key = f'model.layers.{hf_layer}.self_attn.q_a_proj.weight'
-        if q_a_key in weights:
-            q_a = weights.pop(q_a_key)
-            kv_a = weights.pop(
-                f'model.layers.{hf_layer}.self_attn.kv_a_proj_with_mqa.weight')
-            qkv_weight = torch.cat(
-                [
-                    q_a.reshape((-1, self.hidden_size)),
-                    kv_a.reshape((-1, self.hidden_size))
-                ],
-                dim=0,
-            )
-            o_proj = weights.pop(
-                f'model.layers.{hf_layer}.self_attn.o_proj.weight')
-            q_ln = weights.pop(
-                f'model.layers.{hf_layer}.self_attn.q_a_layernorm.weight')
-            kv_ln = weights.pop(
-                f'model.layers.{hf_layer}.self_attn.kv_a_layernorm.weight')
-            q_b_proj = weights.pop(
-                f'model.layers.{hf_layer}.self_attn.q_b_proj.weight')
-            kv_b_proj = weights.pop(
-                f'model.layers.{hf_layer}.self_attn.kv_b_proj.weight')
-
-            q_norm_key = f'{prefix}.q_layernorm.weight'
-            kv_norm_key = f'{prefix}.kv_layernorm.weight'
-
-            qk_nope_shards: list[torch.Tensor] | None = None
-            qk_rope_shards: list[torch.Tensor] | None = None
-            kv_nope_shards: list[torch.Tensor] | None = None
-            linear_v_shards: list[torch.Tensor] | None = None
-            q_b_shards: list[torch.Tensor] | None = None
-            kv_b_shards: list[torch.Tensor] | None = None
-
-            if self.mla_mm_split:
-                qk_nope_key = f'{prefix}.linear_qk_nope.weight'
-                qk_rope_key = f'{prefix}.linear_qk_rope.weight'
-                kv_nope_key = f'{prefix}.linear_kv_nope.weight'
-                linear_v_key = f'{prefix}.linear_v.weight'
-
-                q_b_proj = q_b_proj.reshape(
-                    self.num_attention_heads,
-                    (self.qk_head_dim + self.qk_pos_emb_head_dim), -1)
-                kv_b_proj = kv_b_proj.reshape(
-                    self.num_attention_heads,
-                    (self.qk_head_dim + self.v_head_dim), -1)
-
-                qk_nope = q_b_proj[:, :self.qk_head_dim].reshape(
-                    -1, self.hidden_size)
-                qk_rope = q_b_proj[:, self.qk_head_dim:].reshape(
-                    -1, self.hidden_size)
-                kv_nope = kv_b_proj[:, :self.qk_head_dim].reshape(
-                    -1, self.hidden_size)
-                linear_v = kv_b_proj[:, self.qk_head_dim:].reshape(
-                    -1, self.hidden_size)
-
-                qk_nope_tp = torch.chunk(qk_nope, self.tp_size, dim=0)
-                qk_rope_tp = torch.chunk(qk_rope, self.tp_size, dim=0)
-                kv_nope_tp = torch.chunk(kv_nope, self.tp_size, dim=0)
-                linear_v_tp = torch.chunk(linear_v, self.tp_size, dim=0)
-                qk_nope_shards = [t.clone() for t in qk_nope_tp]
-                qk_rope_shards = [t.clone() for t in qk_rope_tp]
-                kv_nope_shards = [t.clone() for t in kv_nope_tp]
-                linear_v_shards = [t.clone() for t in linear_v_tp]
-            else:
-                q_up_key = f'{prefix}.linear_q_up_proj.weight'
-                kv_up_key = f'{prefix}.linear_kv_up_proj.weight'
-                q_b_tp = torch.chunk(q_b_proj, self.tp_size, dim=0)
-                kv_b_tp = torch.chunk(kv_b_proj, self.tp_size, dim=0)
-                q_b_shards = [t.clone() for t in q_b_tp]
-                kv_b_shards = [t.clone() for t in kv_b_tp]
-
-            o_proj_tp = torch.chunk(o_proj, self.tp_size, dim=1)
-            o_proj_shards = [t.clone() for t in o_proj_tp]
-            for ep_rank in range(self.ep_size):
-                for tp_rank in range(self.tp_size):
-                    mg_model[ep_rank][tp_rank][qkv_key] = qkv_weight
-                    mg_model[ep_rank][tp_rank][
-                        proj_key] = o_proj_shards[tp_rank]
-                    mg_model[ep_rank][tp_rank][q_norm_key] = q_ln
-                    mg_model[ep_rank][tp_rank][kv_norm_key] = kv_ln
-
-                    if self.mla_mm_split:
-                        mg_model[ep_rank][tp_rank][
-                            qk_nope_key] = qk_nope_shards[tp_rank]
-                        mg_model[ep_rank][tp_rank][
-                            qk_rope_key] = qk_rope_shards[tp_rank]
-                        mg_model[ep_rank][tp_rank][
-                            kv_nope_key] = kv_nope_shards[tp_rank]
-                        mg_model[ep_rank][tp_rank][
-                            linear_v_key] = linear_v_shards[tp_rank]
-                    else:
-                        mg_model[ep_rank][tp_rank][
-                            q_up_key] = q_b_shards[tp_rank]
-                        mg_model[ep_rank][tp_rank][
-                            kv_up_key] = kv_b_shards[tp_rank]
-
-                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank], proj_key,
-                                          o_proj_shards[tp_rank])
-            return
+        if 'model.layers.0.self_attn.q_proj.weight' not in self.weight_map and 'model.layers.0.self_attn.q_a_proj.weight' in self.weight_map:
+            raise ValueError('检测到 MLA 权重(如 q_a_proj)，但当前代码已移除 MLA 支持，只支持 GQA。请检查输入的 HF 权重。')
 
         q_weight = weights.pop(
             f'model.layers.{hf_layer}.self_attn.q_proj.weight')
@@ -889,25 +788,17 @@ def get_args():
     parser.add_argument('--qk-head-dim',
                         type=int,
                         default=None,
-                        help='Override qk head dim (MLA).')
+                        help='Override qk head dim.')
     parser.add_argument('--v-head-dim',
                         type=int,
                         default=None,
-                        help='Override v head dim (MLA).')
-    parser.add_argument('--qk-pos-emb-head-dim',
-                        type=int,
-                        default=None,
-                        help='Override qk pos emb head dim (MLA).')
+                        help='Override v head dim.')
     parser.add_argument(
         '--moe-tp-extend-ep',
         action='store_true',
         help=
         'use tp group to extend experts parallism instead of sharding weight tensor of experts in tp group',
     )
-    parser.add_argument('--mla-mm-split',
-                        action='store_true',
-                        default=False,
-                        help='Split 2 up-proj matmul into 4 in MLA')
     parser.add_argument(
         '--schedules-method',
         type=str,
@@ -938,9 +829,7 @@ def main() -> None:
     qk_head_dim = args.qk_head_dim or hf_cfg.get('qk_nope_head_dim') or hf_cfg.get(
         'qk_head_dim') or QK_HEAD_DIM
     v_head_dim = args.v_head_dim or hf_cfg.get('v_head_dim') or V_HEAD_DIM
-    qk_pos_emb_head_dim = args.qk_pos_emb_head_dim or hf_cfg.get(
-        'qk_rope_head_dim') or hf_cfg.get('qk_pos_emb_head_dim'
-                                          ) or QK_POS_EMB_HEAD_DIM
+
     converter = CkptConvert(
         hf_model_path=args.load_dir,
         mg_save_path=args.save_dir,
@@ -954,10 +843,8 @@ def main() -> None:
         num_attention_heads=num_attention_heads,
         qk_head_dim=qk_head_dim,
         v_head_dim=v_head_dim,
-        qk_pos_emb_head_dim=qk_pos_emb_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
         moe_tp_extend_ep=args.moe_tp_extend_ep,
-        mla_mm_split=args.mla_mm_split,
         schedules_method=args.schedules_method,
         vpp_stage=args.num_layers_per_virtual_pipeline_stage,
         num_layer_list=args.num_layer_list,

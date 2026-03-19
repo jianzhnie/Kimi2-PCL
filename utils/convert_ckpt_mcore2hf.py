@@ -77,14 +77,11 @@ class MgCkptConvert:
         qk_pos_emb_head_dim: int,
         moe_grouped_gemm: bool,
         moe_tp_extend_ep: bool,
-        mla_mm_split: bool,
         schedules_method: str | None,
         vpp_stage: int | None,
         num_layer_list: str | None,
         noop_layers: str | None,
         rotary_base: float,
-        q_lora_rank: int,
-        kv_lora_rank: int | None = None,
         num_query_groups: int | None = None,
         vocab_size: int | None = None,
         ffn_hidden_size: int | None = None,
@@ -113,20 +110,18 @@ class MgCkptConvert:
         self.qk_pos_emb_head_dim = qk_pos_emb_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
         self.moe_tp_extend_ep = moe_tp_extend_ep
-        self.mla_mm_split = mla_mm_split
         self.schedules_method = schedules_method
         self.dualpipe = schedules_method == 'dualpipev'
         self.vpp_stage = vpp_stage
         self.num_layer_list = num_layer_list
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
         self.rotary_base = rotary_base
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
         self.num_query_groups = num_query_groups
         self.vocab_size = vocab_size
         self.ffn_hidden_size = ffn_hidden_size
         self.moe_ffn_hidden_size = moe_ffn_hidden_size
         self.hf_config_template = hf_config_template
+        self.detected_num_kv_heads = None
 
         os.makedirs(self.hf_save_dir, exist_ok=True)
 
@@ -214,18 +209,20 @@ class MgCkptConvert:
         cfg['qk_nope_head_dim'] = self.qk_head_dim
         cfg['qk_rope_head_dim'] = self.qk_pos_emb_head_dim
         cfg['v_head_dim'] = self.v_head_dim
-        cfg['q_lora_rank'] = self.q_lora_rank
         cfg['rope_theta'] = float(self.rotary_base)
         cfg['ep_size'] = self.ep_size
         cfg['first_k_dense_replace'] = self.first_k_dense_replace
 
-        if self.kv_lora_rank is not None:
-            cfg['kv_lora_rank'] = self.kv_lora_rank
-        if self.num_query_groups is not None:
-            cfg['num_query_groups'] = self.num_query_groups
-            cfg['group_query_attention'] = self.num_query_groups > 0
+        kv_heads = self.detected_num_kv_heads or self.num_query_groups
+        if kv_heads is not None:
+            if kv_heads > self.num_attention_heads:
+                # If user passed ratio instead of count
+                kv_heads = self.num_attention_heads // kv_heads
+            cfg['num_key_value_heads'] = kv_heads
+            cfg['group_query_attention'] = kv_heads < self.num_attention_heads
             if cfg['group_query_attention']:
-                cfg['num_key_value_heads'] = self.num_attention_heads // self.num_query_groups
+                cfg['num_query_groups'] = self.num_attention_heads // kv_heads
+        
         if self.vocab_size is not None:
             cfg['vocab_size'] = self.vocab_size
         if self.ffn_hidden_size is not None:
@@ -620,128 +617,59 @@ class MgCkptConvert:
         qkv_key = f'{prefix}.linear_qkv.weight'
         proj_key = f'{prefix}.linear_proj.weight'
         q_norm_key = f'{prefix}.q_layernorm.weight'
-        kv_norm_key = f'{prefix}.kv_layernorm.weight'
-        q_up_key = f'{prefix}.linear_q_up_proj.weight'
-        kv_up_key = f'{prefix}.linear_kv_up_proj.weight'
-
-        if kv_norm_key not in models[(0, 0)]:
-            k_norm_key = f'{prefix}.k_layernorm.weight'
-            linear_proj_list: list[torch.Tensor] = []
-            q_parts: list[torch.Tensor] = []
-            k_parts: list[torch.Tensor] = []
-            v_parts: list[torch.Tensor] = []
-
-            head_dim = self.hidden_size // self.num_attention_heads
-            if self.num_attention_heads % self.tp_size != 0:
-                raise ValueError(
-                    f'num_attention_heads={self.num_attention_heads} 不能整除 tp_size={self.tp_size}'
-                )
-            q_per_tp = (self.num_attention_heads // self.tp_size) * head_dim
-
-            for tp_rank in range(self.tp_size):
-                linear_proj_list.append(models[(tp_rank, 0)].pop(proj_key))
-                qkv_shard = models[(tp_rank, 0)].pop(qkv_key)
-                rem = qkv_shard.shape[0] - q_per_tp
-                if rem < 0 or rem % 2 != 0:
-                    raise ValueError(
-                        f'{qkv_key} 分片形状异常: {qkv_shard.shape}, q_per_tp={q_per_tp}'
-                    )
-                kv_per_tp = rem // 2
-                q_r, k_r, v_r = torch.split(qkv_shard,
-                                            [q_per_tp, kv_per_tp, kv_per_tp],
-                                            dim=0)
-                q_parts.append(q_r)
-                k_parts.append(k_r)
-                v_parts.append(v_r)
-
-            o_proj = torch.cat(linear_proj_list, dim=1)
-            hf[f'model.layers.{hf_layer}.self_attn.q_proj.weight'] = torch.cat(
-                q_parts, dim=0)
-            hf[f'model.layers.{hf_layer}.self_attn.k_proj.weight'] = torch.cat(
-                k_parts, dim=0)
-            hf[f'model.layers.{hf_layer}.self_attn.v_proj.weight'] = torch.cat(
-                v_parts, dim=0)
-            hf[f'model.layers.{hf_layer}.self_attn.o_proj.weight'] = o_proj
-            hf[f'model.layers.{hf_layer}.self_attn.q_layernorm.weight'] = models[
-                (0, 0)].pop(q_norm_key)
-            hf[f'model.layers.{hf_layer}.self_attn.k_layernorm.weight'] = models[
-                (0, 0)].pop(k_norm_key)
-            hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone(
-            )
-            return
+        k_norm_key = f'{prefix}.k_layernorm.weight'
 
         linear_proj_list: list[torch.Tensor] = []
-        linear_qb_list: list[torch.Tensor] = []
-        linear_kvb_list: list[torch.Tensor] = []
-        qk_nope_list: list[torch.Tensor] = []
-        qk_rope_list: list[torch.Tensor] = []
-        kv_nope_list: list[torch.Tensor] = []
-        linear_v_list: list[torch.Tensor] = []
+        q_parts: list[torch.Tensor] = []
+        k_parts: list[torch.Tensor] = []
+        v_parts: list[torch.Tensor] = []
+
+        q_head_dim = self.qk_head_dim + self.qk_pos_emb_head_dim
+        if self.num_attention_heads % self.tp_size != 0:
+            raise ValueError(
+                f'num_attention_heads={self.num_attention_heads} 不能整除 tp_size={self.tp_size}'
+            )
+        q_per_tp = (self.num_attention_heads // self.tp_size) * q_head_dim
 
         for tp_rank in range(self.tp_size):
             linear_proj_list.append(models[(tp_rank, 0)].pop(proj_key))
-            if self.mla_mm_split:
-                qk_nope_list.append(
-                    models[(tp_rank,
-                            0)].pop(f'{prefix}.linear_qk_nope.weight'))
-                qk_rope_list.append(
-                    models[(tp_rank,
-                            0)].pop(f'{prefix}.linear_qk_rope.weight'))
-                kv_nope_list.append(
-                    models[(tp_rank,
-                            0)].pop(f'{prefix}.linear_kv_nope.weight'))
-                linear_v_list.append(
-                    models[(tp_rank, 0)].pop(f'{prefix}.linear_v.weight'))
-            else:
-                linear_qb_list.append(models[(tp_rank, 0)].pop(q_up_key))
-                linear_kvb_list.append(models[(tp_rank, 0)].pop(kv_up_key))
+            qkv_shard = models[(tp_rank, 0)].pop(qkv_key)
+            rem = qkv_shard.shape[0] - q_per_tp
+            if rem < 0:
+                raise ValueError(
+                    f'{qkv_key} 分片形状异常: {qkv_shard.shape}, q_per_tp={q_per_tp}'
+                )
+            denom = q_head_dim + self.v_head_dim
+            if rem % denom != 0:
+                raise ValueError(
+                    f'{qkv_key} 分片剩余维度异常: rem={rem}, q_head_dim={q_head_dim}, v_head_dim={self.v_head_dim}'
+                )
+            kv_heads_per_tp = rem // denom
+            if self.detected_num_kv_heads is None:
+                self.detected_num_kv_heads = kv_heads_per_tp * self.tp_size
+            k_per_tp = kv_heads_per_tp * q_head_dim
+            v_per_tp = kv_heads_per_tp * self.v_head_dim
+            q_r, k_r, v_r = torch.split(qkv_shard, [q_per_tp, k_per_tp, v_per_tp],
+                                        dim=0)
+            q_parts.append(q_r)
+            k_parts.append(k_r)
+            v_parts.append(v_r)
 
         o_proj = torch.cat(linear_proj_list, dim=1)
-
-        if self.mla_mm_split:
-            qk_nope_weight = torch.cat(qk_nope_list,
-                                       dim=0).reshape(self.num_attention_heads,
-                                                      self.qk_head_dim, -1)
-            qk_rope_weight = torch.cat(qk_rope_list,
-                                       dim=0).reshape(self.num_attention_heads,
-                                                      self.qk_pos_emb_head_dim,
-                                                      -1)
-            kv_nope_weight = torch.cat(kv_nope_list,
-                                       dim=0).reshape(self.num_attention_heads,
-                                                      self.qk_head_dim, -1)
-            linear_v_weight = torch.cat(linear_v_list, dim=0).reshape(
-                self.num_attention_heads, self.v_head_dim, -1)
-            q_b_proj = torch.cat(
-                [qk_nope_weight, qk_rope_weight], dim=1).reshape(
-                    self.num_attention_heads *
-                    (self.qk_head_dim + self.qk_pos_emb_head_dim), -1)
-            kv_b_proj = torch.cat([kv_nope_weight, linear_v_weight],
-                                  dim=1).reshape(
-                                      self.num_attention_heads *
-                                      (self.qk_head_dim + self.v_head_dim), -1)
-        else:
-            q_b_proj = torch.cat(linear_qb_list, dim=0)
-            kv_b_proj = torch.cat(linear_kvb_list, dim=0)
-
-        qkv = models[(0, 0)].pop(qkv_key)
-        if qkv.shape[0] < self.q_lora_rank:
-            raise ValueError(
-                f'linear_qkv.weight 行数 {qkv.shape[0]} 小于 q_lora_rank={self.q_lora_rank}'
-            )
-        q_a_proj = qkv[:self.q_lora_rank, :]
-        kv_a_proj = qkv[self.q_lora_rank:, :]
-        q_a_ln = models[(0, 0)].pop(q_norm_key)
-        kv_a_ln = models[(0, 0)].pop(kv_norm_key)
-
-        hf[f'model.layers.{hf_layer}.self_attn.q_a_proj.weight'] = q_a_proj
-        hf[f'model.layers.{hf_layer}.self_attn.kv_a_proj_with_mqa.weight'] = kv_a_proj
+        hf[f'model.layers.{hf_layer}.self_attn.q_proj.weight'] = torch.cat(
+            q_parts, dim=0)
+        hf[f'model.layers.{hf_layer}.self_attn.k_proj.weight'] = torch.cat(
+            k_parts, dim=0)
+        hf[f'model.layers.{hf_layer}.self_attn.v_proj.weight'] = torch.cat(
+            v_parts, dim=0)
         hf[f'model.layers.{hf_layer}.self_attn.o_proj.weight'] = o_proj
-        hf[f'model.layers.{hf_layer}.self_attn.q_a_layernorm.weight'] = q_a_ln
-        hf[f'model.layers.{hf_layer}.self_attn.kv_a_layernorm.weight'] = kv_a_ln
-        hf[f'model.layers.{hf_layer}.self_attn.q_b_proj.weight'] = q_b_proj
-        hf[f'model.layers.{hf_layer}.self_attn.kv_b_proj.weight'] = kv_b_proj
+        hf[f'model.layers.{hf_layer}.self_attn.q_layernorm.weight'] = models[
+            (0, 0)].pop(q_norm_key)
+        hf[f'model.layers.{hf_layer}.self_attn.k_layernorm.weight'] = models[
+            (0, 0)].pop(k_norm_key)
         hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone(
         )
+        return
 
     def _reconstruct_router(self, models: dict[tuple[int, int],
                                                dict[str, torch.Tensor]],
@@ -1087,10 +1015,6 @@ def get_args():
         help=
         'use tp group to extend experts parallism instead of sharding weight tensor of experts in tp group'
     )
-    parser.add_argument('--mla-mm-split',
-                        action='store_true',
-                        default=False,
-                        help='Split 2 up-proj matmul into 4 in MLA')
     parser.add_argument(
         '--schedules-method',
         type=str,
@@ -1124,23 +1048,15 @@ def get_args():
     parser.add_argument('--qk-head-dim',
                         type=int,
                         default=None,
-                        help='Override qk head dim (MLA).')
+                        help='Override qk head dim.')
     parser.add_argument('--v-head-dim',
                         type=int,
                         default=None,
-                        help='Override v head dim (MLA).')
+                        help='Override v head dim.')
     parser.add_argument('--qk-pos-emb-head-dim',
                         type=int,
                         default=None,
-                        help='Override qk pos emb head dim (MLA).')
-    parser.add_argument('--q-lora-rank',
-                        type=int,
-                        default=Q_LORA_RANK,
-                        help='q LoRA rank used by MLA.')
-    parser.add_argument('--kv-lora-rank',
-                        type=int,
-                        default=None,
-                        help='Override kv LoRA rank used by MLA.')
+                        help='Override qk pos emb head dim.')
     parser.add_argument('--num-query-groups',
                         type=int,
                         default=None,
@@ -1191,14 +1107,11 @@ def main() -> None:
         qk_pos_emb_head_dim=qk_pos_emb_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
         moe_tp_extend_ep=args.moe_tp_extend_ep,
-        mla_mm_split=args.mla_mm_split,
         schedules_method=args.schedules_method,
         vpp_stage=args.num_layers_per_virtual_pipeline_stage,
         num_layer_list=args.num_layer_list,
         noop_layers=args.noop_layers,
         rotary_base=args.rotary_base,
-        q_lora_rank=args.q_lora_rank,
-        kv_lora_rank=args.kv_lora_rank,
         num_query_groups=args.num_query_groups,
         vocab_size=args.vocab_size,
         ffn_hidden_size=args.ffn_hidden_size,
