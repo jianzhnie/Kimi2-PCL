@@ -78,6 +78,7 @@ class CkptConvert:
         num_layer_list: str | None,
         noop_layers: str | None,
         qlora_nf4: bool,
+        rotary_base: float = 50000.0,
     ):
         self.hf_model_path = hf_model_path
         self.mg_save_path = mg_save_path
@@ -99,6 +100,7 @@ class CkptConvert:
         self.num_layer_list = num_layer_list
         self.noop_layers = noop_layers
         self.qlora_nf4 = qlora_nf4
+        self.rotary_base = rotary_base
 
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
         if self.dualpipe:
@@ -644,12 +646,14 @@ class CkptConvert:
                         'model1': mg_model[1][ep_rank][tp_rank],
                         'checkpoint_version': 3.0,
                         'iteration': 1,
+                        'args': {'rotary_base': self.rotary_base},
                     }
                 else:
                     payload = {
                         'model': mg_model[ep_rank][tp_rank],
                         'checkpoint_version': 3.0,
                         'iteration': 1,
+                        'args': {'rotary_base': self.rotary_base},
                     }
                 torch.save(payload,
                            outpath,
@@ -808,6 +812,10 @@ def get_args():
     parser.add_argument('--qlora-nf4',
                         action='store_true',
                         help='use bitsandbytes nf4 to quantize model.')
+    parser.add_argument('--rotary-base',
+                        type=float,
+                        default=None,
+                        help='Rotary base for RoPE')
 
     args, _ = parser.parse_known_args()
     return args
@@ -829,6 +837,7 @@ def main() -> None:
     qk_head_dim = args.qk_head_dim or hf_cfg.get('qk_nope_head_dim') or hf_cfg.get(
         'qk_head_dim') or QK_HEAD_DIM
     v_head_dim = args.v_head_dim or hf_cfg.get('v_head_dim') or V_HEAD_DIM
+    rotary_base = args.rotary_base or hf_cfg.get('rope_theta') or 50000.0
 
     converter = CkptConvert(
         hf_model_path=args.load_dir,
@@ -850,6 +859,7 @@ def main() -> None:
         num_layer_list=args.num_layer_list,
         noop_layers=args.noop_layers,
         qlora_nf4=args.qlora_nf4,
+        rotary_base=rotary_base,
     )
     converter.run()
 

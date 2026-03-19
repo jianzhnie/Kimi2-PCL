@@ -150,7 +150,9 @@ class MgCkptConvert:
             self._build_vpprank_layer_map()
 
         self.num_real_layers = self.num_layers - len(self.noop_layers_list)
-        inv_dim = self.hidden_size // self.num_attention_heads
+        
+        # 修正：使用 qk_pos_emb_head_dim 计算 inv_dim
+        inv_dim = self.qk_pos_emb_head_dim
         inv_freq = 1.0 / (self.rotary_base**(
             torch.arange(0, inv_dim, 2, dtype=torch.float32) / inv_dim))
         self.inv_freq = inv_freq
@@ -229,6 +231,11 @@ class MgCkptConvert:
             cfg['intermediate_size'] = self.ffn_hidden_size
         if self.moe_ffn_hidden_size is not None:
             cfg['moe_intermediate_size'] = self.moe_ffn_hidden_size
+
+        # 显式更新 rope_scaling 以匹配训练脚本 (factor=32.0, type=yarn)
+        if 'rope_scaling' in cfg and isinstance(cfg['rope_scaling'], dict):
+            cfg['rope_scaling']['factor'] = 32.0
+            cfg['rope_scaling']['type'] = 'yarn'
 
         with open(os.path.join(self.hf_save_dir, 'config.json'), 'w') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
