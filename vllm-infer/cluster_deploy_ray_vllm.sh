@@ -2,12 +2,14 @@
 
 set -euo pipefail
 
-NODES_FILE="${NODES_FILE:-/Users/jianzhengnie/work_dir/Kimi2-PCL/infer/nodel_liist.txt}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+NODES_FILE="${NODES_FILE:-${SCRIPT_DIR}/nodel_liist.txt}"
 IMAGE_NAME="${IMAGE_NAME:-quay.io/ascend/vllm-ascend:main-a3}"
 IMAGE_TAR="${IMAGE_TAR:-/llm_workspace_1P/robin/hfhub/docker/image/vllm-ascend.main-a3.tar}"
-RUN_CONTAINER_SCRIPT="${RUN_CONTAINER_SCRIPT:-/Users/jianzhengnie/work_dir/Kimi2-PCL/infer/ascend_infer_docker_run.sh}"
+RUN_CONTAINER_SCRIPT="${RUN_CONTAINER_SCRIPT:-${SCRIPT_DIR}/ascend_infer_docker_run.sh}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm-ascend-env-a3}"
-VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-/Users/jianzhengnie/work_dir/Kimi2-PCL/infer/vllm_start.sh}"
+VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${SCRIPT_DIR}/vllm_start.sh}"
 
 MASTER_NODE="${MASTER_NODE:-}"
 
@@ -25,7 +27,7 @@ VLLM_PORT="${VLLM_PORT:-8000}"
 usage() {
   cat <<'USAGE'
 Usage:
-  bash infer/cluster_deploy_ray_vllm.sh [--prepare-only|--ray-only|--serve-only]
+  bash vllm-infer/cluster_deploy_ray_vllm.sh [--prepare-only|--ray-only|--serve-only]
 
 Environment:
   NODES_FILE
@@ -108,13 +110,13 @@ fi
 if docker image inspect '${IMAGE_NAME}' >/dev/null 2>&1; then
   :
 else
-  if [[ ! -f '${IMAGE_TAR}' ]]; then
+  if [ ! -f '${IMAGE_TAR}' ]; then
     echo '[${node}] image tar not found: ${IMAGE_TAR}' >&2
     exit 2
   fi
   docker load -i '${IMAGE_TAR}'
 fi
-if [[ ! -f '${RUN_CONTAINER_SCRIPT}' ]]; then
+if [ ! -f '${RUN_CONTAINER_SCRIPT}' ]; then
   echo '[${node}] run script not found: ${RUN_CONTAINER_SCRIPT}' >&2
   exit 2
 fi
@@ -134,69 +136,70 @@ detect_master() {
 
 ray_in_container() {
   local node="$1"
-  shift
-  local cmd="$*"
+  local script="$2"
   ssh_run "$node" bash -lc "set -euo pipefail
-docker exec '${CONTAINER_NAME}' bash -lc \"${cmd}\"
-"
+docker exec -i '${CONTAINER_NAME}' bash -s
+" <<<"$script"
 }
 
 start_ray_head() {
   local node="$1"
-  ray_in_container "$node" "
+  ray_in_container "$node" "$(cat <<EOS
 set -euo pipefail
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES='${RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES}'
 export ASCEND_RT_VISIBLE_DEVICES='${ASCEND_RT_VISIBLE_DEVICES}'
-local_ip=\"\$(hostname -I 2>/dev/null | awk '{print \$1}')\"
-if [[ -z \"\$local_ip\" ]]; then
-  local_ip=\"\$(hostname -i 2>/dev/null | awk '{print \$1}')\"
+local_ip="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
+if [[ -z "\$local_ip" ]]; then
+  local_ip="\$(hostname -i 2>/dev/null | awk '{print \$1}')"
 fi
-nic_name=\"\$(ip route show default 2>/dev/null | awk '{print \$5; exit}')\"
-if [[ -z \"\$nic_name\" ]]; then
-  nic_name=\"eth0\"
+nic_name="\$(ip route show default 2>/dev/null | awk '{print \$5; exit}')"
+if [[ -z "\$nic_name" ]]; then
+  nic_name="eth0"
 fi
-export HCCL_IF_IP=\"\$local_ip\"
-export GLOO_SOCKET_IFNAME=\"\$nic_name\"
-export TP_SOCKET_IFNAME=\"\$nic_name\"
-export HCCL_SOCKET_IFNAME=\"\$nic_name\"
+export HCCL_IF_IP="\$local_ip"
+export GLOO_SOCKET_IFNAME="\$nic_name"
+export TP_SOCKET_IFNAME="\$nic_name"
+export HCCL_SOCKET_IFNAME="\$nic_name"
 ray stop -f || true
-ray start --head --port='${RAY_PORT}' --node-ip-address=\"\$local_ip\"
-echo \"\$local_ip\"
-"
+ray start --head --port='${RAY_PORT}' --node-ip-address="\$local_ip"
+echo "\$local_ip"
+EOS
+)"
 }
 
 start_ray_worker() {
   local node="$1"
   local head_ip="$2"
-  ray_in_container "$node" "
+  ray_in_container "$node" "$(cat <<EOS
 set -euo pipefail
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES='${RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES}'
 export ASCEND_RT_VISIBLE_DEVICES='${ASCEND_RT_VISIBLE_DEVICES}'
-local_ip=\"\$(hostname -I 2>/dev/null | awk '{print \$1}')\"
-if [[ -z \"\$local_ip\" ]]; then
-  local_ip=\"\$(hostname -i 2>/dev/null | awk '{print \$1}')\"
+local_ip="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
+if [[ -z "\$local_ip" ]]; then
+  local_ip="\$(hostname -i 2>/dev/null | awk '{print \$1}')"
 fi
-nic_name=\"\$(ip route get '${head_ip}' 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i==\\\"dev\\\"){print \$(i+1); exit}}')\"
-if [[ -z \"\$nic_name\" ]]; then
-  nic_name=\"\$(ip route show default 2>/dev/null | awk '{print \$5; exit}')\"
+nic_name="\$(ip route get '${head_ip}' 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i==\"dev\"){print \$(i+1); exit}}')"
+if [[ -z "\$nic_name" ]]; then
+  nic_name="\$(ip route show default 2>/dev/null | awk '{print \$5; exit}')"
 fi
-if [[ -z \"\$nic_name\" ]]; then
-  nic_name=\"eth0\"
+if [[ -z "\$nic_name" ]]; then
+  nic_name="eth0"
 fi
-export HCCL_IF_IP=\"\$local_ip\"
-export GLOO_SOCKET_IFNAME=\"\$nic_name\"
-export TP_SOCKET_IFNAME=\"\$nic_name\"
-export HCCL_SOCKET_IFNAME=\"\$nic_name\"
+export HCCL_IF_IP="\$local_ip"
+export GLOO_SOCKET_IFNAME="\$nic_name"
+export TP_SOCKET_IFNAME="\$nic_name"
+export HCCL_SOCKET_IFNAME="\$nic_name"
 ray stop -f || true
-ray start --address='${head_ip}:${RAY_PORT}' --node-ip-address=\"\$local_ip\"
-"
+ray start --address='${head_ip}:${RAY_PORT}' --node-ip-address="\$local_ip"
+EOS
+)"
 }
 
 serve_vllm_on_master() {
   local node="$1"
-  ray_in_container "$node" "
+  ray_in_container "$node" "$(cat <<EOS
 set -euo pipefail
-if [[ ! -f '${VLLM_START_SCRIPT}' ]]; then
+if [ ! -f '${VLLM_START_SCRIPT}' ]; then
   echo 'vllm start script not found: ${VLLM_START_SCRIPT}' >&2
   exit 2
 fi
@@ -204,7 +207,8 @@ export HOST='${VLLM_HOST}'
 export PORT='${VLLM_PORT}'
 nohup bash '${VLLM_START_SCRIPT}' >/tmp/vllm_serve.log 2>&1 &
 echo \$! >/tmp/vllm_serve.pid
-"
+EOS
+)"
   echo "vLLM log: ${node}:/tmp/vllm_serve.log"
 }
 
