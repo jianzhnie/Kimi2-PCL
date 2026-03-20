@@ -1,214 +1,306 @@
-# Ray 分布式推理（Kimi-K2-Base）
+# Ray 分布式推理（vLLM Ascend）
 
-多节点推理适用于模型无法在单机上部署的场景。此时，可以通过张量并行或流水线并行实现模型的分布式部署。具体的并行策略将在后续章节中详细介绍。要成功部署多节点推理，需要完成以下三个步骤：
+本文档给出一套在 Ascend NPU 环境下，使用 vLLM + Ray 进行多节点分布式推理的推荐流程，并将实践笔记整理为可直接执行的命令与脚本化方式。
 
-- **验证多节点通信环境**
-- **设置并启动 Ray 集群**
-- **在多节点上启动在线推理服务**
+## 目标与假设
 
-## 验证多节点通信环境
+- 目标：在多节点（示例：16 节点 × 8 NPU）上启动 vLLM 在线推理服务（OpenAI 兼容 API）。
+- 假设：节点间网络可互通；每个节点可访问共享存储（用于镜像 tar、模型权重与缓存）。
+- 推荐：尽量使用 host 网络（`--net=host`）简化 Ray 通信与端口配置。
 
-### 物理层要求
+## 1. 通信与硬件检查
 
-- 物理机必须位于同一局域网内，并具备网络连通性。
-- 所有 NPU 需通过光模块连接，且连接状态必须正常。
+### 1.1 物理层要求
 
-### 验证流程
+- 物理机位于同一局域网，具备网络连通性。
+- NPU 互联链路正常（光模块/交换机端口状态正常）。
 
-依次在每个节点上执行以下命令。所有结果必须显示为 `success` 且状态为 `UP`：
+### 1.2 NPU 网络与互连验证（每节点执行）
 
 ```bash
- # Check the remote switch ports
- for i in {0..7}; do hccn_tool -i $i -lldp -g | grep Ifname; done 
- # Get the link status of the Ethernet ports (UP or DOWN)
- for i in {0..7}; do hccn_tool -i $i -link -g ; done
- # Check the network health status
- for i in {0..7}; do hccn_tool -i $i -net_health -g ; done
- # View the network detected IP configuration
- for i in {0..7}; do hccn_tool -i $i -netdetect -g ; done
- # View gateway configuration
- for i in {0..7}; do hccn_tool -i $i -gateway -g ; done
- # View NPU network configuration
- cat /etc/hccn.conf
+for i in {0..7}; do hccn_tool -i $i -lldp -g | grep Ifname; done
+for i in {0..7}; do hccn_tool -i $i -link -g ; done
+for i in {0..7}; do hccn_tool -i $i -net_health -g ; done
+for i in {0..7}; do hccn_tool -i $i -netdetect -g ; done
+for i in {0..7}; do hccn_tool -i $i -gateway -g ; done
+cat /etc/hccn.conf
 ```
 
-
-
-### NPU 互连验证
-
-#### 1. 获取 NPU IP 地址
+获取 NPU IP 并做跨节点 ping（示例替换为实际 IP）：
 
 ```bash
 for i in {0..7}; do hccn_tool -i $i -ip -g | grep ipaddr; done
-```
-
-
-
-#### 2. 跨节点 PING 测试
-
-```bash
-# Execute on the target node (replace with actual IP)
 hccn_tool -i 0 -ping -g address 10.20.0.20
 ```
 
+## 2. 共享存储与模型准备
 
-
-## 设置并启动 Ray 集群
-
-### 配置基础容器
-
-为确保所有节点（包括模型路径和 Python 环境）拥有统一的执行环境，建议使用 Docker 镜像。
-
-在使用 Ray 搭建多节点推理集群时，**容器化部署**是首选方案。需在主节点和从节点上同时启动容器，并添加 `--net=host` 参数以确保网络连通性正常。
-
-以下是容器设置命令示例，应在**所有节点**上执行：
+如需挂载分布式存储（示例为 dtfs）：
 
 ```bash
-# Update the vllm-ascend image
-export IMAGE=quay.nju.edu.cn/ascend/vllm-ascend:v0.17.0rc1
-export NAME=vllm-ascend
-
-# Run the container using the defined variables
-# Note if you are running bridge network with docker, please expose available ports for multiple nodes communication in advance.
-# IMPORTANT: /path/to/shared/cache 必须是所有节点都可访问的共享目录（例如 NFS），用于统一缓存与代码下载目录。
-docker run --rm \
---name $NAME \
---net=host \
---shm-size=1g \
---device /dev/davinci0 \
---device /dev/davinci1 \
---device /dev/davinci2 \
---device /dev/davinci3 \
---device /dev/davinci4 \
---device /dev/davinci5 \
---device /dev/davinci6 \
---device /dev/davinci7 \
---device /dev/davinci_manager \
---device /dev/devmm_svm \
---device /dev/hisi_hdc \
--v /usr/local/dcmi:/usr/local/dcmi \
--v /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool \
--v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
--v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
--v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
--v /etc/ascend_install.info:/etc/ascend_install.info \
--v /path/to/shared/cache:/root/.cache \
--it $IMAGE bash
+mount -t dtfs  /llm_workspace_1P  /llm_workspace_1P
 ```
 
+建议将以下内容放在所有节点可见的共享目录下：
 
+- 镜像包：`/llm_workspace_1P/robin/hfhub/docker/image/vllm-ascend.main-a3.tar`
+- 模型权重：例如 `/llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base`
+- 缓存目录：`/root/.cache`（或自定义路径），确保多节点一致（避免重复下载/编译）
 
-### 启动 Ray 集群
+## 3. 容器与镜像（推荐脚本化）
 
-在各节点完成容器设置并安装 vllm-ascend 后，请按以下步骤启动 Ray 集群并执行推理任务。
+### 3.1 镜像存在性与加载
 
-选择一台机器作为主节点，其余作为从节点。操作前请使用 `ip addr` 命令查看本机 `nic_name`（网络接口名称）。
+镜像标签：
 
-设置 `ASCEND_RT_VISIBLE_DEVICES` 环境变量以指定使用的 NPU 设备。对于 Ray 2.1 以上版本，还需设置 `RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES` 变量以避免设备识别问题。
+- `quay.io/ascend/vllm-ascend:main-a3`
 
-主从节点启动命令如下：
-
-**主节点** ：
-
-注意：启动多节点推理的 Ray 集群时，各节点的环境变量必须在**启动 Ray 前**完成设置才能生效。更新环境变量后需要重启 Ray 集群。
+如果节点上不存在该镜像，需要从共享存储加载：
 
 ```bash
-# Head node
-export HCCL_IF_IP={local_ip}
-export GLOO_SOCKET_IFNAME={nic_name}
-export TP_SOCKET_IFNAME={nic_name}
-export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-ray start --head --node-ip-address={local_ip}
+docker load -i /llm_workspace_1P/robin/hfhub/docker/image/vllm-ascend.main-a3.tar
 ```
 
+### 3.2 启动容器
 
+推荐使用脚本启动容器（每节点执行）：
 
-**从节点** ：
+- [ascend_infer_docker_run.sh](file:///Users/jianzhengnie/work_dir/Kimi2-PCL/vllm-infer/ascend_infer_docker_run.sh)
 
-注意：启动多节点推理的 Ray 集群时，各节点的环境变量必须在**启动 Ray 前**完成设置才能生效。更新环境变量后需要重启 Ray 集群。
+该脚本默认容器名为 `vllm-ascend-env-a3`，并挂载共享目录 `/llm_workspace_1P`、缓存目录 `/root/.cache` 等。
+
+如需在容器内使用 SSH（例如访问私有仓库/私有存储），可将宿主机 `/root/.ssh` 挂载进容器（脚本中已支持/可自行添加）。
+
+部分场景需要在启动容器时增加 HCCL 缓冲相关环境变量，可在 `docker run` 中追加：
 
 ```bash
-# Worker node
-export HCCL_IF_IP={local_ip}
-export GLOO_SOCKET_IFNAME={nic_name}
-export TP_SOCKET_IFNAME={nic_name}
+-e HCCL_BUFFSIZE=1024 \
+-e HCCL_BUFFER_FILE_SIZE=1024 \
+```
+
+### 3.3 容器内环境初始化（按需）
+
+部分镜像/环境需要手动 source Ascend 运行环境：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+```
+
+## 4. Ray 集群启动
+
+### 4.1 推荐脚本（一键准备 + Ray + vLLM）
+
+如果你已在控制机上配置好可免密 SSH 到所有节点，可使用：
+
+- [cluster_deploy_ray_vllm.sh](file:///Users/jianzhengnie/work_dir/Kimi2-PCL/vllm-infer/cluster_deploy_ray_vllm.sh)
+- [nodel_liist.txt](file:///Users/jianzhengnie/work_dir/Kimi2-PCL/vllm-infer/nodel_liist.txt)
+
+常见用法：
+
+```bash
+bash vllm-infer/cluster_deploy_ray_vllm.sh
+```
+
+仅执行其中某一步：
+
+```bash
+bash vllm-infer/cluster_deploy_ray_vllm.sh --prepare-only
+bash vllm-infer/cluster_deploy_ray_vllm.sh --ray-only
+bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
+```
+
+重要：脚本默认会在容器内执行 `VLLM_START_SCRIPT` 指定的启动脚本路径。若你的容器未挂载仓库目录，请将 `vllm_start.sh` 放到容器可见路径（例如共享目录 `/llm_workspace_1P/...`），并通过环境变量覆盖：
+
+```bash
+VLLM_START_SCRIPT=/llm_workspace_1P/robin/hfhub/scripts/vllm_start.sh bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
+```
+
+### 4.2 手动启动（容器内执行）
+
+主节点（Head）：
+
+```bash
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+ray stop -f || true
+ray start --head --port=6379 --node-ip-address={local_ip}
+```
+
+从节点（Worker）：
+
+```bash
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+ray stop -f || true
 ray start --address='{head_node_ip}:6379' --node-ip-address={local_ip}
 ```
 
-
-
-多节点集群启动后，执行 `ray status` 和 `ray list nodes` 命令验证集群状态，应显示正确的节点数与 NPU 数量。
-
-Ray 成功启动后通常会显示以下信息：
-
-- 本地 Ray 实例已成功启动
-- Ray Dashboard 地址（默认 [http://localhost:8265](http://localhost:8265/)）
-- 节点与资源状态（CPU/内存/健康节点数）
-- 集群连接地址（用于添加多节点）
-
-### 常见排错要点
-
-- 环境变量必须在 `ray start` 之前设置；变更后需 `ray stop -f` 再重新 `ray start`
-- `HCCL_IF_IP`、`GLOO_SOCKET_IFNAME`、`TP_SOCKET_IFNAME` 要与实际通信网卡匹配（`ip addr` 可查看）
-- 使用非 `--net=host` 时需要额外开放 Ray 相关端口（建议优先使用 host 网络简化通信）
-
-## 多节点场景启动在线推理服务
-
-在容器中可像所有 NPU 位于单节点般使用 vLLM。vLLM 将自动利用 Ray 集群所有节点的 NPU 资源。
-
-**仅需在任一节点运行 vllm 命令即可。**
-
-设置并行化时，常规做法是将 `tensor-parallel-size` 设为每节点 NPU 数量，`pipeline-parallel-size` 设为节点总数。
-
-如需从其他机器访问推理服务，请在 `vllm serve` 中额外添加 `--host 0.0.0.0`（默认仅本机可访问）。
-
-例如在 2 节点 16 NPU（每节点 8 NPU）场景中，设置张量并行大小为 8，流水线并行大小为 2：
+验证：
 
 ```bash
-vllm serve Kimi-K2-Base \
-  --distributed-executor-backend ray \
-  --pipeline-parallel-size 2 \
+ray status
+ray list nodes
+```
+
+调试/规避部分通信问题时，可按需在 `ray start` 前设置（不保证所有环境都需要）：
+
+```bash
+export HCCL_P2P_DISABLE=1
+export ACLNN_ALLOW_DTYPE_CONVERT=1
+```
+
+## 5. 启动 vLLM 分布式推理服务
+
+### 5.1 并行策略建议（TP/PP）
+
+- `--tensor-parallel-size`（TP）：尽量不要超过单机 NPU 数（通常 8）。跨机器做 TP 会带来显著通信开销，除非网络带宽/拓扑非常强。
+- `--pipeline-parallel-size`（PP）：跨节点扩展时更常用。对于 16 节点 × 8 NPU 场景，常见配置是 TP=8、PP=16（每节点 8 卡做 TP，16 个节点做流水线切分）。
+- 注意：某些量化/加载格式可能对 PP 有限制。如遇到 PP 相关报错，优先在同一版本镜像下用较小 PP 验证，再逐步扩大规模。
+
+### 5.2 推荐启动命令（示例）
+
+示例模型路径与服务名请替换为你的实际值。
+
+2 节点 × 8 NPU（共 16 NPU）示例：
+
+```bash
+vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name kimi-k2-base \
+  --gpu-memory-utilization 0.9 \
+  --enable_expert_parallel \
+  --trust-remote-code \
+  --no-enable-prefix-caching \
+  --quantization ascend \
+  --load-format safetensors \
+  --dtype bfloat16 \
   --tensor-parallel-size 8 \
-  --enable-expert-parallel \
-  --seed 1024 \
-  --max-model-len 8192  \
-  --max-num-seqs 25 \
-  --served-model-name kimi \
-  --trust-remote-code \
-  --gpu-memory-utilization 0.9
+  --pipeline-parallel-size 2 \
+  --enforce-eager \
+  --distributed-executor-backend ray
 ```
 
-
-
-若仅需使用张量并行，可将张量并行大小设为集群 NPU 总数。例如 2 节点 16 NPU 场景中设置张量并行大小为 16：
+16 节点 × 8 NPU（共 128 NPU）建议从 TP=8、PP=16 开始：
 
 ```bash
-vllm serve Kimi-K2-Base \
-  --distributed-executor-backend ray \
-  --tensor-parallel-size 16 \
-  --enable-expert-parallel \
-  --seed 1024 \
-  --max-model-len 8192  \
-  --max-num-seqs 25 \
-  --served-model-name kimi \
+vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name kimi-k2-base \
+  --gpu-memory-utilization 0.9 \
+  --enable_expert_parallel \
   --trust-remote-code \
-  --gpu-memory-utilization 0.9
+  --no-enable-prefix-caching \
+  --quantization ascend \
+  --load-format safetensors \
+  --dtype bfloat16 \
+  --tensor-parallel-size 8 \
+  --pipeline-parallel-size 16 \
+  --enforce-eager \
+  --distributed-executor-backend ray
 ```
 
+### 5.3 常见稳定性开关（按需）
 
+当遇到类型转换/算子不支持等问题时，可尝试以下环境变量（会影响性能或精度，建议用于定位问题）：
 
-服务器启动后，您可以通过输入提示词查询模型：
+```bash
+export ALLOW_FP32_TO_FP16=1
+export ATB_OPERATION_AUTOTUNE=1
+export ATB_CONV_TYPE_FLOAT16=1
+export ATB_GMM_OP_ENABLE=0
+export ATB_MOE_ENABLE=0
+export TORCH_NPU_DTYPE_CONVERT_ENABLE=1
+export ACLNN_ALLOW_FLOAT32_TO_FLOAT16=1
+export MOE_GMM_ALIGN_DTYPE=1
+```
+
+如需强行规避多数类型转换报错，可临时使用 `--dtype float32` 验证可行性（显存开销更大）：
+
+```bash
+vllm serve /mnt/model_test/models/vllm-ascend/Kimi-K2-Instruct-W8A8 \
+  --served-model-name kimi-k2-thinking \
+  --gpu-memory-utilization 0.7 \
+  --enable_expert_parallel \
+  --trust-remote-code \
+  --no-enable-prefix-caching \
+  --quantization ascend \
+  --load-format safetensors \
+  --dtype float32 \
+  --tensor-parallel-size 64 \
+  --enforce-eager \
+  --distributed-executor-backend ray
+```
+
+### 5.4 并发与长度配置（按需）
+
+在高并发/长上下文场景中，可逐步增大以下参数（注意显存与吞吐的权衡）：
+
+```bash
+vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
+  --served-model-name kimi-k2-base \
+  --gpu-memory-utilization 0.9 \
+  --max-num-seqs 4096 \
+  --max-num-batched-tokens 32768 \
+  --max-model-len 16384 \
+  --tensor-parallel-size 8 \
+  --pipeline-parallel-size 16 \
+  --distributed-executor-backend ray
+```
+
+定位卡住/算子报错时，可按需打开阻塞调试（会显著影响性能）：
+
+```bash
+export ASCEND_LAUNCH_BLOCKING=1
+```
+
+## 6. API 测试
+
+Chat Completions（推荐）：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "kimi-k2-base",
+    "messages": [{"role": "user", "content": "你是什么模型？"}],
+    "max_tokens": 200,
+    "stream": false
+  }'
+```
+
+如模型支持思考/推理内容输出，可加 `include_thought`（取决于模型与服务实现）：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "kimi-k2-thinking",
+    "messages": [{"role": "user", "content": "我想设计一个数据处理流程，请给出参考"}],
+    "max_tokens": 200,
+    "stream": false,
+    "include_thought": true
+  }'
+```
+
+Completions（兼容接口）：
 
 ```bash
 curl http://localhost:8000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "kimi",
-        "prompt": "tell me how to sleep well",
-        "max_completion_tokens": 100,
-        "temperature": 0
-    }'
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "kimi-k2-base",
+    "prompt": "tell me how to sleep well",
+    "max_completion_tokens": 100,
+    "temperature": 0
+  }'
 ```
+
+## 7. 常见排错要点
+
+- 环境变量必须在 `ray start` 之前设置；变更后需 `ray stop -f` 再重新 `ray start`
+- 网络接口选择：`GLOO_SOCKET_IFNAME`、`TP_SOCKET_IFNAME` 应与实际可通信网卡匹配
+- 性能与并行：优先将 TP 控制在单机范围内，用 PP 扩展到更多节点；不要直接上来就跨机 TP=128
+- 模型配置：部分模型可能需要调整 `config.json`（例如 `torch_dtype`）以匹配算子与精度支持
