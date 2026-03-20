@@ -1,18 +1,48 @@
-# Ray 分布式推理（vLLM Ascend）
+# `Ray` 分布式推理（vLLM Ascend）
 
-本文档给出一套在 Ascend NPU 环境下，使用 vLLM + Ray 进行多节点分布式推理的推荐流程，并将实践笔记整理为可直接执行的命令与脚本化方式。
+本文档面向 Ascend NPU 环境，整理一套使用 vLLM + Ray 进行多节点分布式推理的推荐流程。内容以“可直接执行”为目标，给出脚本化与手动两种方式，并提供常用模型的参数模板与排障要点。
 
-## 目标与假设
+## 快速开始（推荐）
+
+已在仓库中提供一键脚本，覆盖镜像检查/加载、容器启动、Ray 主从加入与 vLLM 服务启动：
+
+- [cluster_deploy_ray_vllm.sh](./vllm-infer/cluster_deploy_ray_vllm.sh)
+- [nodel_liist.txt](./vllm-infer/nodel_liist.txt)
+- [ascend_infer_docker_run.sh](./vllm-infer/ascend_infer_docker_run.sh)
+
+```bash
+bash vllm-infer/cluster_deploy_ray_vllm.sh
+```
+
+仅执行某一步：
+
+```bash
+bash vllm-infer/cluster_deploy_ray_vllm.sh --prepare-only
+bash vllm-infer/cluster_deploy_ray_vllm.sh --ray-only
+bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
+```
+
+脚本会在容器内执行 `VLLM_START_SCRIPT` 指定的启动脚本。默认使用仓库内的：
+
+- `./vllm-infer/vllm_start.sh`
+
+如果你的容器没有挂载整个仓库目录，请把启动脚本放到容器可见的共享路径，并通过环境变量覆盖，例如：
+
+```bash
+VLLM_START_SCRIPT=/llm_workspace_1P/robin/hfhub/scripts/vllm_model_server.sh \
+  bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
+```
+
+## 0. 目标与前置条件
 
 - 目标：在多节点（示例：16 节点 × 8 NPU）上启动 vLLM 在线推理服务（OpenAI 兼容 API）。
-- 假设：节点间网络可互通；每个节点可访问共享存储（用于镜像 tar、模型权重与缓存）。
-- 推荐：尽量使用 host 网络（`--net=host`）简化 Ray 通信与端口配置。
+- 前置：节点间网络可互通；各节点可访问共享存储（镜像 tar、模型权重与缓存）；建议使用 host 网络（`--net=host`）。
 
 ## 1. 通信与硬件检查
 
 ### 1.1 物理层要求
 
-- 物理机位于同一局域网，具备网络连通性。
+- 节点位于同一局域网，具备网络连通性。
 - NPU 互联链路正常（光模块/交换机端口状态正常）。
 
 ### 1.2 NPU 网络与互连验证（每节点执行）
@@ -35,41 +65,41 @@ hccn_tool -i 0 -ping -g address 10.20.0.20
 
 ## 2. 共享存储与模型准备
 
-如需挂载分布式存储（示例为 dtfs）：
+多节点推理要求：模型权重路径与缓存路径在所有节点上保持一致，并且容器内可见。
+
+如需挂载分布式存储（示例为 dtfs，按实际环境替换）：
 
 ```bash
 mount -t dtfs  /llm_workspace_1P  /llm_workspace_1P
 ```
 
-建议将以下内容放在所有节点可见的共享目录下：
+建议统一使用的共享路径示例：
 
 - 镜像包：`/llm_workspace_1P/robin/hfhub/docker/image/vllm-ascend.main-a3.tar`
-- 模型权重：例如 `/llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base`
-- 缓存目录：`/root/.cache`（或自定义路径），确保多节点一致（避免重复下载/编译）
+- 模型权重：`/llm_workspace_1P/robin/hfhub/models/...`
+- 缓存目录：`/root/.cache`（或自定义路径）
 
-## 3. 容器与镜像（推荐脚本化）
+## 3. 容器与镜像
 
-### 3.1 镜像存在性与加载
+### 3.1 镜像标签与加载
 
 镜像标签：
 
 - `quay.io/ascend/vllm-ascend:main-a3`
 
-如果节点上不存在该镜像，需要从共享存储加载：
+如果节点上不存在该镜像，可从共享存储加载：
 
 ```bash
 docker load -i /llm_workspace_1P/robin/hfhub/docker/image/vllm-ascend.main-a3.tar
 ```
 
-### 3.2 启动容器
+### 3.2 启动容器（推荐脚本化）
 
 推荐使用脚本启动容器（每节点执行）：
 
 - [ascend_infer_docker_run.sh](./vllm-infer/ascend_infer_docker_run.sh)
 
 该脚本默认容器名为 `vllm-ascend-env-a3`，并挂载共享目录 `/llm_workspace_1P`、缓存目录 `/root/.cache` 等。
-
-如需在容器内使用 SSH（例如访问私有仓库/私有存储），可将宿主机 `/root/.ssh` 挂载进容器（脚本中已支持/可自行添加）。
 
 部分场景需要在启动容器时增加 HCCL 缓冲相关环境变量，可在 `docker run` 中追加：
 
@@ -87,53 +117,41 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 ```
 
-## 4. Ray 集群启动
+## 4. Ray 集群启动（手动方式）
 
-### 4.1 推荐脚本（一键准备 + Ray + vLLM）
+### 4.1 关键环境变量
 
-如果你已在控制机上配置好可免密 SSH 到所有节点，可使用：
-
-- [cluster_deploy_ray_vllm.sh](./vllm-infer/cluster_deploy_ray_vllm.sh)
-- [nodel_liist.txt](./vllm-infer/nodel_liist.txt)
-
-常见用法：
-
-```bash
-bash vllm-infer/cluster_deploy_ray_vllm.sh
-```
-
-仅执行其中某一步：
-
-```bash
-bash vllm-infer/cluster_deploy_ray_vllm.sh --prepare-only
-bash vllm-infer/cluster_deploy_ray_vllm.sh --ray-only
-bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
-```
-
-重要：脚本默认会在容器内执行 `VLLM_START_SCRIPT` 指定的启动脚本路径。若你的容器未挂载仓库目录，请将 `vllm_model_server.sh` 放到容器可见路径（例如共享目录 `/llm_workspace_1P/...`），并通过环境变量覆盖：
-
-```bash
-VLLM_START_SCRIPT=/llm_workspace_1P/robin/hfhub/scripts/vllm_model_server.sh bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
-```
-
-### 4.2 手动启动（容器内执行）
-
-主节点（Head）：
+Ray 启动前建议设置（按实际网卡/网络环境调整）：
 
 ```bash
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export GLOO_SOCKET_IFNAME=<nic_name>
+export TP_SOCKET_IFNAME=<nic_name>
+export HCCL_SOCKET_IFNAME=<nic_name>
+```
+
+调试/规避部分通信问题时，可按需在 `ray start` 前设置：
+
+```bash
+export HCCL_P2P_DISABLE=1
+export ACLNN_ALLOW_DTYPE_CONVERT=1
+```
+
+### 4.2 启动命令
+
+主节点（Head）：
+
+```bash
 ray stop -f || true
-ray start --head --port=6379 --node-ip-address={local_ip}
+ray start --head --port=6379 --node-ip-address=<head_ip>
 ```
 
 从节点（Worker）：
 
 ```bash
-export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 ray stop -f || true
-ray start --address='{head_node_ip}:6379' --node-ip-address={local_ip}
+ray start --address='<head_ip>:6379' --node-ip-address=<worker_ip>
 ```
 
 验证：
@@ -143,77 +161,52 @@ ray status
 ray list nodes
 ```
 
-调试/规避部分通信问题时，可按需在 `ray start` 前设置（不保证所有环境都需要）：
+## 5. 启动 vLLM 推理服务
 
-```bash
-export HCCL_P2P_DISABLE=1
-export ACLNN_ALLOW_DTYPE_CONVERT=1
-```
+### 5.1 并行策略（TP/PP）
 
-## 5. 启动 vLLM 分布式推理服务
+- TP（`--tensor-parallel-size`）：优先控制在单机 NPU 数以内（通常 8），跨机 TP 会引入较大的通信开销。
+- PP（`--pipeline-parallel-size`）：跨节点扩展时更常用。示例：16 节点 × 8 NPU 可从 TP=8、PP=16 起步。
 
-### 5.1 并行策略建议（TP/PP）
+### 5.2 典型启动模板
 
-- `--tensor-parallel-size`（TP）：尽量不要超过单机 NPU 数（通常 8）。跨机器做 TP 会带来显著通信开销，除非网络带宽/拓扑非常强。
-- `--pipeline-parallel-size`（PP）：跨节点扩展时更常用。对于 16 节点 × 8 NPU 场景，常见配置是 TP=8、PP=16（每节点 8 卡做 TP，16 个节点做流水线切分）。
-- 注意：某些量化/加载格式可能对 PP 有限制。如遇到 PP 相关报错，优先在同一版本镜像下用较小 PP 验证，再逐步扩大规模。
+若你使用的是仓库脚本，优先通过脚本参数/环境变量管理；若直接手动跑 `vllm serve`，建议显式指定：
 
-### 5.2 推荐启动命令（示例）
+- `--distributed-executor-backend ray`
+- `--host 0.0.0.0`（需要对外提供服务时）
+- `--served-model-name <name>`（API 请求中 `model` 使用该名字）
 
-### Qwen3-30B
+### 5.3 示例：Qwen3-30B
 
-#### 单节点 (8 NPU)
+单节点（8 NPU）：
 
 ```bash
 vllm serve /llm_workspace_1P/robin/hfhub/models/Qwen/Qwen3-30B-A3B \
+  --host 0.0.0.0 \
+  --port 8000 \
   --gpu-memory-utilization 0.9 \
   --max-model-len 8192 \
   --tensor-parallel-size 8 \
   --enforce-eager
-  --port 8000 \
 ```
 
-#### 分布式多节点 (2 x 8 NPU)
-
-- 创建 Ray 集群
-
-
-```bash
-# 启动 ray 主节点
-export HCCL_P2P_DISABLE=1 
-export ACLNN_ALLOW_DTYPE_CONVERT=1 
-
-ray start --head --port=6379
-
-ray start --address='8.6.243.152:6379'
-ray start --address='8.6.243.23:6379'
-
-# 启动 ray 从节点
-export HCCL_P2P_DISABLE=1 
-export ACLNN_ALLOW_DTYPE_CONVERT=1 
-ray start --address='MASTER_IP:6379'
-```
-
-- 启动 vLLM 服务
+两节点（2 × 8 NPU）：
 
 ```bash
 vllm serve /llm_workspace_1P/robin/hfhub/models/Qwen/Qwen3-30B-A3B \
+  --host 0.0.0.0 \
+  --port 8000 \
   --gpu-memory-utilization 0.9 \
   --max-model-len 8192 \
   --tensor-parallel-size 8 \
   --pipeline-parallel-size 2 \
   --distributed-executor-backend ray \
-  --enforce-eager \
-  --port 8000 \
+  --enforce-eager
 ```
 
-### Kimi-K2-Base
+### 5.4 示例：Kimi-K2-Base
 
-#### 2 节点 × 8 NPU（共 16 NPU）示例
-
-示例模型路径与服务名请替换为你的实际值。
-
-2 节点 × 8 NPU（共 16 NPU）示例：
+两节点（2 × 8 NPU，16 NPU）：
 
 ```bash
 vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
@@ -229,13 +222,11 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
   --dtype bfloat16 \
   --tensor-parallel-size 8 \
   --pipeline-parallel-size 2 \
-  --enforce-eager \
-  --distributed-executor-backend ray
+  --distributed-executor-backend ray \
+  --enforce-eager
 ```
 
-#### 16 节点 × 8 NPU（共 128 NPU）示例
-
-16 节点 × 8 NPU（共 128 NPU）建议从 TP=8、PP=16 开始：
+16 节点（16 × 8 NPU，128 NPU）从 TP=8、PP=16 起步：
 
 ```bash
 vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
@@ -251,14 +242,15 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
   --dtype bfloat16 \
   --tensor-parallel-size 8 \
   --pipeline-parallel-size 16 \
-  --enforce-eager \
-  --distributed-executor-backend ray
+  --distributed-executor-backend ray \
+  --enforce-eager
 ```
 
+## 6. 性能与稳定性配置（按需）
 
-### 5.3 常见稳定性开关（按需）
+### 6.1 常用环境变量
 
-当遇到类型转换/算子不支持等问题时，可尝试以下环境变量（会影响性能或精度，建议用于定位问题）：
+当遇到类型转换/算子不支持等问题时，可按需尝试：
 
 ```bash
 export ALLOW_FP32_TO_FP16=1
@@ -271,26 +263,13 @@ export ACLNN_ALLOW_FLOAT32_TO_FLOAT16=1
 export MOE_GMM_ALIGN_DTYPE=1
 ```
 
-如需强行规避多数类型转换报错，可临时使用 `--dtype float32` 验证可行性（显存开销更大）：
+定位卡住/算子报错时，可按需打开阻塞调试：
 
 ```bash
-vllm serve /mnt/model_test/models/vllm-ascend/Kimi-K2-Instruct-W8A8 \
-  --served-model-name kimi-k2-thinking \
-  --gpu-memory-utilization 0.7 \
-  --enable_expert_parallel \
-  --trust-remote-code \
-  --no-enable-prefix-caching \
-  --quantization ascend \
-  --load-format safetensors \
-  --dtype float32 \
-  --tensor-parallel-size 64 \
-  --enforce-eager \
-  --distributed-executor-backend ray
+export ASCEND_LAUNCH_BLOCKING=1
 ```
 
-### 5.4 并发与长度配置（按需）
-
-在高并发/长上下文场景中，可逐步增大以下参数（注意显存与吞吐的权衡）：
+### 6.2 并发与长度参数
 
 ```bash
 vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
@@ -304,15 +283,28 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
   --distributed-executor-backend ray
 ```
 
-定位卡住/算子报错时，可按需打开阻塞调试（会显著影响性能）：
+### 6.3 float32 兜底验证
+
+如需快速判断是否为精度/类型问题，可临时使用 `--dtype float32` 验证（显存开销更大）：
 
 ```bash
-export ASCEND_LAUNCH_BLOCKING=1
+vllm serve /mnt/model_test/models/vllm-ascend/Kimi-K2-Instruct-W8A8 \
+  --served-model-name kimi-k2-thinking \
+  --gpu-memory-utilization 0.7 \
+  --enable_expert_parallel \
+  --trust-remote-code \
+  --no-enable-prefix-caching \
+  --quantization ascend \
+  --load-format safetensors \
+  --dtype float32 \
+  --tensor-parallel-size 64 \
+  --distributed-executor-backend ray \
+  --enforce-eager
 ```
 
-## 6. API 测试
+## 7. API 测试
 
-Chat Completions（推荐）：
+Chat Completions：
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -325,21 +317,7 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-如模型支持思考/推理内容输出，可加 `include_thought`（取决于模型与服务实现）：
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "kimi-k2-thinking",
-    "messages": [{"role": "user", "content": "我想设计一个数据处理流程，请给出参考"}],
-    "max_tokens": 200,
-    "stream": false,
-    "include_thought": true
-  }'
-```
-
-Completions（兼容接口）：
+Completions：
 
 ```bash
 curl http://localhost:8000/v1/completions \
@@ -352,9 +330,9 @@ curl http://localhost:8000/v1/completions \
   }'
 ```
 
-## 7. 常见排错要点
+## 8. 常见排错要点
 
-- 环境变量必须在 `ray start` 之前设置；变更后需 `ray stop -f` 再重新 `ray start`
-- 网络接口选择：`GLOO_SOCKET_IFNAME`、`TP_SOCKET_IFNAME` 应与实际可通信网卡匹配
-- 性能与并行：优先将 TP 控制在单机范围内，用 PP 扩展到更多节点；不要直接上来就跨机 TP=128
-- 模型配置：部分模型可能需要调整 `config.json`（例如 `torch_dtype`）以匹配算子与精度支持
+- 变量生效顺序：环境变量必须在 `ray start` 前设置；变更后需 `ray stop -f` 再重新 `ray start`
+- 网卡选择：`GLOO_SOCKET_IFNAME`、`TP_SOCKET_IFNAME`、`HCCL_SOCKET_IFNAME` 要与实际可通信网卡匹配
+- 路径一致性：模型路径与缓存路径需要在所有节点一致，并且容器内可见
+- 并行策略：优先将 TP 控制在单机范围内，用 PP 扩展到更多节点
