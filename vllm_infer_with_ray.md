@@ -65,7 +65,7 @@ docker load -i /llm_workspace_1P/robin/hfhub/docker/image/vllm-ascend.main-a3.ta
 
 推荐使用脚本启动容器（每节点执行）：
 
-- [ascend_infer_docker_run.sh](file:///Users/jianzhengnie/work_dir/Kimi2-PCL/vllm-infer/ascend_infer_docker_run.sh)
+- [ascend_infer_docker_run.sh](./vllm-infer/ascend_infer_docker_run.sh)
 
 该脚本默认容器名为 `vllm-ascend-env-a3`，并挂载共享目录 `/llm_workspace_1P`、缓存目录 `/root/.cache` 等。
 
@@ -93,8 +93,8 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 如果你已在控制机上配置好可免密 SSH 到所有节点，可使用：
 
-- [cluster_deploy_ray_vllm.sh](file:///Users/jianzhengnie/work_dir/Kimi2-PCL/vllm-infer/cluster_deploy_ray_vllm.sh)
-- [nodel_liist.txt](file:///Users/jianzhengnie/work_dir/Kimi2-PCL/vllm-infer/nodel_liist.txt)
+- [cluster_deploy_ray_vllm.sh](./vllm-infer/cluster_deploy_ray_vllm.sh)
+- [nodel_liist.txt](./vllm-infer/nodel_liist.txt)
 
 常见用法：
 
@@ -110,10 +110,10 @@ bash vllm-infer/cluster_deploy_ray_vllm.sh --ray-only
 bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
 ```
 
-重要：脚本默认会在容器内执行 `VLLM_START_SCRIPT` 指定的启动脚本路径。若你的容器未挂载仓库目录，请将 `vllm_start.sh` 放到容器可见路径（例如共享目录 `/llm_workspace_1P/...`），并通过环境变量覆盖：
+重要：脚本默认会在容器内执行 `VLLM_START_SCRIPT` 指定的启动脚本路径。若你的容器未挂载仓库目录，请将 `vllm_model_server.sh` 放到容器可见路径（例如共享目录 `/llm_workspace_1P/...`），并通过环境变量覆盖：
 
 ```bash
-VLLM_START_SCRIPT=/llm_workspace_1P/robin/hfhub/scripts/vllm_start.sh bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
+VLLM_START_SCRIPT=/llm_workspace_1P/robin/hfhub/scripts/vllm_model_server.sh bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
 ```
 
 ### 4.2 手动启动（容器内执行）
@@ -160,6 +160,57 @@ export ACLNN_ALLOW_DTYPE_CONVERT=1
 
 ### 5.2 推荐启动命令（示例）
 
+### Qwen3-30B
+
+#### 单节点 (8 NPU)
+
+```bash
+vllm serve /llm_workspace_1P/robin/hfhub/models/Qwen/Qwen3-30B-A3B \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 8192 \
+  --tensor-parallel-size 8 \
+  --enforce-eager
+  --port 8000 \
+```
+
+#### 分布式多节点 (2 x 8 NPU)
+
+- 创建 Ray 集群
+
+
+```bash
+# 启动 ray 主节点
+export HCCL_P2P_DISABLE=1 
+export ACLNN_ALLOW_DTYPE_CONVERT=1 
+
+ray start --head --port=6379
+
+ray start --address='8.6.243.152:6379'
+ray start --address='8.6.243.23:6379'
+
+# 启动 ray 从节点
+export HCCL_P2P_DISABLE=1 
+export ACLNN_ALLOW_DTYPE_CONVERT=1 
+ray start --address='MASTER_IP:6379'
+```
+
+- 启动 vLLM 服务
+
+```bash
+vllm serve /llm_workspace_1P/robin/hfhub/models/Qwen/Qwen3-30B-A3B \
+  --gpu-memory-utilization 0.9 \
+  --max-model-len 8192 \
+  --tensor-parallel-size 8 \
+  --pipeline-parallel-size 2 \
+  --distributed-executor-backend ray \
+  --enforce-eager \
+  --port 8000 \
+```
+
+### Kimi-K2-Base
+
+#### 2 节点 × 8 NPU（共 16 NPU）示例
+
 示例模型路径与服务名请替换为你的实际值。
 
 2 节点 × 8 NPU（共 16 NPU）示例：
@@ -182,6 +233,8 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
   --distributed-executor-backend ray
 ```
 
+#### 16 节点 × 8 NPU（共 128 NPU）示例
+
 16 节点 × 8 NPU（共 128 NPU）建议从 TP=8、PP=16 开始：
 
 ```bash
@@ -201,6 +254,7 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
   --enforce-eager \
   --distributed-executor-backend ray
 ```
+
 
 ### 5.3 常见稳定性开关（按需）
 
