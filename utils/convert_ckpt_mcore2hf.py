@@ -122,6 +122,8 @@ class MgCkptConvert:
         self.moe_ffn_hidden_size = moe_ffn_hidden_size
         self.hf_config_template = hf_config_template
         self.detected_num_kv_heads = None
+        self._resolved_q_head_dim = None
+        self._resolved_kv_heads_per_tp = None
 
         os.makedirs(self.hf_save_dir, exist_ok=True)
 
@@ -152,10 +154,7 @@ class MgCkptConvert:
         self.num_real_layers = self.num_layers - len(self.noop_layers_list)
         
         # 修正：使用 qk_pos_emb_head_dim 计算 inv_dim
-        inv_dim = self.qk_pos_emb_head_dim
-        inv_freq = 1.0 / (self.rotary_base**(
-            torch.arange(0, inv_dim, 2, dtype=torch.float32) / inv_dim))
-        self.inv_freq = inv_freq
+        self._reset_inv_freq()
 
         self.weight_map: dict[str, str] = {}
         self.total_size_bytes = 0
@@ -176,6 +175,58 @@ class MgCkptConvert:
                         missing.append((tp, pp))
             if missing:
                 logger.info('Missing (tp,pp) in rank dirs: %s', missing[:20])
+
+    def _reset_inv_freq(self) -> None:
+        inv_dim = int(self.qk_pos_emb_head_dim)
+        if inv_dim <= 0:
+            self.inv_freq = torch.empty((0, ), dtype=torch.float32)
+            return
+        inv_freq = 1.0 / (self.rotary_base**(
+            torch.arange(0, inv_dim, 2, dtype=torch.float32) / inv_dim))
+        self.inv_freq = inv_freq
+
+    def _infer_qkv_layout(self, shard_rows: int) -> tuple[int, int] | None:
+        if self.num_attention_heads % self.tp_size != 0:
+            return None
+        heads_per_tp = self.num_attention_heads // self.tp_size
+        if heads_per_tp <= 0:
+            return None
+        max_q_head_dim = shard_rows // heads_per_tp
+        if max_q_head_dim <= 0:
+            return None
+
+        preferred: list[int] = []
+        preferred.append(self.qk_head_dim + self.qk_pos_emb_head_dim)
+        preferred.append(self.qk_head_dim)
+        preferred.append(self.qk_pos_emb_head_dim)
+        preferred = [d for d in preferred if isinstance(d, int) and d > 0]
+
+        seen: set[int] = set()
+        candidates: list[int] = []
+        for d in preferred:
+            if d not in seen:
+                candidates.append(d)
+                seen.add(d)
+
+        for d in range(8, max_q_head_dim + 1, 8):
+            if d not in seen:
+                candidates.append(d)
+                seen.add(d)
+
+        for q_head_dim in candidates:
+            q_per_tp = heads_per_tp * q_head_dim
+            rem = shard_rows - q_per_tp
+            if rem < 0:
+                continue
+            denom = q_head_dim + self.v_head_dim
+            if denom <= 0 or rem % denom != 0:
+                continue
+            kv_heads_per_tp = rem // denom
+            if kv_heads_per_tp <= 0:
+                continue
+            return q_head_dim, kv_heads_per_tp
+
+        return None
 
     def _repo_models_dir(self) -> str:
         return os.path.abspath(
@@ -631,27 +682,61 @@ class MgCkptConvert:
         k_parts: list[torch.Tensor] = []
         v_parts: list[torch.Tensor] = []
 
-        q_head_dim = self.qk_head_dim + self.qk_pos_emb_head_dim
         if self.num_attention_heads % self.tp_size != 0:
             raise ValueError(
                 f'num_attention_heads={self.num_attention_heads} 不能整除 tp_size={self.tp_size}'
             )
-        q_per_tp = (self.num_attention_heads // self.tp_size) * q_head_dim
+        q_head_dim = self._resolved_q_head_dim or (self.qk_head_dim +
+                                                   self.qk_pos_emb_head_dim)
+        kv_heads_per_tp_fixed = self._resolved_kv_heads_per_tp
 
         for tp_rank in range(self.tp_size):
             linear_proj_list.append(models[(tp_rank, 0)].pop(proj_key))
             qkv_shard = models[(tp_rank, 0)].pop(qkv_key)
+            heads_per_tp = self.num_attention_heads // self.tp_size
+
+            if self._resolved_q_head_dim is None:
+                q_per_tp_try = heads_per_tp * q_head_dim
+                rem_try = qkv_shard.shape[0] - q_per_tp_try
+                denom_try = q_head_dim + self.v_head_dim
+                bad = rem_try < 0 or denom_try <= 0 or rem_try % denom_try != 0
+                if bad:
+                    inferred = self._infer_qkv_layout(int(qkv_shard.shape[0]))
+                    if inferred is None:
+                        raise ValueError(
+                            f'{qkv_key} 分片形状异常: {qkv_shard.shape}, q_per_tp={q_per_tp_try}'
+                        )
+                    inferred_q_head_dim, inferred_kv_heads_per_tp = inferred
+                    if (inferred_q_head_dim !=
+                            self.qk_head_dim + self.qk_pos_emb_head_dim):
+                        self.qk_head_dim = 0
+                        self.qk_pos_emb_head_dim = int(inferred_q_head_dim)
+                        self._reset_inv_freq()
+                    self._resolved_q_head_dim = int(inferred_q_head_dim)
+                    self._resolved_kv_heads_per_tp = int(
+                        inferred_kv_heads_per_tp)
+                    q_head_dim = self._resolved_q_head_dim
+                    kv_heads_per_tp_fixed = self._resolved_kv_heads_per_tp
+                    if self.verbose:
+                        logger.info(
+                            'Auto-detected qkv layout: q_head_dim=%d kv_heads_per_tp=%d (from shard_rows=%d)',
+                            q_head_dim,
+                            kv_heads_per_tp_fixed,
+                            int(qkv_shard.shape[0]),
+                        )
+
+            q_per_tp = heads_per_tp * q_head_dim
             rem = qkv_shard.shape[0] - q_per_tp
             if rem < 0:
                 raise ValueError(
                     f'{qkv_key} 分片形状异常: {qkv_shard.shape}, q_per_tp={q_per_tp}'
                 )
             denom = q_head_dim + self.v_head_dim
-            if rem % denom != 0:
+            if denom <= 0 or rem % denom != 0:
                 raise ValueError(
                     f'{qkv_key} 分片剩余维度异常: rem={rem}, q_head_dim={q_head_dim}, v_head_dim={self.v_head_dim}'
                 )
-            kv_heads_per_tp = rem // denom
+            kv_heads_per_tp = kv_heads_per_tp_fixed or (rem // denom)
             if self.detected_num_kv_heads is None:
                 self.detected_num_kv_heads = kv_heads_per_tp * self.tp_size
             k_per_tp = kv_heads_per_tp * q_head_dim

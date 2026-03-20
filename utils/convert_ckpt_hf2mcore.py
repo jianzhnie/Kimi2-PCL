@@ -2,6 +2,7 @@ import argparse
 import json
 import logging as logger
 import os
+import time
 from collections import defaultdict
 from typing import Optional
 
@@ -80,6 +81,13 @@ class CkptConvert:
         qlora_nf4: bool,
         rotary_base: float = 50000.0,
     ):
+        self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
+        self.log_file_load = os.environ.get('CKPT_CONVERT_LOG_FILE',
+                                            '0') != '0'
+        self.log_layer_progress = os.environ.get('CKPT_CONVERT_LOG_LAYER',
+                                                 '1') != '0'
+        self.log_save_progress = os.environ.get('CKPT_CONVERT_LOG_SAVE',
+                                                '1') != '0'
         self.hf_model_path = hf_model_path
         self.mg_save_path = mg_save_path
         self.num_layers = num_layers
@@ -134,6 +142,67 @@ class CkptConvert:
                                                list[int]]] = defaultdict(dict)
             self._build_vpprank_layer_map()
 
+        if self.verbose:
+            shard_files = sorted(set(self.weight_map.values()))
+            num_noop = len(self.noop_layers_list)
+            num_real_layers = self.num_layers - num_noop
+            logger.info(
+                'HF->Megatron: layers=%d (real=%d noop=%d) tp=%d pp=%d ep=%d vpp=%s dualpipe=%s',
+                int(self.num_layers),
+                int(num_real_layers),
+                int(num_noop),
+                int(self.tp_size),
+                int(self.pp_size),
+                int(self.ep_size),
+                str(self.vpp_size),
+                str(self.dualpipe),
+            )
+            logger.info(
+                'HF->Megatron: hidden=%d heads=%d qk=%d v=%d rotary_base=%s first_k_dense=%d',
+                int(self.hidden_size),
+                int(self.num_attention_heads),
+                int(self.qk_head_dim),
+                int(self.v_head_dim),
+                str(self.rotary_base),
+                int(self.first_k_dense_replace),
+            )
+            logger.info(
+                'HF weights: tensors=%d shards=%d (e.g. %s)',
+                len(self.weight_map),
+                len(shard_files),
+                shard_files[:min(5, len(shard_files))],
+            )
+            has_gqa = 'model.layers.0.self_attn.q_proj.weight' in self.weight_map and 'model.layers.0.self_attn.k_proj.weight' in self.weight_map
+            has_mla = 'model.layers.0.self_attn.q_a_proj.weight' in self.weight_map
+            logger.info('HF attention format: gqa=%s mla=%s', str(has_gqa),
+                        str(has_mla))
+            if self.vpp_stage is None:
+                for pp_rank in range(self.pp_size):
+                    ls = self.pprank_layer_idxs[pp_rank]
+                    head = ls[:min(6, len(ls))]
+                    tail = ls[max(0, len(ls) - 6):]
+                    logger.info(
+                        'PP layer map: pp=%d layers=%d head=%s tail=%s',
+                        pp_rank,
+                        len(ls),
+                        head,
+                        tail,
+                    )
+            else:
+                for pp_rank in range(self.pp_size):
+                    for vpp_rank in range(self.vpp_size):
+                        ls = self.vpprank_layer_idxs[pp_rank][vpp_rank]
+                        head = ls[:min(6, len(ls))]
+                        tail = ls[max(0, len(ls) - 6):]
+                        logger.info(
+                            'VPP layer map: pp=%d vpp=%d layers=%d head=%s tail=%s',
+                            pp_rank,
+                            vpp_rank,
+                            len(ls),
+                            head,
+                            tail,
+                        )
+
     def _validate(self) -> None:
         if not os.path.isdir(self.hf_model_path):
             raise FileNotFoundError(self.hf_model_path)
@@ -154,11 +223,15 @@ class CkptConvert:
         index_path = os.path.join(self.hf_model_path,
                                   'model.safetensors.index.json')
         if os.path.isfile(index_path):
+            if self.verbose:
+                logger.info('Using HF index: %s', index_path)
             with open(index_path) as f:
                 return json.load(f)['weight_map']
 
         single = os.path.join(self.hf_model_path, 'model.safetensors')
         if os.path.isfile(single):
+            if self.verbose:
+                logger.info('Using single HF safetensors: %s', single)
             with safe_open(single, framework='pt', device='cpu') as f:
                 return {k: 'model.safetensors' for k in f.keys()}
 
@@ -281,9 +354,14 @@ class CkptConvert:
                                keys: list[str]) -> dict[str, torch.Tensor]:
         path = os.path.join(self.hf_model_path, filename)
         out: dict[str, torch.Tensor] = {}
+        t0 = time.time()
         with safe_open(path, framework='pt', device='cpu') as f:
             for k in keys:
                 out[k] = f.get_tensor(k)
+        if self.log_file_load:
+            dt = time.time() - t0
+            logger.info('Loaded %d tensors from %s (%.2fs)', len(keys), filename,
+                        dt)
         return out
 
     def _load_matched_hf_weights(
@@ -321,9 +399,27 @@ class CkptConvert:
                 raise KeyError(f'HF weight_map 缺少 key: {k}')
             files_to_keys[fn].append(k)
 
+        if self.verbose:
+            layer_count = len(layer_list)
+            logger.info(
+                'Load HF weights: pp=%s vpp=%s layers=%d need_pre=%s need_post=%s keys=%d files=%d',
+                str(pp_rank),
+                str(vpp_rank),
+                int(layer_count),
+                str(need_pre),
+                str(need_post),
+                int(len(required)),
+                int(len(files_to_keys)),
+            )
+
         all_weights: dict[str, torch.Tensor] = {}
+        t0 = time.time()
         for fn, ks in files_to_keys.items():
             all_weights.update(self._load_safetensors_keys(fn, ks))
+        if self.verbose:
+            dt = time.time() - t0
+            logger.info('Loaded HF batch: pp=%s vpp=%s tensors=%d (%.2fs)',
+                        str(pp_rank), str(vpp_rank), len(all_weights), dt)
         return all_weights
 
     def _maybe_quant_nf4(self, state: dict[str, torch.Tensor], key: str,
@@ -633,6 +729,14 @@ class CkptConvert:
         | dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]],
         vpp: bool,
     ) -> None:
+        t0 = time.time()
+        if self.log_save_progress:
+            logger.info(
+                'Saving Megatron ckpt: pp=%d vpp=%s -> %s',
+                int(pp_rank),
+                str(vpp),
+                self.iter_path,
+            )
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
                 prefix = _mp_prefix(tp_rank, pp_rank, ep_rank, self.tp_size,
@@ -659,6 +763,14 @@ class CkptConvert:
                            outpath,
                            pickle_protocol=4,
                            _use_new_zipfile_serialization=True)
+            if self.log_save_progress:
+                done = (ep_rank + 1) * self.tp_size
+                total = self.ep_size * self.tp_size
+                logger.info('Saved pp=%d ep=%d (%d/%d ranks)', int(pp_rank),
+                            int(ep_rank), int(done), int(total))
+        if self.log_save_progress:
+            dt = time.time() - t0
+            logger.info('Saved pp=%d done (%.2fs)', int(pp_rank), dt)
 
     def run(self) -> None:
         if self.vpp_stage is None:
@@ -667,21 +779,34 @@ class CkptConvert:
                 mg_model: dict[int, dict[int, dict[
                     str,
                     torch.Tensor]]] = defaultdict(lambda: defaultdict(dict))
+                t0 = time.time()
                 weights = self._load_matched_hf_weights(pp_rank, None)
                 if pp_rank == 0:
                     self._set_preprocess(weights, mg_model)
                 for local_layer_idx, hf_layer in enumerate(
                         self.pprank_layer_idxs[pp_rank]):
+                    lt0 = time.time()
                     self._set_layer_norm(hf_layer, local_layer_idx, weights,
                                          mg_model)
                     self._set_layer_attn(hf_layer, local_layer_idx, weights,
                                          mg_model)
                     self._set_layer_mlp(hf_layer, local_layer_idx, weights,
                                         mg_model)
+                    if self.log_layer_progress:
+                        logger.info(
+                            'Converted layer hf=%d local=%d pp=%d (%.2fs)',
+                            int(hf_layer),
+                            int(local_layer_idx),
+                            int(pp_rank),
+                            time.time() - lt0,
+                        )
                 if pp_rank == self.pp_size - 1 and not self.dualpipe:
                     self._set_postprocess(weights, mg_model)
                 self._assert_consumed(weights, f'pp_rank={pp_rank}')
                 self._save_pp_rank(pp_rank, mg_model, vpp=False)
+                if self.verbose:
+                    logger.info('pp_rank=%d done (%.2fs)', int(pp_rank),
+                                time.time() - t0)
             return
 
         for pp_rank in range(self.pp_size):
@@ -697,6 +822,7 @@ class CkptConvert:
                     lambda: defaultdict(lambda: defaultdict(dict)))
 
             for vpp_rank in range(self.vpp_size):
+                t0 = time.time()
                 weights = self._load_matched_hf_weights(pp_rank, vpp_rank)
                 if pp_rank == 0 and vpp_rank == 0:
                     self._set_preprocess(weights, mg_model[vpp_rank])
@@ -705,18 +831,31 @@ class CkptConvert:
 
                 layer_list = self.vpprank_layer_idxs[pp_rank][vpp_rank]
                 for local_layer_idx, hf_layer in enumerate(layer_list):
+                    lt0 = time.time()
                     self._set_layer_norm(hf_layer, local_layer_idx, weights,
                                          mg_model[vpp_rank])
                     self._set_layer_attn(hf_layer, local_layer_idx, weights,
                                          mg_model[vpp_rank])
                     self._set_layer_mlp(hf_layer, local_layer_idx, weights,
                                         mg_model[vpp_rank])
+                    if self.log_layer_progress:
+                        logger.info(
+                            'Converted layer hf=%d local=%d pp=%d vpp=%d (%.2fs)',
+                            int(hf_layer),
+                            int(local_layer_idx),
+                            int(pp_rank),
+                            int(vpp_rank),
+                            time.time() - lt0,
+                        )
 
                 if (not self.dualpipe) and (pp_rank == self.pp_size - 1) and (
                         vpp_rank == self.vpp_size - 1):
                     self._set_postprocess(weights, mg_model[vpp_rank])
                 self._assert_consumed(weights,
                                       f'pp_rank={pp_rank} vpp_rank={vpp_rank}')
+                if self.verbose:
+                    logger.info('pp=%d vpp=%d done (%.2fs)', int(pp_rank),
+                                int(vpp_rank), time.time() - t0)
 
             self._save_pp_rank(pp_rank, mg_model, vpp=True)
 
@@ -838,6 +977,22 @@ def main() -> None:
         'qk_head_dim') or QK_HEAD_DIM
     v_head_dim = args.v_head_dim or hf_cfg.get('v_head_dim') or V_HEAD_DIM
     rotary_base = args.rotary_base or hf_cfg.get('rope_theta') or 50000.0
+
+    qk_rope_head_dim = hf_cfg.get('qk_rope_head_dim') or hf_cfg.get(
+        'qk_pos_emb_head_dim') or QK_POS_EMB_HEAD_DIM
+    num_kv_heads = hf_cfg.get('num_key_value_heads') or hf_cfg.get(
+        'num_kv_heads') or hf_cfg.get('num_query_groups')
+    logger.info(
+        'HF config summary: layers=%s hidden=%s heads=%s kv_heads=%s qk_nope=%s qk_rope=%s v=%s rope_theta=%s',
+        str(num_layers),
+        str(hf_cfg.get('hidden_size')),
+        str(hf_cfg.get('num_attention_heads')),
+        str(num_kv_heads),
+        str(hf_cfg.get('qk_nope_head_dim') or hf_cfg.get('qk_head_dim')),
+        str(qk_rope_head_dim),
+        str(hf_cfg.get('v_head_dim')),
+        str(hf_cfg.get('rope_theta')),
+    )
 
     converter = CkptConvert(
         hf_model_path=args.load_dir,
