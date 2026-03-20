@@ -47,5 +47,6 @@ docker run --rm \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /root/.cache:/root/.cache \
     -v /llm_workspace_1P:/llm_workspace_1P:rw \
+    -v /root/.ssh:/root/.ssh \
     -dit ${IMAGE_NAME} \
     /bin/bash -c "while true; do sleep 1000; done"
