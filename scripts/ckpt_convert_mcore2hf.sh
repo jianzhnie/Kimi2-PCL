@@ -1,6 +1,10 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S env -u BASH_ENV bash
 set -euo pipefail
-source ~/.bashrc
+if [[ -f "${HOME}/.bashrc" ]]; then
+  set +u
+  source "${HOME}/.bashrc"
+  set -u
+fi
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -26,7 +30,6 @@ NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-64}"
 QK_HEAD_DIM="${QK_HEAD_DIM:-128}"
 V_HEAD_DIM="${V_HEAD_DIM:-128}"
 QK_POS_EMB_HEAD_DIM="${QK_POS_EMB_HEAD_DIM:-64}"
-Q_LORA_RANK="${Q_LORA_RANK:-1536}"
 
 EXTRA_ARGS=()
 if [[ -n "${SCHEDULES_METHOD}" ]]; then
@@ -62,5 +65,4 @@ python "${REPO_ROOT}/utils/convert_ckpt_mcore2hf.py" \
   --qk-head-dim "${QK_HEAD_DIM}" \
   --v-head-dim "${V_HEAD_DIM}" \
   --qk-pos-emb-head-dim "${QK_POS_EMB_HEAD_DIM}" \
-  --q-lora-rank "${Q_LORA_RANK}" \
   "${EXTRA_ARGS[@]}"

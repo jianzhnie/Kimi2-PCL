@@ -1,6 +1,10 @@
-#!/usr/bin/env bash
+#!/usr/bin/env -S env -u BASH_ENV bash
 set -euo pipefail
-source ~/.bashrc
+if [[ -f "${HOME}/.bashrc" ]]; then
+  set +u
+  source "${HOME}/.bashrc"
+  set -u
+fi
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export CUDA_DEVICE_MAX_CONNECTIONS=1
