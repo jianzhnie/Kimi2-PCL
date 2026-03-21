@@ -11,14 +11,16 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 REPO_ROOT="/llm_workspace_1P/robin/Kimi2-PCL"
 LOAD_DIR="/llm_workspace_1P/robin/hfhub/kimi2-mcore2hf"
-SAVE_DIR="/llm_workspace_1P/robin/mg_ckpt/kimi2-hf2mcore"
+SAVE_DIR="/llm_workspace_1P/robin/hfhub/kimi2-hf2mcore"
 
 
 TP="${TP:-2}"
 PP="${PP:-8}"
 EP="${EP:-64}"
+PP_WORKERS="${PP_WORKERS:-2}"
 NUM_LAYERS="${NUM_LAYERS:-32}"
 FIRST_K_DENSE_REPLACE="${FIRST_K_DENSE_REPLACE:-2}"
+ROTARY_BASE="${ROTARY_BASE:-50000}"
 NOOP_LAYERS="${NOOP_LAYERS:-}"
 NUM_LAYER_LIST="${NUM_LAYER_LIST:-}"
 SCHEDULES_METHOD="${SCHEDULES_METHOD:-dualpipev}"
@@ -40,9 +42,6 @@ fi
 if [[ "${MOE_TP_EXTEND_EP:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--moe-tp-extend-ep)
 fi
-if [[ "${MLA_MM_SPLIT:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--mla-mm-split)
-fi
 if [[ -n "${VPP_STAGE:-}" ]]; then
   EXTRA_ARGS+=(--vpp-stage "${VPP_STAGE}")
 fi
@@ -55,7 +54,9 @@ python "${REPO_ROOT}/utils/convert_ckpt_hf2mcore.py" \
   --target-tensor-parallel-size "${TP}" \
   --target-pipeline-parallel-size "${PP}" \
   --target-expert-parallel-size "${EP}" \
+  --pp-workers "${PP_WORKERS}" \
   --moe-grouped-gemm \
+  --rotary-base "${ROTARY_BASE}" \
   --noop-layers "${NOOP_LAYERS}" \
   --hidden-size "${HIDDEN_SIZE}" \
   --num-experts "${NUM_EXPERTS}" \
