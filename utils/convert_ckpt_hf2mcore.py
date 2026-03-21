@@ -4,6 +4,8 @@ import logging as logger
 import os
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 from typing import Optional
 
 import safetensors.torch
@@ -39,9 +41,10 @@ def _read_hf_config(model_dir: str) -> dict:
 def _ensure_iter_path(save_dir: str) -> str:
     iter_dir = os.path.join(save_dir, 'iter_0000001')
     os.makedirs(iter_dir, exist_ok=True)
-    with open(os.path.join(save_dir, 'latest_checkpointed_iteration.txt'),
-              'w') as f:
-        f.write('1')
+    latest_path = os.path.join(save_dir, 'latest_checkpointed_iteration.txt')
+    if not os.path.isfile(latest_path):
+        with open(latest_path, 'w') as f:
+            f.write('1')
     return iter_dir
 
 
@@ -80,6 +83,8 @@ class CkptConvert:
         noop_layers: str | None,
         qlora_nf4: bool,
         rotary_base: float = 50000.0,
+        print_init_summary: bool = True,
+        pp_workers: int = 1,
     ):
         self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
         self.log_file_load = os.environ.get('CKPT_CONVERT_LOG_FILE',
@@ -88,6 +93,8 @@ class CkptConvert:
                                                  '1') != '0'
         self.log_save_progress = os.environ.get('CKPT_CONVERT_LOG_SAVE',
                                                 '1') != '0'
+        self.print_init_summary = print_init_summary
+        self.pp_workers = int(pp_workers)
         self.hf_model_path = hf_model_path
         self.mg_save_path = mg_save_path
         self.num_layers = num_layers
@@ -142,7 +149,7 @@ class CkptConvert:
                                                list[int]]] = defaultdict(dict)
             self._build_vpprank_layer_map()
 
-        if self.verbose:
+        if self.verbose and self.print_init_summary:
             shard_files = sorted(set(self.weight_map.values()))
             num_noop = len(self.noop_layers_list)
             num_real_layers = self.num_layers - num_noop
@@ -202,6 +209,85 @@ class CkptConvert:
                             head,
                             tail,
                         )
+
+    def run_one_pp_rank(self, pp_rank: int) -> None:
+        if self.vpp_stage is None:
+            logger.info('pp_rank=%s/%s', pp_rank, self.pp_size)
+            mg_model: dict[int, dict[int, dict[
+                str,
+                torch.Tensor]]] = defaultdict(lambda: defaultdict(dict))
+            t0 = time.time()
+            weights = self._load_matched_hf_weights(pp_rank, None)
+            if pp_rank == 0:
+                self._set_preprocess(weights, mg_model)
+            for local_layer_idx, hf_layer in enumerate(
+                    self.pprank_layer_idxs[pp_rank]):
+                lt0 = time.time()
+                self._set_layer_norm(hf_layer, local_layer_idx, weights,
+                                     mg_model)
+                self._set_layer_attn(hf_layer, local_layer_idx, weights,
+                                     mg_model)
+                self._set_layer_mlp(hf_layer, local_layer_idx, weights, mg_model)
+                if self.log_layer_progress:
+                    logger.info('Converted layer hf=%d local=%d pp=%d (%.2fs)',
+                                int(hf_layer), int(local_layer_idx),
+                                int(pp_rank),
+                                time.time() - lt0)
+            if pp_rank == self.pp_size - 1 and not self.dualpipe:
+                self._set_postprocess(weights, mg_model)
+            self._assert_consumed(weights, f'pp_rank={pp_rank}')
+            self._save_pp_rank(pp_rank, mg_model, vpp=False)
+            if self.verbose:
+                logger.info('pp_rank=%d done (%.2fs)', int(pp_rank),
+                            time.time() - t0)
+            return
+
+        logger.info(
+            'pp_rank=%s/%s (vpp=%s stage=%s)',
+            pp_rank,
+            self.pp_size,
+            self.vpp_size,
+            self.vpp_stage,
+        )
+        mg_model: dict[int, dict[int, dict[int, dict[
+            str, torch.Tensor]]]] = defaultdict(
+                lambda: defaultdict(lambda: defaultdict(dict)))
+        for vpp_rank in range(self.vpp_size):
+            t0 = time.time()
+            weights = self._load_matched_hf_weights(pp_rank, vpp_rank)
+            if pp_rank == 0 and vpp_rank == 0:
+                self._set_preprocess(weights, mg_model[vpp_rank])
+            if self.dualpipe and pp_rank == 0 and vpp_rank == 1:
+                self._set_postprocess(weights, mg_model[vpp_rank])
+
+            layer_list = self.vpprank_layer_idxs[pp_rank][vpp_rank]
+            for local_layer_idx, hf_layer in enumerate(layer_list):
+                lt0 = time.time()
+                self._set_layer_norm(hf_layer, local_layer_idx, weights,
+                                     mg_model[vpp_rank])
+                self._set_layer_attn(hf_layer, local_layer_idx, weights,
+                                     mg_model[vpp_rank])
+                self._set_layer_mlp(hf_layer, local_layer_idx, weights,
+                                    mg_model[vpp_rank])
+                if self.log_layer_progress:
+                    logger.info(
+                        'Converted layer hf=%d local=%d pp=%d vpp=%d (%.2fs)',
+                        int(hf_layer),
+                        int(local_layer_idx),
+                        int(pp_rank),
+                        int(vpp_rank),
+                        time.time() - lt0,
+                    )
+
+            if (not self.dualpipe) and (pp_rank == self.pp_size - 1) and (
+                    vpp_rank == self.vpp_size - 1):
+                self._set_postprocess(weights, mg_model[vpp_rank])
+            self._assert_consumed(weights,
+                                  f'pp_rank={pp_rank} vpp_rank={vpp_rank}')
+            if self.verbose:
+                logger.info('pp=%d vpp=%d done (%.2fs)', int(pp_rank),
+                            int(vpp_rank), time.time() - t0)
+        self._save_pp_rank(pp_rank, mg_model, vpp=True)
 
     def _validate(self) -> None:
         if not os.path.isdir(self.hf_model_path):
@@ -506,9 +592,9 @@ class CkptConvert:
         o_proj = weights.pop(
             f'model.layers.{hf_layer}.self_attn.o_proj.weight')
         q_ln = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.q_layernorm.weight')
+            f'model.layers.{hf_layer}.self_attn.q_layernorm.weight', None)
         k_ln = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.k_layernorm.weight')
+            f'model.layers.{hf_layer}.self_attn.k_layernorm.weight', None)
         weights.pop(f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq',
                     None)
 
@@ -530,8 +616,10 @@ class CkptConvert:
                 mg_model[ep_rank][tp_rank][qkv_key] = qkv_shards[tp_rank]
                 mg_model[ep_rank][tp_rank][
                     proj_key] = o_proj_shards[tp_rank]
-                mg_model[ep_rank][tp_rank][q_norm_key] = q_ln
-                mg_model[ep_rank][tp_rank][k_norm_key] = k_ln
+                if q_ln is not None:
+                    mg_model[ep_rank][tp_rank][q_norm_key] = q_ln
+                if k_ln is not None:
+                    mg_model[ep_rank][tp_rank][k_norm_key] = k_ln
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank], proj_key,
                                       o_proj_shards[tp_rank])
 
@@ -773,91 +861,60 @@ class CkptConvert:
             logger.info('Saved pp=%d done (%.2fs)', int(pp_rank), dt)
 
     def run(self) -> None:
-        if self.vpp_stage is None:
+        workers = int(self.pp_workers)
+        if workers <= 1:
             for pp_rank in range(self.pp_size):
-                logger.info('pp_rank=%s/%s', pp_rank, self.pp_size)
-                mg_model: dict[int, dict[int, dict[
-                    str,
-                    torch.Tensor]]] = defaultdict(lambda: defaultdict(dict))
-                t0 = time.time()
-                weights = self._load_matched_hf_weights(pp_rank, None)
-                if pp_rank == 0:
-                    self._set_preprocess(weights, mg_model)
-                for local_layer_idx, hf_layer in enumerate(
-                        self.pprank_layer_idxs[pp_rank]):
-                    lt0 = time.time()
-                    self._set_layer_norm(hf_layer, local_layer_idx, weights,
-                                         mg_model)
-                    self._set_layer_attn(hf_layer, local_layer_idx, weights,
-                                         mg_model)
-                    self._set_layer_mlp(hf_layer, local_layer_idx, weights,
-                                        mg_model)
-                    if self.log_layer_progress:
-                        logger.info(
-                            'Converted layer hf=%d local=%d pp=%d (%.2fs)',
-                            int(hf_layer),
-                            int(local_layer_idx),
-                            int(pp_rank),
-                            time.time() - lt0,
-                        )
-                if pp_rank == self.pp_size - 1 and not self.dualpipe:
-                    self._set_postprocess(weights, mg_model)
-                self._assert_consumed(weights, f'pp_rank={pp_rank}')
-                self._save_pp_rank(pp_rank, mg_model, vpp=False)
-                if self.verbose:
-                    logger.info('pp_rank=%d done (%.2fs)', int(pp_rank),
-                                time.time() - t0)
+                self.run_one_pp_rank(pp_rank)
             return
 
-        for pp_rank in range(self.pp_size):
-            logger.info(
-                'pp_rank=%s/%s (vpp=%s stage=%s)',
-                pp_rank,
-                self.pp_size,
-                self.vpp_size,
-                self.vpp_stage,
-            )
-            mg_model: dict[int, dict[int, dict[int, dict[
-                str, torch.Tensor]]]] = defaultdict(
-                    lambda: defaultdict(lambda: defaultdict(dict)))
+        workers = min(workers, self.pp_size)
+        ctx = get_context('spawn')
+        cfg = dict(
+            hf_model_path=self.hf_model_path,
+            mg_save_path=self.mg_save_path,
+            num_layers=self.num_layers,
+            tp_size=self.tp_size,
+            pp_size=self.pp_size,
+            ep_size=self.ep_size,
+            first_k_dense_replace=self.first_k_dense_replace,
+            hidden_size=self.hidden_size,
+            num_experts=self.num_experts,
+            num_attention_heads=self.num_attention_heads,
+            qk_head_dim=self.qk_head_dim,
+            v_head_dim=self.v_head_dim,
+            moe_grouped_gemm=self.moe_grouped_gemm,
+            moe_tp_extend_ep=self.moe_tp_extend_ep,
+            schedules_method=self.schedules_method,
+            vpp_stage=None if self.dualpipe else self.vpp_stage,
+            num_layer_list=self.num_layer_list,
+            noop_layers=self.noop_layers,
+            qlora_nf4=self.qlora_nf4,
+            rotary_base=self.rotary_base,
+            print_init_summary=False,
+            pp_workers=1,
+        )
 
-            for vpp_rank in range(self.vpp_size):
-                t0 = time.time()
-                weights = self._load_matched_hf_weights(pp_rank, vpp_rank)
-                if pp_rank == 0 and vpp_rank == 0:
-                    self._set_preprocess(weights, mg_model[vpp_rank])
-                if self.dualpipe and pp_rank == 0 and vpp_rank == 1:
-                    self._set_postprocess(weights, mg_model[vpp_rank])
+        t0 = time.time()
+        logger.info('Parallel convert: pp_workers=%d pp=%d', int(workers),
+                    int(self.pp_size))
+        futures = []
+        with ProcessPoolExecutor(max_workers=workers,
+                                 mp_context=ctx) as ex:
+            for pp_rank in range(self.pp_size):
+                futures.append(ex.submit(_worker_run_one_pp_rank, cfg, pp_rank))
+            for fut in as_completed(futures):
+                fut.result()
+        logger.info('Parallel convert done (%.2fs)', time.time() - t0)
 
-                layer_list = self.vpprank_layer_idxs[pp_rank][vpp_rank]
-                for local_layer_idx, hf_layer in enumerate(layer_list):
-                    lt0 = time.time()
-                    self._set_layer_norm(hf_layer, local_layer_idx, weights,
-                                         mg_model[vpp_rank])
-                    self._set_layer_attn(hf_layer, local_layer_idx, weights,
-                                         mg_model[vpp_rank])
-                    self._set_layer_mlp(hf_layer, local_layer_idx, weights,
-                                        mg_model[vpp_rank])
-                    if self.log_layer_progress:
-                        logger.info(
-                            'Converted layer hf=%d local=%d pp=%d vpp=%d (%.2fs)',
-                            int(hf_layer),
-                            int(local_layer_idx),
-                            int(pp_rank),
-                            int(vpp_rank),
-                            time.time() - lt0,
-                        )
 
-                if (not self.dualpipe) and (pp_rank == self.pp_size - 1) and (
-                        vpp_rank == self.vpp_size - 1):
-                    self._set_postprocess(weights, mg_model[vpp_rank])
-                self._assert_consumed(weights,
-                                      f'pp_rank={pp_rank} vpp_rank={vpp_rank}')
-                if self.verbose:
-                    logger.info('pp=%d vpp=%d done (%.2fs)', int(pp_rank),
-                                int(vpp_rank), time.time() - t0)
-
-            self._save_pp_rank(pp_rank, mg_model, vpp=True)
+def _worker_run_one_pp_rank(cfg: dict, pp_rank: int) -> None:
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    converter = CkptConvert(**cfg)
+    converter.run_one_pp_rank(int(pp_rank))
 
 
 def get_args():
@@ -936,6 +993,10 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override v head dim.')
+    parser.add_argument('--qk-pos-emb-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override qk pos emb head dim.')
     parser.add_argument(
         '--moe-tp-extend-ep',
         action='store_true',
@@ -955,6 +1016,10 @@ def get_args():
                         type=float,
                         default=None,
                         help='Rotary base for RoPE')
+    parser.add_argument('--pp-workers',
+                        type=int,
+                        default=1,
+                        help='Parallelize by pp_rank with processes.')
 
     args, _ = parser.parse_known_args()
     return args
@@ -978,7 +1043,7 @@ def main() -> None:
     v_head_dim = args.v_head_dim or hf_cfg.get('v_head_dim') or V_HEAD_DIM
     rotary_base = args.rotary_base or hf_cfg.get('rope_theta') or 50000.0
 
-    qk_rope_head_dim = hf_cfg.get('qk_rope_head_dim') or hf_cfg.get(
+    qk_rope_head_dim = args.qk_pos_emb_head_dim or hf_cfg.get('qk_rope_head_dim') or hf_cfg.get(
         'qk_pos_emb_head_dim') or QK_POS_EMB_HEAD_DIM
     num_kv_heads = hf_cfg.get('num_key_value_heads') or hf_cfg.get(
         'num_kv_heads') or hf_cfg.get('num_query_groups')
@@ -1015,6 +1080,7 @@ def main() -> None:
         noop_layers=args.noop_layers,
         qlora_nf4=args.qlora_nf4,
         rotary_base=rotary_base,
+        pp_workers=args.pp_workers,
     )
     converter.run()
 

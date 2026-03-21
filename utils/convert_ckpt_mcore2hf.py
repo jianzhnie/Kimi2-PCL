@@ -287,6 +287,9 @@ class MgCkptConvert:
         if 'rope_scaling' in cfg and isinstance(cfg['rope_scaling'], dict):
             cfg['rope_scaling']['factor'] = 32.0
             cfg['rope_scaling']['type'] = 'yarn'
+            cfg['rope_scaling']['original_max_position_embeddings'] = 4096
+            cfg['rope_scaling']['mscale'] = 1.0
+            cfg['rope_scaling']['mscale_all_dim'] = 1.0
 
         with open(os.path.join(self.hf_save_dir, 'config.json'), 'w') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -755,12 +758,13 @@ class MgCkptConvert:
         hf[f'model.layers.{hf_layer}.self_attn.v_proj.weight'] = torch.cat(
             v_parts, dim=0)
         hf[f'model.layers.{hf_layer}.self_attn.o_proj.weight'] = o_proj
-        hf[f'model.layers.{hf_layer}.self_attn.q_layernorm.weight'] = models[
-            (0, 0)].pop(q_norm_key)
-        hf[f'model.layers.{hf_layer}.self_attn.k_layernorm.weight'] = models[
-            (0, 0)].pop(k_norm_key)
-        hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone(
-        )
+        q_ln = models[(0, 0)].pop(q_norm_key, None)
+        if q_ln is not None:
+            hf[f'model.layers.{hf_layer}.self_attn.q_layernorm.weight'] = q_ln
+        k_ln = models[(0, 0)].pop(k_norm_key, None)
+        if k_ln is not None:
+            hf[f'model.layers.{hf_layer}.self_attn.k_layernorm.weight'] = k_ln
+        hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone()
         return
 
     def _reconstruct_router(self, models: dict[tuple[int, int],
