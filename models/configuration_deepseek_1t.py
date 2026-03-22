@@ -24,7 +24,7 @@ class DeepseekV3Config(PretrainedConfig):
         group_query_attention=True,
         n_shared_experts=1,
         n_routed_experts=128,
-        ep_size=1,
+        ep_size=64,
         routed_scaling_factor=2.827,
         qk_rope_head_dim=64,
         v_head_dim=128,
@@ -38,7 +38,9 @@ class DeepseekV3Config(PretrainedConfig):
         first_k_dense_replace=2,
         norm_topk_prob=True,
         scoring_func='sigmoid',
-        aux_loss_alpha=0.01,
+        moe_aux_loss_coeff=0.01,
+        moe_z_loss_coeff=0.001,
+        moe_router_topk=2,
         seq_aux=True,
         moe_router_enable_expert_bias=True,
         moe_router_dtype='fp32',
@@ -54,7 +56,15 @@ class DeepseekV3Config(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_theta=50000.0,
-        rope_scaling=None,
+        rope_scaling={
+            'type': 'yarn',
+            'factor': 32.0,
+            'original_max_position_embeddings': 4096,
+            'beta_fast': 1.0,
+            'beta_slow': 1.0,
+            'mscale': 1.0,
+            'mscale_all_dim': 1.0,
+        },
         attention_bias=False,
         attention_dropout=0.0,
         **kwargs,
@@ -85,7 +95,9 @@ class DeepseekV3Config(PretrainedConfig):
         self.first_k_dense_replace = first_k_dense_replace
         self.norm_topk_prob = norm_topk_prob
         self.scoring_func = scoring_func
-        self.aux_loss_alpha = aux_loss_alpha
+        self.moe_aux_loss_coeff = moe_aux_loss_coeff
+        self.moe_z_loss_coeff = moe_z_loss_coeff
+        self.moe_router_topk = moe_router_topk
         self.seq_aux = seq_aux
         self.moe_router_enable_expert_bias = moe_router_enable_expert_bias
         self.moe_router_dtype = moe_router_dtype

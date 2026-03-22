@@ -9,7 +9,9 @@
     "AutoModel": "modeling_deepseek.DeepseekV3Model",
     "AutoModelForCausalLM": "modeling_deepseek.DeepseekV3ForCausalLM"
   },
-  "aux_loss_alpha": 0.001,
+  "moe_aux_loss_coeff": 0.001,
+  "moe_z_loss_coeff": 0.0,
+  "moe_router_topk": 2,
   "bos_token_id": 163584,
   "eos_token_id": 163585,
   "ep_size": 32,

@@ -40,7 +40,9 @@ class DeepseekV3Config(PretrainedConfig):
         first_k_dense_replace=3,
         norm_topk_prob=True,
         scoring_func='sigmoid',
-        aux_loss_alpha=0.001,
+        moe_aux_loss_coeff=0.001,
+        moe_z_loss_coeff=0.0,
+        moe_router_topk=2,
         seq_aux=True,
         moe_router_enable_expert_bias=False,
         moe_router_dtype='fp32',
@@ -89,7 +91,9 @@ class DeepseekV3Config(PretrainedConfig):
         self.first_k_dense_replace = first_k_dense_replace
         self.norm_topk_prob = norm_topk_prob
         self.scoring_func = scoring_func
-        self.aux_loss_alpha = aux_loss_alpha
+        self.moe_aux_loss_coeff = moe_aux_loss_coeff
+        self.moe_z_loss_coeff = moe_z_loss_coeff
+        self.moe_router_topk = moe_router_topk
         self.seq_aux = seq_aux
         self.moe_router_enable_expert_bias = moe_router_enable_expert_bias
         self.moe_router_dtype = moe_router_dtype
