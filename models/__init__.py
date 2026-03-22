@@ -1,4 +1,4 @@
-from .configuration_deepseek_100b import DeepseekV3Config
+from .configuration_deepseek_1t import DeepseekV3Config
 from .modeling_deepseek import (DeepseekV3ForCausalLM,
                                 DeepseekV3ForSequenceClassification,
                                 DeepseekV3Model)
