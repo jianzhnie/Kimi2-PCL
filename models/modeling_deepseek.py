@@ -482,13 +482,38 @@ class MoEGate(nn.Module):
                 f'insupportable TopK function for MoE gating: {self.topk_method}'
             )
 
-        ### norm gate to sum 1
+        aux_loss = None
+        if self.training:
+            scores_aux = scores.view(bsz, seq_len, -1)
+            topk_idx_aux = topk_idx.view(bsz, seq_len, -1)
+            mask = torch.zeros(bsz,
+                               seq_len,
+                               self.n_routed_experts,
+                               device=scores_aux.device,
+                               dtype=scores_aux.dtype)
+            mask.scatter_add_(
+                2, topk_idx_aux,
+                torch.ones_like(topk_idx_aux, dtype=scores_aux.dtype))
+            if self.seq_aux:
+                fi = mask.mean(dim=1)
+                pi = scores_aux.mean(dim=1)
+                aux_loss = (pi * fi).sum(dim=-1).mean()
+            else:
+                fi = mask.mean(dim=(0, 1))
+                pi = scores_aux.mean(dim=(0, 1))
+                aux_loss = (pi * fi).sum()
+            aux_loss = aux_loss * self.config.moe_aux_loss_coeff * self.n_routed_experts
+            if self.config.moe_z_loss_coeff > 0:
+                z_loss = torch.logsumexp(logits.view(bsz, seq_len, -1),
+                                         dim=-1).pow(2).mean()
+                aux_loss = aux_loss + z_loss * self.config.moe_z_loss_coeff
+
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
-        topk_weight = topk_weight * self.routed_scaling_factor  # must multiply the scaling factor
+        topk_weight = topk_weight * self.routed_scaling_factor
 
-        return topk_idx, topk_weight
+        return topk_idx, topk_weight, aux_loss
 
 
 class DeepseekV3MoE(nn.Module):
@@ -537,7 +562,7 @@ class DeepseekV3MoE(nn.Module):
     def forward(self, hidden_states):
         identity = hidden_states
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight = self.gate(hidden_states)
+        topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         flat_topk_idx = topk_idx.view(-1)
         if self.training:
@@ -557,7 +582,7 @@ class DeepseekV3MoE(nn.Module):
                                    topk_weight).view(*orig_shape)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(identity)
-        return y
+        return y, aux_loss
 
     def moe_forward(self, x, topk_ids, topk_weight):
         out = x.new_zeros(x.shape)
@@ -1185,7 +1210,13 @@ class DeepseekV3DecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        
+        aux_loss = None
+        if isinstance(self.mlp, DeepseekV3MoE):
+            hidden_states, aux_loss = self.mlp(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
+            
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states, )
@@ -1195,6 +1226,9 @@ class DeepseekV3DecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value, )
+
+        if aux_loss is not None:
+            outputs += (aux_loss, )
 
         return outputs
 
@@ -1433,6 +1467,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
+        all_aux_loss = []
 
         for decoder_layer in self.layers:
             if output_hidden_states:
@@ -1455,6 +1490,10 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1], )
+                
+            if len(layer_outputs) > (3 if output_attentions and use_cache else (2 if output_attentions or use_cache else 1)):
+                if layer_outputs[-1] is not None:
+                    all_aux_loss.append(layer_outputs[-1])
 
         hidden_states = self.norm(hidden_states)
 
@@ -1466,17 +1505,24 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         if use_cache:
             next_cache = (next_decoder_cache.to_legacy_cache()
                           if use_legacy_cache else next_decoder_cache)
+                          
+        aux_loss = sum(all_aux_loss) if all_aux_loss else None
+        
         if not return_dict:
             return tuple(
                 v for v in
-                [hidden_states, next_cache, all_hidden_states, all_self_attns]
+                [hidden_states, next_cache, all_hidden_states, all_self_attns, aux_loss]
                 if v is not None)
-        return BaseModelOutputWithPast(
+                
+        output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
+        if aux_loss is not None:
+            output.aux_loss = aux_loss
+        return output
 
 
 class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
@@ -1589,6 +1635,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            
+            if hasattr(outputs, 'aux_loss') and outputs.aux_loss is not None:
+                loss += outputs.aux_loss
 
         if not return_dict:
             output = (logits, ) + outputs[1:]
@@ -1797,6 +1846,10 @@ class DeepseekV3ForSequenceClassification(DeepseekV3PreTrainedModel):
             elif self.config.problem_type == 'multi_label_classification':
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)
+                
+            if hasattr(transformer_outputs, 'aux_loss') and transformer_outputs.aux_loss is not None:
+                loss += transformer_outputs.aux_loss
+                
         if not return_dict:
             output = (pooled_logits, ) + transformer_outputs[1:]
             return ((loss, ) + output) if loss is not None else output
