@@ -7,7 +7,7 @@
 已在仓库中提供一键脚本，覆盖镜像检查/加载、容器启动、Ray 主从加入与 vLLM 服务启动：
 
 - [cluster_deploy_ray_vllm.sh](./vllm-infer/cluster_deploy_ray_vllm.sh)
-- [nodel_liist.txt](./vllm-infer/nodel_liist.txt)
+- [node_list.txt](./vllm-infer/node_list.txt)
 - [ascend_infer_docker_run.sh](./vllm-infer/ascend_infer_docker_run.sh)
 
 ```bash
@@ -24,7 +24,7 @@ bash vllm-infer/cluster_deploy_ray_vllm.sh --serve-only
 
 脚本会在容器内执行 `VLLM_START_SCRIPT` 指定的启动脚本。默认使用仓库内的：
 
-- `./vllm-infer/vllm_start.sh`
+- `./vllm-infer/vllm_model_server.sh`
 
 如果你的容器没有挂载整个仓库目录，请把启动脚本放到容器可见的共享路径，并通过环境变量覆盖，例如：
 
@@ -178,14 +178,20 @@ ray list nodes
 
 ### 5.3 示例：Qwen3-30B
 
+> **配置建议**：Qwen3-30B 是 Dense 模型，推荐开启 `--enable-prefix-caching` 以大幅提升多轮对话与长上下文的吞吐性能；同时加入 `--served-model-name qwen3-30b` 方便 API 路由。在 NPU 显存允许的情况下，可将 `max-model-len` 扩展至 32768。
+
 单节点（8 NPU）：
 
 ```bash
 vllm serve /llm_workspace_1P/robin/hfhub/models/Qwen/Qwen3-30B-A3B \
   --host 0.0.0.0 \
   --port 8000 \
+  --served-model-name qwen3-30b \
   --gpu-memory-utilization 0.9 \
-  --max-model-len 8192 \
+  --max-model-len 32768 \
+  --max-num-seqs 256 \
+  --enable-prefix-caching \
+  --trust-remote-code \
   --tensor-parallel-size 8 \
   --enforce-eager
 ```
@@ -196,8 +202,12 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/Qwen/Qwen3-30B-A3B \
 vllm serve /llm_workspace_1P/robin/hfhub/models/Qwen/Qwen3-30B-A3B \
   --host 0.0.0.0 \
   --port 8000 \
+  --served-model-name qwen3-30b \
   --gpu-memory-utilization 0.9 \
-  --max-model-len 8192 \
+  --max-model-len 32768 \
+  --max-num-seqs 256 \
+  --enable-prefix-caching \
+  --trust-remote-code \
   --tensor-parallel-size 8 \
   --pipeline-parallel-size 2 \
   --distributed-executor-backend ray \
@@ -205,6 +215,8 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/Qwen/Qwen3-30B-A3B \
 ```
 
 ### 5.4 示例：Kimi-K2-Base
+
+> **配置建议**：Kimi-K2 属于大型 MoE（混合专家）架构，必须开启 `--enable-expert-parallel` 以减少跨节点通信开销；同时当前版本下建议关闭 Prefix Caching（`--disable-prefix-caching`），避免与 MoE/PP 产生兼容性问题。可通过增大 `max-num-seqs` 和 `max-num-batched-tokens` 提升系统并发上限。
 
 两节点（2 × 8 NPU，16 NPU）：
 
@@ -214,9 +226,12 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
   --port 8000 \
   --served-model-name kimi-k2-base \
   --gpu-memory-utilization 0.9 \
-  --enable_expert_parallel \
+  --max-model-len 16384 \
+  --max-num-seqs 4096 \
+  --max-num-batched-tokens 32768 \
+  --enable-expert-parallel \
   --trust-remote-code \
-  --no-enable-prefix-caching \
+  --disable-prefix-caching \
   --quantization ascend \
   --load-format safetensors \
   --dtype bfloat16 \
@@ -234,9 +249,12 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
   --port 8000 \
   --served-model-name kimi-k2-base \
   --gpu-memory-utilization 0.9 \
-  --enable_expert_parallel \
+  --max-model-len 16384 \
+  --max-num-seqs 4096 \
+  --max-num-batched-tokens 32768 \
+  --enable-expert-parallel \
   --trust-remote-code \
-  --no-enable-prefix-caching \
+  --disable-prefix-caching \
   --quantization ascend \
   --load-format safetensors \
   --dtype bfloat16 \
@@ -271,16 +289,12 @@ export ASCEND_LAUNCH_BLOCKING=1
 
 ### 6.2 并发与长度参数
 
+如果硬件显存足够或模型需要更高的并发处理能力，可通过以下参数调整系统的最大调度序列数：
+
 ```bash
-vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
-  --served-model-name kimi-k2-base \
-  --gpu-memory-utilization 0.9 \
-  --max-num-seqs 4096 \
-  --max-num-batched-tokens 32768 \
-  --max-model-len 16384 \
-  --tensor-parallel-size 8 \
-  --pipeline-parallel-size 16 \
-  --distributed-executor-backend ray
+--max-num-seqs 4096 \
+--max-num-batched-tokens 32768 \
+--max-model-len 16384
 ```
 
 ### 6.3 float32 兜底验证
@@ -291,9 +305,9 @@ vllm serve /llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base \
 vllm serve /mnt/model_test/models/vllm-ascend/Kimi-K2-Instruct-W8A8 \
   --served-model-name kimi-k2-thinking \
   --gpu-memory-utilization 0.7 \
-  --enable_expert_parallel \
+  --enable-expert-parallel \
   --trust-remote-code \
-  --no-enable-prefix-caching \
+  --disable-prefix-caching \
   --quantization ascend \
   --load-format safetensors \
   --dtype float32 \
