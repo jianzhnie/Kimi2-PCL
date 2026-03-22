@@ -4,12 +4,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-NODES_FILE="${NODES_FILE:-${SCRIPT_DIR}/nodel_liist.txt}"
+NODES_FILE="${NODES_FILE:-${SCRIPT_DIR}/node_list.txt}"
 IMAGE_NAME="${IMAGE_NAME:-quay.io/ascend/vllm-ascend:main-a3}"
 IMAGE_TAR="${IMAGE_TAR:-/llm_workspace_1P/robin/hfhub/docker/image/vllm-ascend.main-a3.tar}"
 RUN_CONTAINER_SCRIPT="${RUN_CONTAINER_SCRIPT:-${SCRIPT_DIR}/ascend_infer_docker_run.sh}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm-ascend-env-a3}"
-VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${SCRIPT_DIR}/vllm_start.sh}"
+VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${SCRIPT_DIR}/vllm_model_server.sh}"
 
 MASTER_NODE="${MASTER_NODE:-}"
 
@@ -120,6 +120,8 @@ if [ ! -f '${RUN_CONTAINER_SCRIPT}' ]; then
   echo '[${node}] run script not found: ${RUN_CONTAINER_SCRIPT}' >&2
   exit 2
 fi
+export IMAGE_NAME='${IMAGE_NAME}'
+export CONTAINER_NAME='${CONTAINER_NAME}'
 bash '${RUN_CONTAINER_SCRIPT}'
 docker ps --format '{{.Names}}' | grep -Fx '${CONTAINER_NAME}' >/dev/null
 echo '[${node}] container ready: ${CONTAINER_NAME}'

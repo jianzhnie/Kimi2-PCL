@@ -18,7 +18,7 @@ EXPERT_PARALLEL_FLAG="${EXPERT_PARALLEL_FLAG:-}"
 
 PREFIX_CACHING="${PREFIX_CACHING:-0}"
 ENABLE_PREFIX_CACHING_FLAG="${ENABLE_PREFIX_CACHING_FLAG:---enable-prefix-caching}"
-DISABLE_PREFIX_CACHING_FLAG="${DISABLE_PREFIX_CACHING_FLAG:---no-enable-prefix-caching}"
+DISABLE_PREFIX_CACHING_FLAG="${DISABLE_PREFIX_CACHING_FLAG:---disable-prefix-caching}"
 
 DISTRIBUTED_EXECUTOR_BACKEND="${DISTRIBUTED_EXECUTOR_BACKEND:-ray}"
 
@@ -88,7 +88,7 @@ if [[ "$ENABLE_EXPERT_PARALLEL" == "1" ]]; then
       help_text="$(vllm_help)"
       EXPERT_PARALLEL_FLAG="$(choose_flag "$help_text" "--enable-expert-parallel" "--enable_expert_parallel")"
     else
-      EXPERT_PARALLEL_FLAG="--enable_expert_parallel"
+      EXPERT_PARALLEL_FLAG="--enable-expert-parallel"
     fi
   fi
   args+=("$EXPERT_PARALLEL_FLAG")

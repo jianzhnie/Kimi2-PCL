@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Configuration
-IMAGE_NAME="quay.io/ascend/vllm-ascend:main-a3"
-CONTAINER_NAME="vllm-ascend-env-a3"
+IMAGE_NAME="${IMAGE_NAME:-quay.io/ascend/vllm-ascend:main-a3}"
+CONTAINER_NAME="${CONTAINER_NAME:-vllm-ascend-env-a3}"
 
 # Check if container exists
 if [ "$(docker ps -aq -f name=^/${CONTAINER_NAME}$)" ]; then
