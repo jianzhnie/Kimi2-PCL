@@ -152,7 +152,7 @@ class MgCkptConvert:
             self._build_vpprank_layer_map()
 
         self.num_real_layers = self.num_layers - len(self.noop_layers_list)
-        
+
         # 修正：使用 qk_pos_emb_head_dim 计算 inv_dim
         self._reset_inv_freq()
 
@@ -242,7 +242,8 @@ class MgCkptConvert:
                 with open(cfg_1t) as f:
                     d = json.load(f)
                 if int(d.get('hidden_size', -1)) == self.hidden_size and int(
-                        d.get('num_hidden_layers', -1)) == self.num_real_layers:
+                        d.get('num_hidden_layers',
+                              -1)) == self.num_real_layers:
                     return cfg_1t
             except Exception:
                 pass
@@ -275,7 +276,7 @@ class MgCkptConvert:
             cfg['group_query_attention'] = kv_heads < self.num_attention_heads
             if cfg['group_query_attention']:
                 cfg['num_query_groups'] = self.num_attention_heads // kv_heads
-        
+
         if self.vocab_size is not None:
             cfg['vocab_size'] = self.vocab_size
         if self.ffn_hidden_size is not None:
@@ -296,11 +297,14 @@ class MgCkptConvert:
 
         gen_cfg = os.path.join(models_dir, 'generation_config.json')
         if os.path.isfile(gen_cfg):
-            shutil.copyfile(gen_cfg,
-                            os.path.join(self.hf_save_dir,
-                                         'generation_config.json'))
+            shutil.copyfile(
+                gen_cfg,
+                os.path.join(self.hf_save_dir, 'generation_config.json'))
 
-        for fn in ['configuration_deepseek.py', 'modeling_deepseek.py', '__init__.py']:
+        for fn in [
+                'configuration_deepseek.py', 'modeling_deepseek.py',
+                '__init__.py'
+        ]:
             src = os.path.join(models_dir, fn)
             if os.path.isfile(src):
                 shutil.copyfile(src, os.path.join(self.hf_save_dir, fn))
@@ -549,11 +553,10 @@ class MgCkptConvert:
                 keep[k] = v
         return keep
 
-    def _reconstruct_router_lazy(self,
-                                 base_models: dict[tuple[int, int],
-                                                   dict[str, torch.Tensor]],
-                                 pp_rank: int,
-                                 vpp_rank: int | None,
+    def _reconstruct_router_lazy(self, base_models: dict[tuple[int, int],
+                                                         dict[str,
+                                                              torch.Tensor]],
+                                 pp_rank: int, vpp_rank: int | None,
                                  key: str) -> torch.Tensor:
         for tp_rank in range(self.tp_size):
             d = base_models.get((tp_rank, 0))
@@ -590,8 +593,7 @@ class MgCkptConvert:
         for ep in range(self.ep_size):
             owners = self._tp_ranks_for_ep(pp_rank, ep)
             if not owners:
-                raise ValueError(
-                    f'找不到 ep={ep} 的权重目录: pp={pp_rank} key={key}')
+                raise ValueError(f'找不到 ep={ep} 的权重目录: pp={pp_rank} key={key}')
             if len(owners) != 1:
                 raise ValueError(
                     f'router 不支持跨 TP 分片重建: pp={pp_rank} ep={ep} owners={owners}'
@@ -653,8 +655,8 @@ class MgCkptConvert:
     def _set_postprocess(
             self, hf: dict[str, torch.Tensor],
             models: dict[tuple[int, int], dict[str, torch.Tensor]]) -> None:
-        hf['model.norm.weight'] = models[(0, 0)].pop(
-            'decoder.final_layernorm.weight')
+        hf['model.norm.weight'] = models[(
+            0, 0)].pop('decoder.final_layernorm.weight')
         parts = [
             models[(tp_rank, 0)].pop('output_layer.weight')
             for tp_rank in range(self.tp_size)
@@ -666,8 +668,8 @@ class MgCkptConvert:
                         hf_layer: int, local_idx: int) -> None:
         in_key = f'decoder.layers.{local_idx}.input_layernorm.weight'
         mlp_key = f'decoder.layers.{local_idx}.pre_mlp_layernorm.weight'
-        hf[f'model.layers.{hf_layer}.input_layernorm.weight'] = models[(0, 0)].pop(
-            in_key)
+        hf[f'model.layers.{hf_layer}.input_layernorm.weight'] = models[(
+            0, 0)].pop(in_key)
         hf[f'model.layers.{hf_layer}.post_attention_layernorm.weight'] = models[
             (0, 0)].pop(mlp_key)
 
@@ -744,7 +746,8 @@ class MgCkptConvert:
                 self.detected_num_kv_heads = kv_heads_per_tp * self.tp_size
             k_per_tp = kv_heads_per_tp * q_head_dim
             v_per_tp = kv_heads_per_tp * self.v_head_dim
-            q_r, k_r, v_r = torch.split(qkv_shard, [q_per_tp, k_per_tp, v_per_tp],
+            q_r, k_r, v_r = torch.split(qkv_shard,
+                                        [q_per_tp, k_per_tp, v_per_tp],
                                         dim=0)
             q_parts.append(q_r)
             k_parts.append(k_r)
@@ -764,7 +767,8 @@ class MgCkptConvert:
         k_ln = models[(0, 0)].pop(k_norm_key, None)
         if k_ln is not None:
             hf[f'model.layers.{hf_layer}.self_attn.k_layernorm.weight'] = k_ln
-        hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone()
+        hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone(
+        )
         return
 
     def _reconstruct_router(self, models: dict[tuple[int, int],
@@ -823,8 +827,8 @@ class MgCkptConvert:
             hf[f'model.layers.{hf_layer}.mlp.down_proj.weight'] = fc2
             return
 
-        pp_rank = self.layer2loc[hf_layer][0] if self.vpp_size is None else self.layer2loc_vpp[
-            hf_layer][0]
+        pp_rank = self.layer2loc[hf_layer][
+            0] if self.vpp_size is None else self.layer2loc_vpp[hf_layer][0]
         vpp_rank = None if self.vpp_size is None else self.layer2loc_vpp[
             hf_layer][1]
         router = self._reconstruct_router_lazy(models, pp_rank, vpp_rank,
@@ -892,8 +896,7 @@ class MgCkptConvert:
             for ep_rank in range(self.ep_size):
                 owners = self._tp_ranks_for_ep(pp_rank, ep_rank)
                 if not owners:
-                    raise ValueError(
-                        f'找不到 ep={ep_rank} 的权重目录: pp={pp_rank}')
+                    raise ValueError(f'找不到 ep={ep_rank} 的权重目录: pp={pp_rank}')
                 local_states: dict[int, dict[str, torch.Tensor]] = {}
                 for tp_rank in owners:
                     local_states[tp_rank] = self._load_sparse_ep_state(
@@ -1056,8 +1059,7 @@ class MgCkptConvert:
                         'total_size': self.total_size_bytes
                     },
                     'weight_map': self.weight_map
-                },
-                f)
+                }, f)
 
 
 def get_args():
