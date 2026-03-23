@@ -71,6 +71,10 @@ class CkptConvert:
         ep_size: int,
         first_k_dense_replace: int,
         hidden_size: int,
+        ffn_hidden_size: int | None,
+        moe_ffn_hidden_size: int | None,
+        vocab_size: int | None,
+        num_query_groups: int | None,
         num_experts: int,
         num_attention_heads: int,
         qk_head_dim: int,
@@ -103,6 +107,10 @@ class CkptConvert:
         self.ep_size = ep_size
         self.first_k_dense_replace = first_k_dense_replace
         self.hidden_size = hidden_size
+        self.ffn_hidden_size = ffn_hidden_size
+        self.moe_ffn_hidden_size = moe_ffn_hidden_size
+        self.vocab_size = vocab_size
+        self.num_query_groups = num_query_groups
         self.num_experts = num_experts
         self.num_attention_heads = num_attention_heads
         self.qk_head_dim = qk_head_dim
@@ -304,6 +312,17 @@ class CkptConvert:
             raise ValueError('num_experts 必须能整除 ep_size')
         if self.num_layer_list is not None and self.vpp_stage is not None:
             raise ValueError('num-layer-list 与 vpp/dualpipev 不可同时配置')
+        if self.vocab_size is not None and self.vocab_size <= 0:
+            raise ValueError('vocab-size 必须 > 0')
+        if self.ffn_hidden_size is not None and self.ffn_hidden_size <= 0:
+            raise ValueError('ffn-hidden-size 必须 > 0')
+        if self.moe_ffn_hidden_size is not None and self.moe_ffn_hidden_size <= 0:
+            raise ValueError('moe-ffn-hidden-size 必须 > 0')
+        if self.num_query_groups is not None:
+            if self.num_query_groups <= 0:
+                raise ValueError('num-query-groups 必须 > 0')
+            if self.num_attention_heads % self.num_query_groups != 0:
+                raise ValueError('num-attention-heads 必须能整除 num-query-groups')
 
     def _read_weight_map(self) -> dict[str, str]:
         index_path = os.path.join(self.hf_model_path,
@@ -725,18 +744,29 @@ class CkptConvert:
                                       shared_fc2_shards[tp_rank])
 
         if self.moe_grouped_gemm:
-            gemm_fc1 = torch.cat(experts_linear_fc1_list).view(
-                self.hidden_size, -1)
-            gemm_fc2 = torch.cat(experts_linear_fc2_list).view(
-                -1, self.hidden_size)
+            # experts_linear_fc1_list 每个元素形状: [hidden_size, intermediate_size*2]
+            # 需要 view 成 [num_experts, hidden_size, intermediate_size*2] 然后做 EP/TP 切分
+            gemm_fc1 = torch.stack(experts_linear_fc1_list, dim=0).reshape(
+                self.num_experts, self.hidden_size, -1)
+            gemm_fc2 = torch.stack(experts_linear_fc2_list, dim=0).reshape(
+                self.num_experts, -1, self.hidden_size)
+            if gemm_fc1.shape[1] != self.hidden_size or gemm_fc2.shape[
+                    2] != self.hidden_size:
+                raise ValueError(
+                    f'moe grouped gemm hidden_size 不匹配: hidden_size={self.hidden_size} gemm_fc1={tuple(gemm_fc1.shape)} gemm_fc2={tuple(gemm_fc2.shape)}'
+                )
             if self.moe_tp_extend_ep:
+                if self.num_experts % (self.ep_size * self.tp_size) != 0:
+                    raise ValueError(
+                        f'moe_tp_extend_ep 需要 num_experts 能整除 ep_size*tp_size: num_experts={self.num_experts} ep={self.ep_size} tp={self.tp_size}'
+                    )
                 gemm_fc1_ep = torch.chunk(
-                    gemm_fc1.view(self.num_experts, self.hidden_size, -1),
+                    gemm_fc1,
                     self.ep_size * self.tp_size,
                     dim=0,
                 )
                 gemm_fc2_ep = torch.chunk(
-                    gemm_fc2.view(self.num_experts, -1, self.hidden_size),
+                    gemm_fc2,
                     self.ep_size * self.tp_size,
                     dim=0,
                 )
@@ -754,13 +784,21 @@ class CkptConvert:
                         self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                               experts_weight2_key, w2)
             else:
+                if gemm_fc1.shape[2] % self.tp_size != 0:
+                    raise ValueError(
+                        f'moe grouped gemm 需要 intermediate*2 能整除 tp_size: gemm_fc1={tuple(gemm_fc1.shape)} tp={self.tp_size}'
+                    )
+                if gemm_fc2.shape[1] % self.tp_size != 0:
+                    raise ValueError(
+                        f'moe grouped gemm 需要 intermediate 能整除 tp_size: gemm_fc2={tuple(gemm_fc2.shape)} tp={self.tp_size}'
+                    )
                 gemm_fc1_ep = torch.chunk(
-                    gemm_fc1.view(self.num_experts, self.hidden_size, -1),
+                    gemm_fc1,
                     self.ep_size,
                     dim=0,
                 )
                 gemm_fc2_ep = torch.chunk(
-                    gemm_fc2.view(self.num_experts, -1, self.hidden_size),
+                    gemm_fc2,
                     self.ep_size,
                     dim=0,
                 )
@@ -878,6 +916,10 @@ class CkptConvert:
             ep_size=self.ep_size,
             first_k_dense_replace=self.first_k_dense_replace,
             hidden_size=self.hidden_size,
+            ffn_hidden_size=self.ffn_hidden_size,
+            moe_ffn_hidden_size=self.moe_ffn_hidden_size,
+            vocab_size=self.vocab_size,
+            num_query_groups=self.num_query_groups,
             num_experts=self.num_experts,
             num_attention_heads=self.num_attention_heads,
             qk_head_dim=self.qk_head_dim,
@@ -975,6 +1017,18 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override hidden size (default: from HF config).')
+    parser.add_argument('--ffn-hidden-size',
+                        type=int,
+                        default=None,
+                        help='Override ffn hidden size.')
+    parser.add_argument('--moe-ffn-hidden-size',
+                        type=int,
+                        default=None,
+                        help='Override moe ffn hidden size.')
+    parser.add_argument('--vocab-size',
+                        type=int,
+                        default=None,
+                        help='Override vocab size.')
     parser.add_argument('--num-experts',
                         type=int,
                         default=None,
@@ -985,6 +1039,10 @@ def get_args():
         default=None,
         help='Override attention heads (default: from HF config).',
     )
+    parser.add_argument('--num-query-groups',
+                        type=int,
+                        default=None,
+                        help='Override num query groups.')
     parser.add_argument('--qk-head-dim',
                         type=int,
                         default=None,
@@ -1034,6 +1092,11 @@ def main() -> None:
     if not num_layers:
         raise ValueError('无法从 HF config 推断 num_layers，请显式传入 --num-layers')
     hidden_size = args.hidden_size or hf_cfg.get('hidden_size') or HIDDEN_SIZE
+    ffn_hidden_size = args.ffn_hidden_size or hf_cfg.get(
+        'intermediate_size') or hf_cfg.get('ffn_hidden_size')
+    moe_ffn_hidden_size = args.moe_ffn_hidden_size or hf_cfg.get(
+        'moe_intermediate_size') or hf_cfg.get('moe_ffn_hidden_size')
+    vocab_size = args.vocab_size or hf_cfg.get('vocab_size')
     num_experts = args.num_experts or hf_cfg.get('num_experts') or hf_cfg.get(
         'n_experts') or hf_cfg.get('n_routed_experts') or NUM_EXPERTS
     num_attention_heads = args.num_attention_heads or hf_cfg.get(
@@ -1045,8 +1108,9 @@ def main() -> None:
 
     qk_rope_head_dim = args.qk_pos_emb_head_dim or hf_cfg.get('qk_rope_head_dim') or hf_cfg.get(
         'qk_pos_emb_head_dim') or QK_POS_EMB_HEAD_DIM
+    num_query_groups = args.num_query_groups or hf_cfg.get('num_query_groups')
     num_kv_heads = hf_cfg.get('num_key_value_heads') or hf_cfg.get(
-        'num_kv_heads') or hf_cfg.get('num_query_groups')
+        'num_kv_heads') or num_query_groups
     logger.info(
         'HF config summary: layers=%s hidden=%s heads=%s kv_heads=%s qk_nope=%s qk_rope=%s v=%s rope_theta=%s',
         str(num_layers),
@@ -1068,6 +1132,10 @@ def main() -> None:
         ep_size=args.target_expert_parallel_size,
         first_k_dense_replace=args.first_k_dense_replace,
         hidden_size=hidden_size,
+        ffn_hidden_size=ffn_hidden_size,
+        moe_ffn_hidden_size=moe_ffn_hidden_size,
+        vocab_size=vocab_size,
+        num_query_groups=num_query_groups,
         num_experts=num_experts,
         num_attention_heads=num_attention_heads,
         qk_head_dim=qk_head_dim,
