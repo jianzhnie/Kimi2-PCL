@@ -89,6 +89,8 @@ python utils/convert_ckpt_hf2mcore.py \
 - `--num-layer-list`：当 `num_layers` 不能整除 `pp_size` 时，显式给定每个 PP 的层数分配（形如 `4,4,4,4`）。
 - `--noop-layers`：指定 noop layer 索引列表（逗号分隔），用于与训练侧的 “跳层/空层” 配置对齐。
 - `--qlora-nf4`：输出层权重做 bitsandbytes nf4 量化（需要额外安装 `bitsandbytes`）。
+- `--cast-dtype`：可选，对浮点权重做 dtype 转换（`fp32`/`bf16`/`fp16`）。
+- `--sha256-manifest`：输出分块 sha256 清单（json），用于做文件级一致性校验。
 
 ### MCore → HF
 
@@ -104,6 +106,8 @@ bash scripts/ckpt_convert_mcore2hf.sh
 python utils/convert_ckpt_mcore2hf.py \
   --load-dir /path/to/mcore_ckpt_dir \
   --save-dir /path/to/hf_model_dir \
+  --pp-workers 2 \
+  --io-threads 4 \
   --num-layers 32 \
   --first-k-dense-replace 2 \
   --source-tensor-parallel-size 2 \
@@ -132,6 +136,16 @@ python utils/convert_ckpt_mcore2hf.py \
 
 - `model-00001-of-0000XX.safetensors` 分片文件
 - `model.safetensors.index.json`
+
+### 对齐验证（tests）
+
+当 `scripts/pretrain_kimi2_1t_4k.sh` 或 `utils/` 下转换逻辑变更时，可运行对齐回归测试：
+
+```bash
+python -m unittest -v tests/weights/test_align_pretrain_config.py
+```
+
+仓库包含一个 GitHub Actions 工作流片段：.github/workflows/weights.yml，会在相关路径变更时自动触发该测试。
 
 ## 训练脚本（scripts）
 
