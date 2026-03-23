@@ -80,4 +80,5 @@ python "${REPO_ROOT}/utils/convert_ckpt_mcore2hf.py" \
   --qk-head-dim "${QK_HEAD_DIM}" \
   --v-head-dim "${V_HEAD_DIM}" \
   --qk-pos-emb-head-dim "${QK_POS_EMB_HEAD_DIM}" \
+  --sha256-manifest "${SAVE_DIR}/sha256_manifest.json" \
   "${EXTRA_ARGS[@]}"
