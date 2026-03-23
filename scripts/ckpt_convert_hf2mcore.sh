@@ -9,9 +9,13 @@ fi
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-REPO_ROOT="/llm_workspace_1P/robin/Kimi2-PCL"
-LOAD_DIR="/llm_workspace_1P/robin/hfhub/kimi2-mcore2hf"
-SAVE_DIR="/llm_workspace_1P/robin/hfhub/kimi2-hf2mcore"
+
+export MOE_TP_EXTEND_EP=1
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-"$(cd "${SCRIPT_DIR}/.." && pwd)"}"
+LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/kimi2-mcore2hf}"
+SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/kimi2-hf2mcore}"
 
 
 TP="${TP:-2}"
@@ -44,6 +48,14 @@ if [[ -n "${NUM_LAYER_LIST}" ]]; then
   EXTRA_ARGS+=(--num-layer-list "${NUM_LAYER_LIST}")
 fi
 if [[ "${MOE_TP_EXTEND_EP:-0}" == "1" ]]; then
+  if [[ "${TP}" -le 1 ]]; then
+    echo "MOE_TP_EXTEND_EP=1 需要 TP>1" >&2
+    exit 2
+  fi
+  if (( EP % TP != 0 )); then
+    echo "MOE_TP_EXTEND_EP=1 需要 EP 能整除 TP: EP=${EP} TP=${TP}" >&2
+    exit 2
+  fi
   EXTRA_ARGS+=(--moe-tp-extend-ep)
 fi
 if [[ -n "${VPP_STAGE:-}" ]]; then

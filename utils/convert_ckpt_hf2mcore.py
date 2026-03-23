@@ -222,8 +222,7 @@ class CkptConvert:
         if self.vpp_stage is None:
             logger.info('pp_rank=%s/%s', pp_rank, self.pp_size)
             mg_model: dict[int, dict[int, dict[
-                str,
-                torch.Tensor]]] = defaultdict(lambda: defaultdict(dict))
+                str, torch.Tensor]]] = defaultdict(lambda: defaultdict(dict))
             t0 = time.time()
             weights = self._load_matched_hf_weights(pp_rank, None)
             if pp_rank == 0:
@@ -235,7 +234,8 @@ class CkptConvert:
                                      mg_model)
                 self._set_layer_attn(hf_layer, local_layer_idx, weights,
                                      mg_model)
-                self._set_layer_mlp(hf_layer, local_layer_idx, weights, mg_model)
+                self._set_layer_mlp(hf_layer, local_layer_idx, weights,
+                                    mg_model)
                 if self.log_layer_progress:
                     logger.info('Converted layer hf=%d local=%d pp=%d (%.2fs)',
                                 int(hf_layer), int(local_layer_idx),
@@ -257,9 +257,10 @@ class CkptConvert:
             self.vpp_size,
             self.vpp_stage,
         )
-        mg_model: dict[int, dict[int, dict[int, dict[
-            str, torch.Tensor]]]] = defaultdict(
-                lambda: defaultdict(lambda: defaultdict(dict)))
+        mg_model: dict[int,
+                       dict[int,
+                            dict[int, dict[str, torch.Tensor]]]] = defaultdict(
+                                lambda: defaultdict(lambda: defaultdict(dict)))
         for vpp_rank in range(self.vpp_size):
             t0 = time.time()
             weights = self._load_matched_hf_weights(pp_rank, vpp_rank)
@@ -287,14 +288,15 @@ class CkptConvert:
                         time.time() - lt0,
                     )
 
-            if (not self.dualpipe) and (pp_rank == self.pp_size - 1) and (
-                    vpp_rank == self.vpp_size - 1):
+            if (not self.dualpipe) and (pp_rank == self.pp_size -
+                                        1) and (vpp_rank == self.vpp_size - 1):
                 self._set_postprocess(weights, mg_model[vpp_rank])
             self._assert_consumed(weights,
                                   f'pp_rank={pp_rank} vpp_rank={vpp_rank}')
             if self.verbose:
                 logger.info('pp=%d vpp=%d done (%.2fs)', int(pp_rank),
-                            int(vpp_rank), time.time() - t0)
+                            int(vpp_rank),
+                            time.time() - t0)
         self._save_pp_rank(pp_rank, mg_model, vpp=True)
 
     def _validate(self) -> None:
@@ -323,6 +325,11 @@ class CkptConvert:
                 raise ValueError('num-query-groups 必须 > 0')
             if self.num_attention_heads % self.num_query_groups != 0:
                 raise ValueError('num-attention-heads 必须能整除 num-query-groups')
+        if self.moe_tp_extend_ep:
+            if self.tp_size <= 1:
+                raise ValueError('moe-tp-extend-ep 需要 tp_size > 1 才有意义')
+            if self.ep_size % self.tp_size != 0:
+                raise ValueError('moe-tp-extend-ep 需要 ep_size 能整除 tp_size')
 
     def _read_weight_map(self) -> dict[str, str]:
         index_path = os.path.join(self.hf_model_path,
@@ -465,8 +472,8 @@ class CkptConvert:
                 out[k] = f.get_tensor(k)
         if self.log_file_load:
             dt = time.time() - t0
-            logger.info('Loaded %d tensors from %s (%.2fs)', len(keys), filename,
-                        dt)
+            logger.info('Loaded %d tensors from %s (%.2fs)', len(keys),
+                        filename, dt)
         return out
 
     def _load_matched_hf_weights(
@@ -480,13 +487,11 @@ class CkptConvert:
         need_pre = pp_rank == 0 and (vpp_rank is None or vpp_rank == 0)
         need_post = False
         if self.dualpipe:
-            need_post = pp_rank == 0 and (vpp_rank is not None) and (vpp_rank
-                                                                     == self.vpp_size
-                                                                     - 1)
+            need_post = pp_rank == 0 and (vpp_rank is not None) and (
+                vpp_rank == self.vpp_size - 1)
         else:
-            need_post = pp_rank == self.pp_size - 1 and (vpp_rank is None
-                                                         or vpp_rank
-                                                         == self.vpp_size - 1)
+            need_post = pp_rank == self.pp_size - 1 and (
+                vpp_rank is None or vpp_rank == self.vpp_size - 1)
 
         required: set[str] = set()
         for layer in layer_list:
@@ -600,7 +605,8 @@ class CkptConvert:
         proj_key = f'{prefix}.linear_proj.weight'
 
         if 'model.layers.0.self_attn.q_proj.weight' not in self.weight_map and 'model.layers.0.self_attn.q_a_proj.weight' in self.weight_map:
-            raise ValueError('检测到 MLA 权重(如 q_a_proj)，但当前代码已移除 MLA 支持，只支持 GQA。请检查输入的 HF 权重。')
+            raise ValueError(
+                '检测到 MLA 权重(如 q_a_proj)，但当前代码已移除 MLA 支持，只支持 GQA。请检查输入的 HF 权重。')
 
         q_weight = weights.pop(
             f'model.layers.{hf_layer}.self_attn.q_proj.weight')
@@ -633,8 +639,7 @@ class CkptConvert:
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
                 mg_model[ep_rank][tp_rank][qkv_key] = qkv_shards[tp_rank]
-                mg_model[ep_rank][tp_rank][
-                    proj_key] = o_proj_shards[tp_rank]
+                mg_model[ep_rank][tp_rank][proj_key] = o_proj_shards[tp_rank]
                 if q_ln is not None:
                     mg_model[ep_rank][tp_rank][q_norm_key] = q_ln
                 if k_ln is not None:
@@ -702,7 +707,7 @@ class CkptConvert:
 
         experts_linear_fc1_list: list[torch.Tensor] = []
         experts_linear_fc2_list: list[torch.Tensor] = []
-        expert_tp_size = self.tp_size if self.moe_tp_extend_ep else 1
+        expert_tp_size = 1
         for expert in range(self.num_experts):
             gate = weights.pop(
                 f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'
@@ -728,61 +733,69 @@ class CkptConvert:
         experts_weight1_key = f'{prefix}.experts.weight1'
         experts_weight2_key = f'{prefix}.experts.weight2'
 
-        for ep_rank in range(self.ep_size):
-            for tp_rank in range(self.tp_size):
-                mg_model[ep_rank][tp_rank][router_key] = router_w
-                mg_model[ep_rank][tp_rank][router_bias_key] = router_b
-                mg_model[ep_rank][tp_rank][
-                    shared_fc1_key] = shared_fc1_shards[tp_rank]
-                mg_model[ep_rank][tp_rank][
-                    shared_fc2_key] = shared_fc2_shards[tp_rank]
+        if self.moe_tp_extend_ep:
+            num_local = self.num_experts // self.ep_size
+            for ep_rank in range(self.ep_size):
+                tp_rank = ep_rank % self.tp_size
+                mg_model[ep_rank][tp_rank][router_key] = router_w[
+                    ep_rank * num_local:(ep_rank + 1) * num_local].clone()
+                mg_model[ep_rank][tp_rank][router_bias_key] = router_b[
+                    ep_rank * num_local:(ep_rank + 1) * num_local].clone()
+                mg_model[ep_rank][tp_rank][shared_fc1_key] = shared_fc1_shards[
+                    tp_rank]
+                mg_model[ep_rank][tp_rank][shared_fc2_key] = shared_fc2_shards[
+                    tp_rank]
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                       shared_fc1_key,
                                       shared_fc1_shards[tp_rank])
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                       shared_fc2_key,
                                       shared_fc2_shards[tp_rank])
+        else:
+            for ep_rank in range(self.ep_size):
+                for tp_rank in range(self.tp_size):
+                    mg_model[ep_rank][tp_rank][router_key] = router_w
+                    mg_model[ep_rank][tp_rank][router_bias_key] = router_b
+                    mg_model[ep_rank][tp_rank][
+                        shared_fc1_key] = shared_fc1_shards[tp_rank]
+                    mg_model[ep_rank][tp_rank][
+                        shared_fc2_key] = shared_fc2_shards[tp_rank]
+                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
+                                          shared_fc1_key,
+                                          shared_fc1_shards[tp_rank])
+                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
+                                          shared_fc2_key,
+                                          shared_fc2_shards[tp_rank])
 
         if self.moe_grouped_gemm:
             # experts_linear_fc1_list 每个元素形状: [hidden_size, intermediate_size*2]
             # 需要 view 成 [num_experts, hidden_size, intermediate_size*2] 然后做 EP/TP 切分
-            gemm_fc1 = torch.stack(experts_linear_fc1_list, dim=0).reshape(
-                self.num_experts, self.hidden_size, -1)
-            gemm_fc2 = torch.stack(experts_linear_fc2_list, dim=0).reshape(
-                self.num_experts, -1, self.hidden_size)
+            gemm_fc1 = torch.stack(experts_linear_fc1_list,
+                                   dim=0).reshape(self.num_experts,
+                                                  self.hidden_size, -1)
+            gemm_fc2 = torch.stack(experts_linear_fc2_list,
+                                   dim=0).reshape(self.num_experts, -1,
+                                                  self.hidden_size)
             if gemm_fc1.shape[1] != self.hidden_size or gemm_fc2.shape[
                     2] != self.hidden_size:
                 raise ValueError(
                     f'moe grouped gemm hidden_size 不匹配: hidden_size={self.hidden_size} gemm_fc1={tuple(gemm_fc1.shape)} gemm_fc2={tuple(gemm_fc2.shape)}'
                 )
             if self.moe_tp_extend_ep:
-                if self.num_experts % (self.ep_size * self.tp_size) != 0:
-                    raise ValueError(
-                        f'moe_tp_extend_ep 需要 num_experts 能整除 ep_size*tp_size: num_experts={self.num_experts} ep={self.ep_size} tp={self.tp_size}'
-                    )
-                gemm_fc1_ep = torch.chunk(
-                    gemm_fc1,
-                    self.ep_size * self.tp_size,
-                    dim=0,
-                )
-                gemm_fc2_ep = torch.chunk(
-                    gemm_fc2,
-                    self.ep_size * self.tp_size,
-                    dim=0,
-                )
+                gemm_fc1_ep = torch.chunk(gemm_fc1, self.ep_size, dim=0)
+                gemm_fc2_ep = torch.chunk(gemm_fc2, self.ep_size, dim=0)
                 for ep_rank in range(self.ep_size):
-                    for tp_rank in range(self.tp_size):
-                        idx = ep_rank * self.tp_size + tp_rank
-                        w1 = gemm_fc1_ep[idx].reshape(self.hidden_size,
-                                                      -1).clone()
-                        w2 = gemm_fc2_ep[idx].reshape(
-                            -1, self.hidden_size).clone()
-                        mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
-                        mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
-                        self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
-                                              experts_weight1_key, w1)
-                        self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
-                                              experts_weight2_key, w2)
+                    tp_rank = ep_rank % self.tp_size
+                    w1 = gemm_fc1_ep[ep_rank].permute(1, 0, 2).reshape(
+                        self.hidden_size, -1).clone()
+                    w2 = gemm_fc2_ep[ep_rank].reshape(
+                        -1, self.hidden_size).clone()
+                    mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
+                    mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
+                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
+                                          experts_weight1_key, w1)
+                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
+                                          experts_weight2_key, w2)
             else:
                 if gemm_fc1.shape[2] % self.tp_size != 0:
                     raise ValueError(
@@ -827,26 +840,49 @@ class CkptConvert:
                     global_idx = local_idx + ep_rank * num_local_experts
                     local_fc1 = experts_linear_fc1_list[global_idx].t()
                     local_fc2 = experts_linear_fc2_list[global_idx].t()
-                    local_fc1_tp = torch.chunk(local_fc1, self.tp_size, dim=0)
-                    local_fc2_tp = torch.chunk(local_fc2, self.tp_size, dim=1)
-                    local_fc1_shards = [t.clone() for t in local_fc1_tp]
-                    local_fc2_shards = [t.clone() for t in local_fc2_tp]
                     local_prefix = f'{prefix}.experts.local_experts.{local_idx}'
-                    for tp_rank in range(self.tp_size):
+                    if self.moe_tp_extend_ep:
+                        tp_rank = ep_rank % self.tp_size
                         mg_model[ep_rank][tp_rank][
-                            f'{local_prefix}.linear_fc1.weight'] = local_fc1_shards[
-                                tp_rank]
+                            f'{local_prefix}.linear_fc1.weight'] = local_fc1.clone(
+                            )
                         mg_model[ep_rank][tp_rank][
-                            f'{local_prefix}.linear_fc2.weight'] = local_fc2_shards[
-                                tp_rank]
+                            f'{local_prefix}.linear_fc2.weight'] = local_fc2.clone(
+                            )
                         self._maybe_quant_nf4(
                             mg_model[ep_rank][tp_rank],
                             f'{local_prefix}.linear_fc1.weight',
-                            local_fc1_shards[tp_rank])
+                            mg_model[ep_rank][tp_rank]
+                            [f'{local_prefix}.linear_fc1.weight'])
                         self._maybe_quant_nf4(
                             mg_model[ep_rank][tp_rank],
                             f'{local_prefix}.linear_fc2.weight',
-                            local_fc2_shards[tp_rank])
+                            mg_model[ep_rank][tp_rank]
+                            [f'{local_prefix}.linear_fc2.weight'])
+                    else:
+                        local_fc1_tp = torch.chunk(local_fc1,
+                                                   self.tp_size,
+                                                   dim=0)
+                        local_fc2_tp = torch.chunk(local_fc2,
+                                                   self.tp_size,
+                                                   dim=1)
+                        local_fc1_shards = [t.clone() for t in local_fc1_tp]
+                        local_fc2_shards = [t.clone() for t in local_fc2_tp]
+                        for tp_rank in range(self.tp_size):
+                            mg_model[ep_rank][tp_rank][
+                                f'{local_prefix}.linear_fc1.weight'] = local_fc1_shards[
+                                    tp_rank]
+                            mg_model[ep_rank][tp_rank][
+                                f'{local_prefix}.linear_fc2.weight'] = local_fc2_shards[
+                                    tp_rank]
+                            self._maybe_quant_nf4(
+                                mg_model[ep_rank][tp_rank],
+                                f'{local_prefix}.linear_fc1.weight',
+                                local_fc1_shards[tp_rank])
+                            self._maybe_quant_nf4(
+                                mg_model[ep_rank][tp_rank],
+                                f'{local_prefix}.linear_fc2.weight',
+                                local_fc2_shards[tp_rank])
 
     def _save_pp_rank(
         self,
@@ -863,8 +899,15 @@ class CkptConvert:
                 str(vpp),
                 self.iter_path,
             )
+        saved = 0
+        total = self.ep_size * self.tp_size
+        if self.moe_tp_extend_ep:
+            total = self.ep_size
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
+                if self.moe_tp_extend_ep and (ep_rank %
+                                              self.tp_size) != tp_rank:
+                    continue
                 prefix = _mp_prefix(tp_rank, pp_rank, ep_rank, self.tp_size,
                                     self.pp_size, self.ep_size)
                 outdir = os.path.join(self.iter_path, prefix)
@@ -876,24 +919,27 @@ class CkptConvert:
                         'model1': mg_model[1][ep_rank][tp_rank],
                         'checkpoint_version': 3.0,
                         'iteration': 1,
-                        'args': {'rotary_base': self.rotary_base},
+                        'args': {
+                            'rotary_base': self.rotary_base
+                        },
                     }
                 else:
                     payload = {
                         'model': mg_model[ep_rank][tp_rank],
                         'checkpoint_version': 3.0,
                         'iteration': 1,
-                        'args': {'rotary_base': self.rotary_base},
+                        'args': {
+                            'rotary_base': self.rotary_base
+                        },
                     }
                 torch.save(payload,
                            outpath,
                            pickle_protocol=4,
                            _use_new_zipfile_serialization=True)
+                saved += 1
             if self.log_save_progress:
-                done = (ep_rank + 1) * self.tp_size
-                total = self.ep_size * self.tp_size
                 logger.info('Saved pp=%d ep=%d (%d/%d ranks)', int(pp_rank),
-                            int(ep_rank), int(done), int(total))
+                            int(ep_rank), int(saved), int(total))
         if self.log_save_progress:
             dt = time.time() - t0
             logger.info('Saved pp=%d done (%.2fs)', int(pp_rank), dt)
@@ -940,10 +986,10 @@ class CkptConvert:
         logger.info('Parallel convert: pp_workers=%d pp=%d', int(workers),
                     int(self.pp_size))
         futures = []
-        with ProcessPoolExecutor(max_workers=workers,
-                                 mp_context=ctx) as ex:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
             for pp_rank in range(self.pp_size):
-                futures.append(ex.submit(_worker_run_one_pp_rank, cfg, pp_rank))
+                futures.append(ex.submit(_worker_run_one_pp_rank, cfg,
+                                         pp_rank))
             for fut in as_completed(futures):
                 fut.result()
         logger.info('Parallel convert done (%.2fs)', time.time() - t0)
@@ -1087,8 +1133,9 @@ def main() -> None:
     args = get_args()
     logger.info('Arguments: %s', args)
     hf_cfg = _read_hf_config(args.load_dir)
-    num_layers = args.num_layers or hf_cfg.get('num_hidden_layers') or hf_cfg.get(
-        'num_layers') or hf_cfg.get('n_layer')
+    num_layers = args.num_layers or hf_cfg.get(
+        'num_hidden_layers') or hf_cfg.get('num_layers') or hf_cfg.get(
+            'n_layer')
     if not num_layers:
         raise ValueError('无法从 HF config 推断 num_layers，请显式传入 --num-layers')
     hidden_size = args.hidden_size or hf_cfg.get('hidden_size') or HIDDEN_SIZE
@@ -1101,13 +1148,14 @@ def main() -> None:
         'n_experts') or hf_cfg.get('n_routed_experts') or NUM_EXPERTS
     num_attention_heads = args.num_attention_heads or hf_cfg.get(
         'num_attention_heads') or NUM_ATTENTION_HEADS
-    qk_head_dim = args.qk_head_dim or hf_cfg.get('qk_nope_head_dim') or hf_cfg.get(
-        'qk_head_dim') or QK_HEAD_DIM
+    qk_head_dim = args.qk_head_dim or hf_cfg.get(
+        'qk_nope_head_dim') or hf_cfg.get('qk_head_dim') or QK_HEAD_DIM
     v_head_dim = args.v_head_dim or hf_cfg.get('v_head_dim') or V_HEAD_DIM
     rotary_base = args.rotary_base or hf_cfg.get('rope_theta') or 50000.0
 
-    qk_rope_head_dim = args.qk_pos_emb_head_dim or hf_cfg.get('qk_rope_head_dim') or hf_cfg.get(
-        'qk_pos_emb_head_dim') or QK_POS_EMB_HEAD_DIM
+    qk_rope_head_dim = args.qk_pos_emb_head_dim or hf_cfg.get(
+        'qk_rope_head_dim') or hf_cfg.get(
+            'qk_pos_emb_head_dim') or QK_POS_EMB_HEAD_DIM
     num_query_groups = args.num_query_groups or hf_cfg.get('num_query_groups')
     num_kv_heads = hf_cfg.get('num_key_value_heads') or hf_cfg.get(
         'num_kv_heads') or num_query_groups
