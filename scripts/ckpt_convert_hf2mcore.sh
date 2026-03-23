@@ -12,8 +12,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 export MOE_TP_EXTEND_EP=1
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="${REPO_ROOT:-"$(cd "${SCRIPT_DIR}/.." && pwd)"}"
+REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/kimi2-mcore2hf}"
 SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/kimi2-hf2mcore}"
 
@@ -22,6 +21,8 @@ TP="${TP:-2}"
 PP="${PP:-8}"
 EP="${EP:-64}"
 PP_WORKERS="${PP_WORKERS:-2}"
+IO_THREADS="${IO_THREADS:-2}"
+CAST_DTYPE="${CAST_DTYPE:-bf16}"
 NUM_LAYERS="${NUM_LAYERS:-32}"
 FIRST_K_DENSE_REPLACE="${FIRST_K_DENSE_REPLACE:-2}"
 ROTARY_BASE="${ROTARY_BASE:-50000}"
@@ -39,6 +40,7 @@ NUM_QUERY_GROUPS="${NUM_QUERY_GROUPS:-2}"
 QK_HEAD_DIM="${QK_HEAD_DIM:-128}"
 V_HEAD_DIM="${V_HEAD_DIM:-128}"
 QK_POS_EMB_HEAD_DIM="${QK_POS_EMB_HEAD_DIM:-64}"
+MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"
 
 EXTRA_ARGS=()
 if [[ -n "${SCHEDULES_METHOD}" ]]; then
@@ -61,6 +63,9 @@ fi
 if [[ -n "${VPP_STAGE:-}" ]]; then
   EXTRA_ARGS+=(--vpp-stage "${VPP_STAGE}")
 fi
+if [[ -n "${CAST_DTYPE}" ]]; then
+  EXTRA_ARGS+=(--cast-dtype "${CAST_DTYPE}")
+fi
 
 python "${REPO_ROOT}/utils/convert_ckpt_hf2mcore.py" \
   --load-dir "${LOAD_DIR}" \
@@ -71,6 +76,7 @@ python "${REPO_ROOT}/utils/convert_ckpt_hf2mcore.py" \
   --target-pipeline-parallel-size "${PP}" \
   --target-expert-parallel-size "${EP}" \
   --pp-workers "${PP_WORKERS}" \
+  --hf-io-threads "${IO_THREADS}" \
   --moe-grouped-gemm \
   --rotary-base "${ROTARY_BASE}" \
   --noop-layers "${NOOP_LAYERS}" \
@@ -81,7 +87,9 @@ python "${REPO_ROOT}/utils/convert_ckpt_hf2mcore.py" \
   --num-experts "${NUM_EXPERTS}" \
   --num-attention-heads "${NUM_ATTENTION_HEADS}" \
   --num-query-groups "${NUM_QUERY_GROUPS}" \
+  --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}" \
   --qk-head-dim "${QK_HEAD_DIM}" \
   --v-head-dim "${V_HEAD_DIM}" \
   --qk-pos-emb-head-dim "${QK_POS_EMB_HEAD_DIM}" \
+  --sha256-manifest "${SAVE_DIR}/sha256_manifest.json" \
   "${EXTRA_ARGS[@]}"
