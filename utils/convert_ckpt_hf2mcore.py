@@ -1,14 +1,15 @@
 import argparse
+import hashlib
 import json
 import logging as logger
 import os
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                as_completed)
 from multiprocessing import get_context
 from typing import Optional
 
-import safetensors.torch
 import torch
 from safetensors import safe_open
 
@@ -46,6 +47,46 @@ def _ensure_iter_path(save_dir: str) -> str:
         with open(latest_path, 'w') as f:
             f.write('1')
     return iter_dir
+
+
+def _dtype_from_str(s: str) -> torch.dtype:
+    v = (s or '').lower()
+    if v in ('fp16', 'float16'):
+        return torch.float16
+    if v in ('bf16', 'bfloat16'):
+        return torch.bfloat16
+    if v in ('fp32', 'float32'):
+        return torch.float32
+    raise ValueError(f'不支持的 dtype: {s}')
+
+
+def _sha256_file(path: str, chunk_bytes: int = 32 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            b = f.read(chunk_bytes)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _write_sha256_manifest(save_dir: str, out_path: str | None) -> str | None:
+    if not out_path:
+        return None
+    files: list[str] = []
+    for root, _, fns in os.walk(save_dir):
+        for fn in fns:
+            if fn.endswith('.pt') or fn.endswith('.txt'):
+                files.append(os.path.join(root, fn))
+    files.sort()
+    payload: dict[str, str] = {}
+    for p in files:
+        rel = os.path.relpath(p, save_dir)
+        payload[rel] = _sha256_file(p)
+    with open(out_path, 'w') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return out_path
 
 
 def _mp_prefix(tp_rank: int, pp_rank: int, ep_rank: int, tp: int, pp: int,
@@ -89,6 +130,10 @@ class CkptConvert:
         rotary_base: float = 50000.0,
         print_init_summary: bool = True,
         pp_workers: int = 1,
+        cast_dtype: str | None = None,
+        tie_word_embeddings: bool | None = None,
+        hf_io_threads: int = 1,
+        qk_layernorm: bool = False,
     ):
         self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
         self.log_file_load = os.environ.get('CKPT_CONVERT_LOG_FILE',
@@ -99,6 +144,11 @@ class CkptConvert:
                                                 '1') != '0'
         self.print_init_summary = print_init_summary
         self.pp_workers = int(pp_workers)
+        self.hf_io_threads = max(1, int(hf_io_threads))
+        self.cast_dtype = cast_dtype
+        self._target_dtype = _dtype_from_str(
+            cast_dtype) if cast_dtype else None
+        self.tie_word_embeddings = tie_word_embeddings
         self.hf_model_path = hf_model_path
         self.mg_save_path = mg_save_path
         self.num_layers = num_layers
@@ -124,6 +174,7 @@ class CkptConvert:
         self.noop_layers = noop_layers
         self.qlora_nf4 = qlora_nf4
         self.rotary_base = rotary_base
+        self.qk_layernorm = qk_layernorm
 
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
         if self.dualpipe:
@@ -500,7 +551,10 @@ class CkptConvert:
             required.add('model.embed_tokens.weight')
         if need_post:
             required.add('model.norm.weight')
-            required.add('lm_head.weight')
+            if not self.tie_word_embeddings:
+                required.add('lm_head.weight')
+            else:
+                required.add('model.embed_tokens.weight')
 
         files_to_keys: dict[str, list[str]] = defaultdict(list)
         for k in required:
@@ -524,8 +578,17 @@ class CkptConvert:
 
         all_weights: dict[str, torch.Tensor] = {}
         t0 = time.time()
-        for fn, ks in files_to_keys.items():
-            all_weights.update(self._load_safetensors_keys(fn, ks))
+        if self.hf_io_threads > 1 and len(files_to_keys) > 1:
+            with ThreadPoolExecutor(max_workers=self.hf_io_threads) as ex:
+                futures = [
+                    ex.submit(self._load_safetensors_keys, fn, ks)
+                    for fn, ks in files_to_keys.items()
+                ]
+                for fut in as_completed(futures):
+                    all_weights.update(fut.result())
+        else:
+            for fn, ks in files_to_keys.items():
+                all_weights.update(self._load_safetensors_keys(fn, ks))
         if self.verbose:
             dt = time.time() - t0
             logger.info('Loaded HF batch: pp=%s vpp=%s tensors=%d (%.2fs)',
@@ -550,9 +613,14 @@ class CkptConvert:
     def _set_preprocess(
             self, weights: dict[str, torch.Tensor],
             mg_model: dict[int, dict[int, dict[str, torch.Tensor]]]) -> None:
-        emb = weights.pop('model.embed_tokens.weight')
+        if self.tie_word_embeddings and self.pp_size == 1 and self.vpp_stage is None:
+            emb = weights['model.embed_tokens.weight']
+        else:
+            emb = weights.pop('model.embed_tokens.weight')
         emb_tp = torch.chunk(emb, self.tp_size, dim=0)
-        emb_shards = [t.clone() for t in emb_tp]
+        emb_shards = [
+            t.contiguous() if not t.is_contiguous() else t for t in emb_tp
+        ]
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
                 mg_model[ep_rank][tp_rank][
@@ -562,9 +630,16 @@ class CkptConvert:
             self, weights: dict[str, torch.Tensor],
             mg_model: dict[int, dict[int, dict[str, torch.Tensor]]]) -> None:
         final_norm = weights.pop('model.norm.weight')
-        lm_head = weights.pop('lm_head.weight')
+        lm_head = weights.pop('lm_head.weight', None)
+        if lm_head is None:
+            if self.tie_word_embeddings:
+                lm_head = weights.pop('model.embed_tokens.weight')
+            else:
+                raise KeyError('缺少 lm_head.weight 且未启用 tie_word_embeddings')
         lm_head_tp = torch.chunk(lm_head, self.tp_size, dim=0)
-        lm_head_shards = [t.clone() for t in lm_head_tp]
+        lm_head_shards = [
+            t.contiguous() if not t.is_contiguous() else t for t in lm_head_tp
+        ]
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
                 mg_model[ep_rank][tp_rank][
@@ -634,7 +709,9 @@ class CkptConvert:
             torch.cat([q_tp[i], k_tp[i], v_tp[i]], dim=0)
             for i in range(self.tp_size)
         ]
-        o_proj_shards = [t.clone() for t in o_proj_tp]
+        o_proj_shards = [
+            t.contiguous() if not t.is_contiguous() else t for t in o_proj_tp
+        ]
 
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
@@ -664,8 +741,12 @@ class CkptConvert:
             fc1 = torch.cat([gate, up], dim=0)
             fc1_tp = torch.chunk(fc1, self.tp_size, dim=0)
             fc2_tp = torch.chunk(down, self.tp_size, dim=1)
-            fc1_shards = [t.clone() for t in fc1_tp]
-            fc2_shards = [t.clone() for t in fc2_tp]
+            fc1_shards = [
+                t.contiguous() if not t.is_contiguous() else t for t in fc1_tp
+            ]
+            fc2_shards = [
+                t.contiguous() if not t.is_contiguous() else t for t in fc2_tp
+            ]
             for ep_rank in range(self.ep_size):
                 for tp_rank in range(self.tp_size):
                     mg_model[ep_rank][tp_rank][
@@ -702,8 +783,14 @@ class CkptConvert:
         shared_fc1 = torch.cat([shared_gate, shared_up], dim=0)
         shared_fc1_tp = torch.chunk(shared_fc1, self.tp_size, dim=0)
         shared_fc2_tp = torch.chunk(shared_down, self.tp_size, dim=1)
-        shared_fc1_shards = [t.clone() for t in shared_fc1_tp]
-        shared_fc2_shards = [t.clone() for t in shared_fc2_tp]
+        shared_fc1_shards = [
+            t.contiguous() if not t.is_contiguous() else t
+            for t in shared_fc1_tp
+        ]
+        shared_fc2_shards = [
+            t.contiguous() if not t.is_contiguous() else t
+            for t in shared_fc2_tp
+        ]
 
         experts_linear_fc1_list: list[torch.Tensor] = []
         experts_linear_fc2_list: list[torch.Tensor] = []
@@ -787,9 +874,9 @@ class CkptConvert:
                 for ep_rank in range(self.ep_size):
                     tp_rank = ep_rank % self.tp_size
                     w1 = gemm_fc1_ep[ep_rank].permute(1, 0, 2).reshape(
-                        self.hidden_size, -1).clone()
+                        self.hidden_size, -1).contiguous()
                     w2 = gemm_fc2_ep[ep_rank].reshape(
-                        -1, self.hidden_size).clone()
+                        -1, self.hidden_size).contiguous()
                     mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
                     mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
                     self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
@@ -824,9 +911,9 @@ class CkptConvert:
                                          dim=1)
                     for tp_rank in range(self.tp_size):
                         w1 = fc1_tp[tp_rank].reshape(self.hidden_size,
-                                                     -1).clone()
-                        w2 = fc2_tp[tp_rank].reshape(-1,
-                                                     self.hidden_size).clone()
+                                                     -1).contiguous()
+                        w2 = fc2_tp[tp_rank].reshape(
+                            -1, self.hidden_size).contiguous()
                         mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
                         mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
                         self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
@@ -844,10 +931,10 @@ class CkptConvert:
                     if self.moe_tp_extend_ep:
                         tp_rank = ep_rank % self.tp_size
                         mg_model[ep_rank][tp_rank][
-                            f'{local_prefix}.linear_fc1.weight'] = local_fc1.clone(
+                            f'{local_prefix}.linear_fc1.weight'] = local_fc1.contiguous(
                             )
                         mg_model[ep_rank][tp_rank][
-                            f'{local_prefix}.linear_fc2.weight'] = local_fc2.clone(
+                            f'{local_prefix}.linear_fc2.weight'] = local_fc2.contiguous(
                             )
                         self._maybe_quant_nf4(
                             mg_model[ep_rank][tp_rank],
@@ -866,8 +953,14 @@ class CkptConvert:
                         local_fc2_tp = torch.chunk(local_fc2,
                                                    self.tp_size,
                                                    dim=1)
-                        local_fc1_shards = [t.clone() for t in local_fc1_tp]
-                        local_fc2_shards = [t.clone() for t in local_fc2_tp]
+                        local_fc1_shards = [
+                            t.contiguous() if not t.is_contiguous() else t
+                            for t in local_fc1_tp
+                        ]
+                        local_fc2_shards = [
+                            t.contiguous() if not t.is_contiguous() else t
+                            for t in local_fc2_tp
+                        ]
                         for tp_rank in range(self.tp_size):
                             mg_model[ep_rank][tp_rank][
                                 f'{local_prefix}.linear_fc1.weight'] = local_fc1_shards[
@@ -883,6 +976,21 @@ class CkptConvert:
                                 mg_model[ep_rank][tp_rank],
                                 f'{local_prefix}.linear_fc2.weight',
                                 local_fc2_shards[tp_rank])
+
+    def _maybe_cast(self, t: torch.Tensor) -> torch.Tensor:
+        if self._target_dtype is None:
+            return t
+        if not torch.is_floating_point(t):
+            return t
+        if t.dtype == self._target_dtype:
+            return t
+        return t.to(dtype=self._target_dtype)
+
+    def _cast_model_dict(
+            self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if self._target_dtype is None:
+            return d
+        return {k: self._maybe_cast(v) for k, v in d.items()}
 
     def _save_pp_rank(
         self,
@@ -915,17 +1023,22 @@ class CkptConvert:
                 outpath = os.path.join(outdir, 'model_optim_rng.pt')
                 if vpp:
                     payload = {
-                        'model0': mg_model[0][ep_rank][tp_rank],
-                        'model1': mg_model[1][ep_rank][tp_rank],
-                        'checkpoint_version': 3.0,
-                        'iteration': 1,
+                        'model0':
+                        self._cast_model_dict(mg_model[0][ep_rank][tp_rank]),
+                        'model1':
+                        self._cast_model_dict(mg_model[1][ep_rank][tp_rank]),
+                        'checkpoint_version':
+                        3.0,
+                        'iteration':
+                        1,
                         'args': {
                             'rotary_base': self.rotary_base
                         },
                     }
                 else:
                     payload = {
-                        'model': mg_model[ep_rank][tp_rank],
+                        'model':
+                        self._cast_model_dict(mg_model[ep_rank][tp_rank]),
                         'checkpoint_version': 3.0,
                         'iteration': 1,
                         'args': {
@@ -980,6 +1093,10 @@ class CkptConvert:
             rotary_base=self.rotary_base,
             print_init_summary=False,
             pp_workers=1,
+            cast_dtype=self.cast_dtype,
+            tie_word_embeddings=self.tie_word_embeddings,
+            hf_io_threads=self.hf_io_threads,
+            qk_layernorm=self.qk_layernorm,
         )
 
         t0 = time.time()
@@ -1102,6 +1219,17 @@ def get_args():
                         default=None,
                         help='Override qk pos emb head dim.')
     parser.add_argument(
+        '--qk-layernorm',
+        action='store_true',
+        help='Enable QK LayerNorm (must match pretrain config)')
+    parser.add_argument('--max-position-embeddings',
+                        type=int,
+                        default=None,
+                        help='Override max position embeddings.')
+    parser.add_argument('--tie-word-embeddings',
+                        action='store_true',
+                        help='Tie word embeddings and output layer.')
+    parser.add_argument(
         '--moe-tp-extend-ep',
         action='store_true',
         help=
@@ -1124,6 +1252,19 @@ def get_args():
                         type=int,
                         default=1,
                         help='Parallelize by pp_rank with processes.')
+    parser.add_argument('--cast-dtype',
+                        type=str,
+                        default=None,
+                        choices=['fp32', 'bf16', 'fp16'],
+                        help='Cast floating tensors before saving.')
+    parser.add_argument('--hf-io-threads',
+                        type=int,
+                        default=1,
+                        help='Thread workers for reading HF safetensors.')
+    parser.add_argument('--sha256-manifest',
+                        type=str,
+                        default=None,
+                        help='Write sha256 manifest json to this path.')
 
     args, _ = parser.parse_known_args()
     return args
@@ -1159,6 +1300,10 @@ def main() -> None:
     num_query_groups = args.num_query_groups or hf_cfg.get('num_query_groups')
     num_kv_heads = hf_cfg.get('num_key_value_heads') or hf_cfg.get(
         'num_kv_heads') or num_query_groups
+
+    tie_word_embeddings = bool(hf_cfg.get('tie_word_embeddings'))
+    if getattr(args, 'tie_word_embeddings', False):
+        tie_word_embeddings = True
     logger.info(
         'HF config summary: layers=%s hidden=%s heads=%s kv_heads=%s qk_nope=%s qk_rope=%s v=%s rope_theta=%s',
         str(num_layers),
@@ -1197,8 +1342,12 @@ def main() -> None:
         qlora_nf4=args.qlora_nf4,
         rotary_base=rotary_base,
         pp_workers=args.pp_workers,
+        cast_dtype=args.cast_dtype,
+        tie_word_embeddings=tie_word_embeddings,
+        qk_layernorm=args.qk_layernorm,
     )
     converter.run()
+    _write_sha256_manifest(args.save_dir, args.sha256_manifest)
 
 
 if __name__ == '__main__':

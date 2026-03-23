@@ -1,10 +1,14 @@
 import argparse
+import hashlib
+import inspect
 import json
 import logging as logger
 import os
 import shutil
+import struct
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import safetensors.torch
@@ -20,8 +24,6 @@ NUM_ATTENTION_HEADS = 64
 QK_HEAD_DIM = 128
 QK_POS_EMB_HEAD_DIM = 64
 V_HEAD_DIM = 128
-Q_LORA_RANK = 1536
-KV_LORA_RANK = 512
 NUM_QUERY_GROUPS = 2
 FFN_HIDDEN_SIZE = 18432
 MOE_FFN_HIDDEN_SIZE = 12288
@@ -58,6 +60,122 @@ def _resolve_iter_dir(load_dir: str) -> str:
     raise FileNotFoundError(f'无法定位迭代目录: {load_dir}')
 
 
+def _dtype_from_str(s: str) -> torch.dtype:
+    v = (s or '').lower()
+    if v in ('fp16', 'float16'):
+        return torch.float16
+    if v in ('bf16', 'bfloat16'):
+        return torch.bfloat16
+    if v in ('fp32', 'float32'):
+        return torch.float32
+    raise ValueError(f'不支持的 dtype: {s}')
+
+
+def _sha256_file(path: str, chunk_bytes: int = 32 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            b = f.read(chunk_bytes)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _write_sha256_manifest(save_dir: str, out_path: str | None) -> str | None:
+    if not out_path:
+        return None
+    files: list[str] = []
+    for fn in sorted(os.listdir(save_dir)):
+        if fn.endswith('.safetensors') or fn.endswith('.json'):
+            files.append(fn)
+    payload: dict[str, str] = {}
+    for fn in files:
+        p = os.path.join(save_dir, fn)
+        if os.path.isfile(p):
+            payload[fn] = _sha256_file(p)
+    with open(out_path, 'w') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return out_path
+
+
+def _read_safetensors_header_keys(path: str) -> list[str]:
+    with open(path, 'rb') as f:
+        header_len = struct.unpack('<Q', f.read(8))[0]
+        header = f.read(int(header_len))
+    meta = json.loads(header.decode('utf-8'))
+    keys = [k for k in meta.keys() if k != '__metadata__']
+    keys.sort()
+    return keys
+
+
+def _write_hf_index_by_scan(save_dir: str) -> tuple[str, int]:
+    weight_map: dict[str, str] = {}
+    total_size = 0
+    shard_files = sorted(fn for fn in os.listdir(save_dir)
+                         if fn.endswith('.safetensors'))
+    for fn in shard_files:
+        p = os.path.join(save_dir, fn)
+        if not os.path.isfile(p):
+            continue
+        total_size += int(os.path.getsize(p))
+        for k in _read_safetensors_header_keys(p):
+            weight_map[k] = fn
+    index_path = os.path.join(save_dir, 'model.safetensors.index.json')
+    with open(index_path, 'w') as f:
+        json.dump(
+            {
+                'metadata': {
+                    'total_size': total_size
+                },
+                'weight_map': weight_map
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return index_path, total_size
+
+
+def _torch_load_compat(path: str, disable_mmap: bool) -> dict:
+    base = {'map_location': 'cpu'}
+    sig = None
+    try:
+        sig = inspect.signature(torch.load)
+    except Exception:
+        sig = None
+
+    support_weights_only = bool(sig and 'weights_only' in sig.parameters)
+    support_mmap = bool(sig and 'mmap' in sig.parameters and not disable_mmap)
+
+    candidates: list[dict] = []
+    if support_weights_only:
+        kw = dict(base)
+        kw['weights_only'] = True
+        if support_mmap:
+            kw['mmap'] = True
+        candidates.append(kw)
+    kw = dict(base)
+    if support_weights_only:
+        kw['weights_only'] = False
+    if support_mmap:
+        kw['mmap'] = True
+    candidates.append(kw)
+    kw = dict(base)
+    if support_weights_only:
+        kw['weights_only'] = False
+    candidates.append(kw)
+
+    last = None
+    for kw in candidates:
+        try:
+            return torch.load(path, **kw)
+        except Exception as e:
+            last = e
+            continue
+    raise last  # type: ignore[misc]
+
+
 class MgCkptConvert:
 
     def __init__(
@@ -84,9 +202,15 @@ class MgCkptConvert:
         rotary_base: float,
         num_query_groups: int | None = None,
         vocab_size: int | None = None,
+        max_position_embeddings: int | None = None,
+        tie_word_embeddings: bool = False,
         ffn_hidden_size: int | None = None,
         moe_ffn_hidden_size: int | None = None,
         hf_config_template: str | None = None,
+        cast_dtype: str | None = None,
+        io_threads: int = 4,
+        disable_mmap: bool = False,
+        extra_config_kwargs: dict | None = None,
     ):
         self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
         self.log_rank_load = os.environ.get('CKPT_CONVERT_LOG_RANK',
@@ -118,12 +242,22 @@ class MgCkptConvert:
         self.rotary_base = rotary_base
         self.num_query_groups = num_query_groups
         self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.tie_word_embeddings = tie_word_embeddings
         self.ffn_hidden_size = ffn_hidden_size
         self.moe_ffn_hidden_size = moe_ffn_hidden_size
         self.hf_config_template = hf_config_template
         self.detected_num_kv_heads = None
         self._resolved_q_head_dim = None
         self._resolved_kv_heads_per_tp = None
+        self.cast_dtype = cast_dtype
+        self.io_threads = max(1, int(io_threads))
+        self.disable_mmap = bool(disable_mmap)
+        self.extra_config_kwargs = extra_config_kwargs or {}
+        self._target_dtype = _dtype_from_str(
+            cast_dtype) if cast_dtype else None
+        self._sparse_cache: dict[tuple[int, int, int, int | None],
+                                 dict[str, torch.Tensor]] = {}
 
         os.makedirs(self.hf_save_dir, exist_ok=True)
 
@@ -247,7 +381,15 @@ class MgCkptConvert:
                     return cfg_1t
             except Exception:
                 pass
-        return os.path.join(models_dir, 'config.json')
+        candidates = [
+            os.path.join(models_dir, 'config_1t.json'),
+            os.path.join(models_dir, 'config_100b.json'),
+            os.path.join(models_dir, 'config.json'),
+        ]
+        for p in candidates:
+            if os.path.isfile(p):
+                return p
+        raise FileNotFoundError(f'找不到可用的 HF config 模板: {candidates}')
 
     def _write_hf_artifacts(self) -> None:
         models_dir = self._repo_models_dir()
@@ -266,6 +408,13 @@ class MgCkptConvert:
         cfg['rope_theta'] = float(self.rotary_base)
         cfg['ep_size'] = self.ep_size
         cfg['first_k_dense_replace'] = self.first_k_dense_replace
+        cfg['tie_word_embeddings'] = self.tie_word_embeddings
+        if self.max_position_embeddings is not None:
+            cfg['max_position_embeddings'] = self.max_position_embeddings
+        if 'n_routed_experts' in cfg:
+            cfg['n_routed_experts'] = self.num_experts
+        if 'num_experts' in cfg:
+            cfg['num_experts'] = self.num_experts
 
         kv_heads = self.detected_num_kv_heads or self.num_query_groups
         if kv_heads is not None:
@@ -284,13 +433,34 @@ class MgCkptConvert:
         if self.moe_ffn_hidden_size is not None:
             cfg['moe_intermediate_size'] = self.moe_ffn_hidden_size
 
-        # 显式更新 rope_scaling 以匹配训练脚本 (factor=32.0, type=yarn)
-        if 'rope_scaling' in cfg and isinstance(cfg['rope_scaling'], dict):
-            cfg['rope_scaling']['factor'] = 32.0
-            cfg['rope_scaling']['type'] = 'yarn'
-            cfg['rope_scaling']['original_max_position_embeddings'] = 4096
-            cfg['rope_scaling']['mscale'] = 1.0
-            cfg['rope_scaling']['mscale_all_dim'] = 1.0
+        # 显式更新 rope_scaling 以匹配训练脚本 (默认 factor=32.0, type=yarn)
+        if 'rope_scaling_type' in self.extra_config_kwargs or (
+                'rope_scaling' in cfg
+                and isinstance(cfg['rope_scaling'], dict)):
+            if 'rope_scaling' not in cfg or not isinstance(
+                    cfg['rope_scaling'], dict):
+                cfg['rope_scaling'] = {}
+            cfg['rope_scaling']['factor'] = self.extra_config_kwargs.get(
+                'rope_scaling_factor', 32.0)
+            cfg['rope_scaling']['type'] = self.extra_config_kwargs.get(
+                'rope_scaling_type', 'yarn')
+            cfg['rope_scaling'][
+                'original_max_position_embeddings'] = self.extra_config_kwargs.get(
+                    'rope_scaling_original_max_position_embeddings', 4096)
+            cfg['rope_scaling']['mscale'] = self.extra_config_kwargs.get(
+                'rope_scaling_mscale', 1.0)
+            cfg['rope_scaling'][
+                'mscale_all_dim'] = self.extra_config_kwargs.get(
+                    'rope_scaling_mscale_all_dim', 1.0)
+
+        # 更新 MoE 相关的额外参数
+        for k, v in self.extra_config_kwargs.items():
+            if k.startswith('moe_') or k in [
+                    'n_shared_experts', 'routed_scaling_factor', 'n_group',
+                    'topk_group', 'scoring_func', 'norm_topk_prob', 'seq_aux',
+                    'rms_norm_eps'
+            ]:
+                cfg[k] = v
 
         with open(os.path.join(self.hf_save_dir, 'config.json'), 'w') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -323,7 +493,7 @@ class MgCkptConvert:
         ckpt_path = self._resolve_rank_ckpt_path(0, 0, None)
         if self.verbose:
             logger.info('Detecting vpp from: %s', ckpt_path)
-        state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        state = _torch_load_compat(ckpt_path, disable_mmap=self.disable_mmap)
         model_keys = sorted([
             k for k in state.keys() if k.startswith('model') and k != 'model'
         ])
@@ -479,7 +649,7 @@ class MgCkptConvert:
         if self.verbose and self.log_rank_load:
             logger.info('Loading rank ckpt: tp=%d pp=%d ep=%s vpp=%s path=%s',
                         tp_rank, pp_rank, ep_rank, vpp_rank, ckpt_path)
-        state = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        state = _torch_load_compat(ckpt_path, disable_mmap=self.disable_mmap)
         if self.verbose and self.log_rank_load:
             dt = time.perf_counter() - t0
             logger.info('Loaded rank ckpt: tp=%d pp=%d ep=%s vpp=%s in %.2fs',
@@ -521,14 +691,34 @@ class MgCkptConvert:
             logger.info('Loading models for stage: pp_rank=%d vpp_rank=%s',
                         pp_rank, vpp_rank)
 
-        for tp_rank in range(self.tp_size):
+        def one(
+            tp_rank: int
+        ) -> tuple[int, int | None, dict[str, torch.Tensor]
+                   | None]:
             eps = self._rank_dir_map.get((tp_rank, pp_rank), [])
             if not eps:
-                continue
+                return tp_rank, None, None
             base_ep = eps[0]
-            state = self._load_rank_state(tp_rank, pp_rank, base_ep, vpp_rank)
-            models[(tp_rank, base_ep)] = state
-            models[(tp_rank, 0)] = state
+            st = self._load_rank_state(tp_rank, pp_rank, base_ep, vpp_rank)
+            return tp_rank, base_ep, st
+
+        max_workers = min(self.io_threads, self.tp_size)
+        if max_workers <= 1:
+            for tp_rank in range(self.tp_size):
+                tp, base_ep, st = one(tp_rank)
+                if st is None or base_ep is None:
+                    continue
+                models[(tp, base_ep)] = st
+                models[(tp, 0)] = st
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = [ex.submit(one, tp) for tp in range(self.tp_size)]
+                for fut in as_completed(futures):
+                    tp, base_ep, st = fut.result()
+                    if st is None or base_ep is None:
+                        continue
+                    models[(tp, base_ep)] = st
+                    models[(tp, 0)] = st
 
         if self.verbose:
             logger.info(
@@ -546,11 +736,17 @@ class MgCkptConvert:
 
     def _load_sparse_ep_state(self, tp_rank: int, pp_rank: int, ep_rank: int,
                               vpp_rank: int | None) -> dict[str, torch.Tensor]:
+        key = (int(tp_rank), int(pp_rank), int(ep_rank),
+               None if vpp_rank is None else int(vpp_rank))
+        cached = self._sparse_cache.get(key)
+        if cached is not None:
+            return cached
         state = self._load_rank_state(tp_rank, pp_rank, ep_rank, vpp_rank)
         keep: dict[str, torch.Tensor] = {}
         for k, v in state.items():
             if '.mlp.experts.' in k or '.mlp.router.' in k:
                 keep[k] = v
+        self._sparse_cache[key] = keep
         return keep
 
     def _reconstruct_router_lazy(self, base_models: dict[tuple[int, int],
@@ -661,7 +857,8 @@ class MgCkptConvert:
             models[(tp_rank, 0)].pop('output_layer.weight')
             for tp_rank in range(self.tp_size)
         ]
-        hf['lm_head.weight'] = torch.cat(parts, dim=0)
+        if not self.tie_word_embeddings:
+            hf['lm_head.weight'] = torch.cat(parts, dim=0)
 
     def _set_layer_norm(self, hf: dict[str, torch.Tensor],
                         models: dict[tuple[int, int], dict[str, torch.Tensor]],
@@ -930,24 +1127,86 @@ class MgCkptConvert:
                     del st
                 gc.collect()
 
+    def _maybe_cast(self, t: torch.Tensor) -> torch.Tensor:
+        if self._target_dtype is None:
+            return t
+        if not torch.is_floating_point(t):
+            return t
+        if t.dtype == self._target_dtype:
+            return t
+        return t.to(dtype=self._target_dtype)
+
     def _save_shard(self, tensors: dict[str, torch.Tensor], shard_idx: int,
                     total_shards: int) -> None:
         name = f'model-{shard_idx:05d}-of-{total_shards:06d}.safetensors'
         path = os.path.join(self.hf_save_dir, name)
-        for k in tensors.keys():
-            self.weight_map[k] = name
         packed: dict[str, torch.Tensor] = {}
         for k, v in tensors.items():
+            v = self._maybe_cast(v)
             if not v.is_contiguous():
                 packed[k] = v.contiguous()
             else:
                 packed[k] = v
-            self.total_size_bytes += packed[k].nelement(
-            ) * packed[k].element_size()
         safetensors.torch.save_file(packed, path, metadata={'format': 'pt'})
         if self.verbose:
             logger.info('Saved shard %d/%d: %s (tensors=%d)', shard_idx,
                         total_shards, path, len(tensors))
+
+    def _convert_one_stage(self, pp_rank: int, vpp_rank: int | None,
+                           total_shards: int) -> None:
+        import gc
+        self._sparse_cache = {}
+
+        models = self._load_models_for_stage(pp_rank=pp_rank,
+                                             vpp_rank=vpp_rank)
+
+        if pp_rank == 0 and vpp_rank in (None, 0):
+            base_tensors: dict[str, torch.Tensor] = {}
+            self._set_preprocess(base_tensors, models)
+            self._save_shard(base_tensors, 1, total_shards)
+
+        if self.vpp_size is None:
+            layers = self.pprank_layer_idxs[pp_rank]
+            for hf_layer in layers:
+                local_idx = self.layer2loc[hf_layer][1]
+                layer_tensors: dict[str, torch.Tensor] = {}
+                self._set_layer_norm(layer_tensors, models, hf_layer,
+                                     local_idx)
+                self._set_layer_attn(layer_tensors, models, hf_layer,
+                                     local_idx)
+                self._set_layer_mlp(layer_tensors, models, hf_layer, local_idx)
+                self._save_shard(layer_tensors, hf_layer + 2, total_shards)
+
+            if pp_rank == self.pp_size - 1:
+                tail_tensors: dict[str, torch.Tensor] = {}
+                self._set_postprocess(tail_tensors, models)
+                self._save_shard(tail_tensors, total_shards, total_shards)
+        else:
+            layers = self.vpprank_layer_idxs.get(pp_rank, {}).get(vpp_rank, [])
+            for hf_layer in layers:
+                local_idx = self.layer2loc_vpp[hf_layer][2]
+                layer_tensors: dict[str, torch.Tensor] = {}
+                self._set_layer_norm(layer_tensors, models, hf_layer,
+                                     local_idx)
+                self._set_layer_attn(layer_tensors, models, hf_layer,
+                                     local_idx)
+                self._set_layer_mlp(layer_tensors, models, hf_layer, local_idx)
+                self._save_shard(layer_tensors, hf_layer + 2, total_shards)
+
+            is_post = False
+            if self.dualpipe:
+                if pp_rank == 0 and vpp_rank == self.vpp_size - 1:
+                    is_post = True
+            else:
+                if pp_rank == self.pp_size - 1 and vpp_rank == self.vpp_size - 1:
+                    is_post = True
+            if is_post:
+                tail_tensors: dict[str, torch.Tensor] = {}
+                self._set_postprocess(tail_tensors, models)
+                self._save_shard(tail_tensors, total_shards, total_shards)
+
+        del models
+        gc.collect()
 
     def run(self) -> None:
         total_shards = self.num_real_layers + 2
@@ -959,103 +1218,83 @@ class MgCkptConvert:
                 self.pp_size, self.ep_size, self.vpp_size, self.dualpipe,
                 self.hf_save_dir)
 
-        import gc
-
+        stages: list[tuple[int, int | None]] = []
         if self.vpp_size is None:
-            for pp_rank in range(self.pp_size):
-                models = self._load_models_for_stage(pp_rank=pp_rank,
-                                                     vpp_rank=None)
-
-                if pp_rank == 0:
-                    base_tensors: dict[str, torch.Tensor] = {}
-                    self._set_preprocess(base_tensors, models)
-                    self._save_shard(base_tensors, 1, total_shards)
-
-                layers = self.pprank_layer_idxs[pp_rank]
-                for hf_layer in layers:
-                    local_idx = self.layer2loc[hf_layer][1]
-                    if self.verbose:
-                        logger.info(
-                            'Converting layer %d/%d: pp_rank=%d local_idx=%d',
-                            hf_layer, self.num_real_layers - 1, pp_rank,
-                            local_idx)
-
-                    layer_tensors: dict[str, torch.Tensor] = {}
-                    self._set_layer_norm(layer_tensors, models, hf_layer,
-                                         local_idx)
-                    self._set_layer_attn(layer_tensors, models, hf_layer,
-                                         local_idx)
-                    self._set_layer_mlp(layer_tensors, models, hf_layer,
-                                        local_idx)
-                    self._save_shard(layer_tensors, hf_layer + 2, total_shards)
-
-                if pp_rank == self.pp_size - 1:
-                    tail_tensors: dict[str, torch.Tensor] = {}
-                    self._set_postprocess(tail_tensors, models)
-                    self._save_shard(tail_tensors, total_shards, total_shards)
-
-                del models
-                gc.collect()
-
+            stages = [(pp, None) for pp in range(self.pp_size)]
         else:
-            for pp_rank in range(self.pp_size):
-                for vpp_rank in range(self.vpp_size):
-                    models = self._load_models_for_stage(pp_rank=pp_rank,
-                                                         vpp_rank=vpp_rank)
+            for pp in range(self.pp_size):
+                for vpp in range(self.vpp_size):
+                    stages.append((pp, vpp))
 
-                    if pp_rank == 0 and vpp_rank == 0:
-                        base_tensors: dict[str, torch.Tensor] = {}
-                        self._set_preprocess(base_tensors, models)
-                        self._save_shard(base_tensors, 1, total_shards)
+        workers = int(os.environ.get('CKPT_CONVERT_PP_WORKERS', '1'))
+        workers = max(1, min(workers, len(stages)))
+        if workers <= 1:
+            for pp_rank, vpp_rank in stages:
+                self._convert_one_stage(pp_rank, vpp_rank, total_shards)
+        else:
+            from concurrent.futures import ProcessPoolExecutor
+            from multiprocessing import get_context
 
-                    if pp_rank in self.vpprank_layer_idxs and vpp_rank in self.vpprank_layer_idxs[
-                            pp_rank]:
-                        layers = self.vpprank_layer_idxs[pp_rank][vpp_rank]
-                        for hf_layer in layers:
-                            local_idx = self.layer2loc_vpp[hf_layer][2]
-                            if self.verbose:
-                                logger.info(
-                                    'Converting layer %d/%d: pp_rank=%d vpp_rank=%d local_idx=%d',
-                                    hf_layer, self.num_real_layers - 1,
-                                    pp_rank, vpp_rank, local_idx)
-                            layer_tensors: dict[str, torch.Tensor] = {}
-                            self._set_layer_norm(layer_tensors, models,
-                                                 hf_layer, local_idx)
-                            self._set_layer_attn(layer_tensors, models,
-                                                 hf_layer, local_idx)
-                            self._set_layer_mlp(layer_tensors, models,
-                                                hf_layer, local_idx)
-                            self._save_shard(layer_tensors, hf_layer + 2,
-                                             total_shards)
-
-                    is_post = False
-                    if self.dualpipe:
-                        if pp_rank == 0 and vpp_rank == self.vpp_size - 1:
-                            is_post = True
-                    else:
-                        if pp_rank == self.pp_size - 1 and vpp_rank == self.vpp_size - 1:
-                            is_post = True
-
-                    if is_post:
-                        tail_tensors: dict[str, torch.Tensor] = {}
-                        self._set_postprocess(tail_tensors, models)
-                        self._save_shard(tail_tensors, total_shards,
-                                         total_shards)
-
-                    del models
-                    gc.collect()
+            ctx = get_context('spawn')
+            cfg = dict(
+                mg_load_dir=self.mg_load_dir,
+                hf_save_dir=self.hf_save_dir,
+                num_layers=self.num_layers,
+                tp_size=self.tp_size,
+                pp_size=self.pp_size,
+                ep_size=self.ep_size,
+                first_k_dense_replace=self.first_k_dense_replace,
+                hidden_size=self.hidden_size,
+                num_experts=self.num_experts,
+                num_attention_heads=self.num_attention_heads,
+                qk_head_dim=self.qk_head_dim,
+                v_head_dim=self.v_head_dim,
+                qk_pos_emb_head_dim=self.qk_pos_emb_head_dim,
+                moe_grouped_gemm=self.moe_grouped_gemm,
+                moe_tp_extend_ep=self.moe_tp_extend_ep,
+                schedules_method=self.schedules_method,
+                vpp_stage=self.vpp_stage,
+                num_layer_list=self.num_layer_list,
+                noop_layers=','.join(map(str, self.noop_layers_list)),
+                rotary_base=float(self.rotary_base),
+                num_query_groups=self.num_query_groups,
+                vocab_size=self.vocab_size,
+                max_position_embeddings=self.max_position_embeddings,
+                tie_word_embeddings=self.tie_word_embeddings,
+                ffn_hidden_size=self.ffn_hidden_size,
+                moe_ffn_hidden_size=self.moe_ffn_hidden_size,
+                hf_config_template=self.hf_config_template,
+                cast_dtype=self.cast_dtype,
+                io_threads=1,
+                disable_mmap=self.disable_mmap,
+                extra_config_kwargs=self.extra_config_kwargs,
+            )
+            t0 = time.time()
+            logger.info('Parallel convert: pp_workers=%d stages=%d',
+                        int(workers), int(len(stages)))
+            with ProcessPoolExecutor(max_workers=workers,
+                                     mp_context=ctx) as ex:
+                futures = [
+                    ex.submit(_worker_convert_stage, cfg, pp, vpp,
+                              total_shards) for pp, vpp in stages
+                ]
+                for fut in as_completed(futures):
+                    fut.result()
+            logger.info('Parallel convert done (%.2fs)', time.time() - t0)
 
         self._write_hf_artifacts()
-        index_path = os.path.join(self.hf_save_dir,
-                                  'model.safetensors.index.json')
-        with open(index_path, 'w') as f:
-            json.dump(
-                {
-                    'metadata': {
-                        'total_size': self.total_size_bytes
-                    },
-                    'weight_map': self.weight_map
-                }, f)
+        _write_hf_index_by_scan(self.hf_save_dir)
+
+
+def _worker_convert_stage(cfg: dict, pp_rank: int, vpp_rank: int | None,
+                          total_shards: int) -> None:
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    conv = MgCkptConvert(**cfg)
+    conv._convert_one_stage(int(pp_rank), vpp_rank, int(total_shards))
 
 
 def get_args():
@@ -1115,9 +1354,29 @@ def get_args():
         default=None,
         choices=['dualpipev'],
         help='An innovative bidirectional pipeline parallelism algorithm.')
+    parser.add_argument('--pp-workers',
+                        type=int,
+                        default=None,
+                        help='Override CKPT_CONVERT_PP_WORKERS in-process.')
+    parser.add_argument('--io-threads',
+                        type=int,
+                        default=4,
+                        help='Thread workers for loading rank ckpt files.')
+    parser.add_argument('--disable-mmap',
+                        action='store_true',
+                        help='Disable torch.load mmap when supported.')
+    parser.add_argument('--cast-dtype',
+                        type=str,
+                        default=None,
+                        choices=['fp32', 'bf16', 'fp16'],
+                        help='Cast floating tensors before saving.')
+    parser.add_argument('--sha256-manifest',
+                        type=str,
+                        default=None,
+                        help='Write sha256 manifest json to this path.')
     parser.add_argument('--num-layers',
                         type=int,
-                        default=32,
+                        default=None,
                         help='Number of transformer layers.')
     parser.add_argument('--first-k-dense-replace',
                         type=int,
@@ -1151,6 +1410,13 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override qk pos emb head dim.')
+    parser.add_argument('--max-position-embeddings',
+                        type=int,
+                        default=None,
+                        help='Override max position embeddings.')
+    parser.add_argument('--tie-word-embeddings',
+                        action='store_true',
+                        help='Tie word embeddings and output layer.')
     parser.add_argument('--num-query-groups',
                         type=int,
                         default=None,
@@ -1179,12 +1445,22 @@ def get_args():
 def main() -> None:
     args = get_args()
     logger.info('Arguments: %s', args)
+    if args.pp_workers is not None:
+        os.environ['CKPT_CONVERT_PP_WORKERS'] = str(int(args.pp_workers))
+
+    extra_config_kwargs = {}
+    if args.num_layers is None:
+        raise ValueError('必须提供 --num-layers')
+
     hidden_size = args.hidden_size or HIDDEN_SIZE
     num_experts = args.num_experts or NUM_EXPERTS
     num_attention_heads = args.num_attention_heads or NUM_ATTENTION_HEADS
     qk_head_dim = args.qk_head_dim or QK_HEAD_DIM
     v_head_dim = args.v_head_dim or V_HEAD_DIM
     qk_pos_emb_head_dim = args.qk_pos_emb_head_dim or QK_POS_EMB_HEAD_DIM
+
+    tie_word_embeddings = bool(getattr(args, 'tie_word_embeddings', False))
+
     converter = MgCkptConvert(
         mg_load_dir=args.load_dir,
         hf_save_dir=args.save_dir,
@@ -1208,11 +1484,18 @@ def main() -> None:
         rotary_base=args.rotary_base,
         num_query_groups=args.num_query_groups,
         vocab_size=args.vocab_size,
+        max_position_embeddings=args.max_position_embeddings,
+        tie_word_embeddings=tie_word_embeddings,
         ffn_hidden_size=args.ffn_hidden_size,
         moe_ffn_hidden_size=args.moe_ffn_hidden_size,
         hf_config_template=args.hf_config_template,
+        cast_dtype=args.cast_dtype,
+        io_threads=args.io_threads,
+        disable_mmap=args.disable_mmap,
+        extra_config_kwargs=extra_config_kwargs,
     )
     converter.run()
+    _write_sha256_manifest(args.save_dir, args.sha256_manifest)
 
 
 if __name__ == '__main__':
