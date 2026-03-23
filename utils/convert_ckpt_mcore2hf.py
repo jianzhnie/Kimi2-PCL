@@ -853,44 +853,40 @@ class MgCkptConvert:
         if self.moe_grouped_gemm:
             w1_key = f'{prefix}.experts.weight1'
             w2_key = f'{prefix}.experts.weight2'
-            if self.moe_tp_extend_ep:
-                raise ValueError('moe_tp_extend_ep 暂不支持稀疏专家目录格式')
-            else:
-                num_local = self.num_experts // self.ep_size
-                for ep_rank in range(self.ep_size):
-                    owners = self._tp_ranks_for_ep(pp_rank, ep_rank)
-                    if not owners:
+            num_local = self.num_experts // self.ep_size
+            for ep_rank in range(self.ep_size):
+                owners = self._tp_ranks_for_ep(pp_rank, ep_rank)
+                if not owners:
+                    raise ValueError(f'找不到 ep={ep_rank} 的权重目录: pp={pp_rank}')
+                shards_w1: list[torch.Tensor] = []
+                shards_w2: list[torch.Tensor] = []
+                for tp_rank in owners:
+                    d = self._load_sparse_ep_state(tp_rank, pp_rank, ep_rank,
+                                                   vpp_rank)
+                    if w1_key not in d or w2_key not in d:
                         raise ValueError(
-                            f'找不到 ep={ep_rank} 的权重目录: pp={pp_rank}')
-                    shards_w1: list[torch.Tensor] = []
-                    shards_w2: list[torch.Tensor] = []
-                    for tp_rank in owners:
-                        d = self._load_sparse_ep_state(tp_rank, pp_rank,
-                                                       ep_rank, vpp_rank)
-                        if w1_key not in d or w2_key not in d:
-                            raise ValueError(
-                                f'找不到 moe 权重: pp={pp_rank} ep={ep_rank} tp={tp_rank}'
-                            )
-                        shards_w1.append(d[w1_key])
-                        shards_w2.append(d[w2_key])
-                        del d
-                        gc.collect()
+                            f'找不到 moe 权重: pp={pp_rank} ep={ep_rank} tp={tp_rank}'
+                        )
+                    shards_w1.append(d[w1_key])
+                    shards_w2.append(d[w2_key])
+                    del d
+                    gc.collect()
 
-                    local_w1 = shards_w1[0] if len(
-                        shards_w1) == 1 else torch.cat(shards_w1, dim=1)
-                    local_w2 = shards_w2[0] if len(
-                        shards_w2) == 1 else torch.cat(shards_w2, dim=0)
-                    w1_3d = local_w1.view(self.hidden_size, num_local,
-                                          -1).permute(1, 0, 2).contiguous()
-                    w2_3d = local_w2.view(num_local, -1, self.hidden_size)
-                    for li in range(num_local):
-                        expert = ep_rank * num_local + li
-                        fc1 = w1_3d[li].t()
-                        gate, up = torch.chunk(fc1, 2, dim=0)
-                        down = w2_3d[li].t()
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up
-                        hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down
+                local_w1 = shards_w1[0] if len(shards_w1) == 1 else torch.cat(
+                    shards_w1, dim=1)
+                local_w2 = shards_w2[0] if len(shards_w2) == 1 else torch.cat(
+                    shards_w2, dim=0)
+                w1_3d = local_w1.view(self.hidden_size, num_local,
+                                      -1).permute(1, 0, 2).contiguous()
+                w2_3d = local_w2.view(num_local, -1, self.hidden_size)
+                for li in range(num_local):
+                    expert = ep_rank * num_local + li
+                    fc1 = w1_3d[li].t()
+                    gate, up = torch.chunk(fc1, 2, dim=0)
+                    down = w2_3d[li].t()
+                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate
+                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up
+                    hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down
         else:
             num_local = self.num_experts // self.ep_size
             for ep_rank in range(self.ep_size):
