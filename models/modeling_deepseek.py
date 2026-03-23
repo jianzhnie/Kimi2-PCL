@@ -816,15 +816,14 @@ class DeepseekV3Attention(nn.Module):
             )
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads,
-                                                       self.q_head_dim).transpose(
-                                                           1, 2)
+        query_states = self.q_proj(hidden_states).view(
+            bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.q_head_dim).transpose(
-                1, 2)
+            bsz, q_len, self.num_key_value_heads,
+            self.q_head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.v_head_dim).transpose(
-                1, 2)
+            bsz, q_len, self.num_key_value_heads,
+            self.v_head_dim).transpose(1, 2)
 
         if self.q_layernorm is not None:
             query_states = self.q_layernorm(query_states)
@@ -832,7 +831,8 @@ class DeepseekV3Attention(nn.Module):
             key_states = self.k_layernorm(key_states)
 
         q_nope, q_pe = torch.split(
-            query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim],
+            dim=-1)
         k_nope, k_pe = torch.split(
             key_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -898,6 +898,7 @@ class DeepseekV3Attention(nn.Module):
 
 
 class DeepseekV3FlashAttention2(DeepseekV3Attention):
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10(
@@ -928,10 +929,12 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
 
         bsz, q_len, _ = hidden_states.size()
 
-        query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads,
+        query_states = self.q_proj(hidden_states).view(bsz, q_len,
+                                                       self.num_heads,
                                                        self.q_head_dim)
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.q_head_dim)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len,
+                                                     self.num_key_value_heads,
+                                                     self.q_head_dim)
         value_states = self.v_proj(hidden_states).view(
             bsz, q_len, self.num_key_value_heads, self.v_head_dim)
 
@@ -941,7 +944,8 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             key_states = self.k_layernorm(key_states)
 
         q_nope, q_pe = torch.split(
-            query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim],
+            dim=-1)
         k_nope, k_pe = torch.split(
             key_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -954,13 +958,19 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                 kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids, unsqueeze_dim=2)
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe,
+                                          k_pe,
+                                          cos,
+                                          sin,
+                                          position_ids,
+                                          unsqueeze_dim=2)
 
         query_states = torch.cat([q_nope, q_pe], dim=-1)
         key_states = torch.cat([k_nope, k_pe], dim=-1)
 
         if self.q_head_dim != self.v_head_dim:
-            value_states = F.pad(value_states, [0, self.q_head_dim - self.v_head_dim])
+            value_states = F.pad(value_states,
+                                 [0, self.q_head_dim - self.v_head_dim])
 
         if past_key_value is not None:
             # past_key_value expects (bsz, num_heads, seq_len, head_dim) or similar
@@ -1210,13 +1220,13 @@ class DeepseekV3DecoderLayer(nn.Module):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        
+
         aux_loss = None
         if isinstance(self.mlp, DeepseekV3MoE):
             hidden_states, aux_loss = self.mlp(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
-            
+
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states, )
@@ -1490,8 +1500,10 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1], )
-                
-            if len(layer_outputs) > (3 if output_attentions and use_cache else (2 if output_attentions or use_cache else 1)):
+
+            if len(layer_outputs) > (
+                    3 if output_attentions and use_cache else
+                (2 if output_attentions or use_cache else 1)):
                 if layer_outputs[-1] is not None:
                     all_aux_loss.append(layer_outputs[-1])
 
@@ -1505,15 +1517,15 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         if use_cache:
             next_cache = (next_decoder_cache.to_legacy_cache()
                           if use_legacy_cache else next_decoder_cache)
-                          
+
         aux_loss = sum(all_aux_loss) if all_aux_loss else None
-        
+
         if not return_dict:
-            return tuple(
-                v for v in
-                [hidden_states, next_cache, all_hidden_states, all_self_attns, aux_loss]
-                if v is not None)
-                
+            return tuple(v for v in [
+                hidden_states, next_cache, all_hidden_states, all_self_attns,
+                aux_loss
+            ] if v is not None)
+
         output = BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=next_cache,
@@ -1635,7 +1647,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
-            
+
             if hasattr(outputs, 'aux_loss') and outputs.aux_loss is not None:
                 loss += outputs.aux_loss
 
@@ -1846,10 +1858,12 @@ class DeepseekV3ForSequenceClassification(DeepseekV3PreTrainedModel):
             elif self.config.problem_type == 'multi_label_classification':
                 loss_fct = BCEWithLogitsLoss()
                 loss = loss_fct(pooled_logits, labels)
-                
-            if hasattr(transformer_outputs, 'aux_loss') and transformer_outputs.aux_loss is not None:
+
+            if hasattr(
+                    transformer_outputs,
+                    'aux_loss') and transformer_outputs.aux_loss is not None:
                 loss += transformer_outputs.aux_loss
-                
+
         if not return_dict:
             output = (pooled_logits, ) + transformer_outputs[1:]
             return ((loss, ) + output) if loss is not None else output
