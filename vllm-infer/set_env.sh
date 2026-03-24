@@ -57,3 +57,12 @@ export GLOO_SOCKET_IFNAME=enp66s0f0
 export HCCL_SOCKET_IFNAME=enp66s0f0  
 export HCCL_P2P_DISABLE=1
 export ACLNN_ALLOW_DTYPE_CONVERT=1
+
+# 自动获取业务网卡 IP 并统一绑定，确保 Ray 和 vLLM 互相识别的节点 IP 完全一致
+if command -v ip >/dev/null 2>&1; then
+    _NODE_IP=$(ip -4 addr show ${GLOO_SOCKET_IFNAME} 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
+    if [ -n "$_NODE_IP" ]; then
+        export RAY_NODE_IP_ADDRESS="$_NODE_IP"
+        export VLLM_HOST_IP="$_NODE_IP"
+    fi
+fi

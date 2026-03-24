@@ -101,9 +101,15 @@ _remote_start_ray_head() {
     set -euo pipefail
     local resources_json="{\"NPU\": ${npus}}"
     
+    # 如果环境变量中设置了 RAY_NODE_IP_ADDRESS，优先使用它
+    local node_ip_flag=""
+    if [[ -n "${RAY_NODE_IP_ADDRESS:-}" ]]; then
+        node_ip_flag="--node-ip-address ${RAY_NODE_IP_ADDRESS}"
+    fi
+
     ray start --head \
         --port "${port}" \
-        --node-ip-address "${master_addr}" \
+        ${node_ip_flag} \
         --dashboard-host=0.0.0.0 \
         --dashboard-port="${dashboard_port}" \
         --num-gpus="${npus}" \
@@ -118,7 +124,14 @@ _remote_start_ray_worker() {
     set -euo pipefail
     local resources_json="{\"NPU\": ${npus}}"
     
+    # 同样优先使用明确指定的节点 IP
+    local node_ip_flag=""
+    if [[ -n "${RAY_NODE_IP_ADDRESS:-}" ]]; then
+        node_ip_flag="--node-ip-address ${RAY_NODE_IP_ADDRESS}"
+    fi
+
     ray start --address "${master_addr}:${port}" \
+        ${node_ip_flag} \
         --num-gpus="${npus}" \
         --resources="${resources_json}"
 }
