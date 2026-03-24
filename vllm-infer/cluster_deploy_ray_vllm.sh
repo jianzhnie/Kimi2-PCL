@@ -1,60 +1,53 @@
 #!/usr/bin/env bash
+# ==========================================
+# 集群部署脚本 (cluster_deploy_ray_vllm.sh)
+# 用于在多节点集群上部署容器，启动 Ray 集群以及 vLLM 服务。
+# ==========================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${SCRIPT_DIR}/set_env.sh"
 
-NODES_FILE="${NODES_FILE:-${SCRIPT_DIR}/node_list.txt}"
-IMAGE_NAME="${IMAGE_NAME:-quay.io/ascend/vllm-ascend:main-a3}"
-IMAGE_TAR="${IMAGE_TAR:-/llm_workspace_1P/robin/hfhub/docker/image/vllm-ascend.main-a3.tar}"
-RUN_CONTAINER_SCRIPT="${RUN_CONTAINER_SCRIPT:-${SCRIPT_DIR}/ascend_infer_docker_run.sh}"
-CONTAINER_NAME="${CONTAINER_NAME:-vllm-ascend-env-a3}"
-VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${SCRIPT_DIR}/vllm_model_server.sh}"
+# ------------------------------------------
+# 引入环境变量
+# ------------------------------------------
+if [[ -f "${ENV_FILE}" ]]; then
+  source "${ENV_FILE}"
+else
+  echo "[ERROR] 环境配置文件未找到: ${ENV_FILE}" >&2
+  exit 1
+fi
 
-MASTER_NODE="${MASTER_NODE:-}"
+# ------------------------------------------
+# 日志函数
+# ------------------------------------------
+log_info() { echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $*"; }
+log_err()  { echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $*" >&2; }
 
-SSH_USER_HOST_PREFIX="${SSH_USER_HOST_PREFIX:-}"
-SSH_OPTS="${SSH_OPTS:--o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10}"
-PARALLELISM="${PARALLELISM:-8}"
-
-RAY_PORT="${RAY_PORT:-6379}"
-ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES="${RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES:-1}"
-
-VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
-VLLM_PORT="${VLLM_PORT:-8000}"
-
+# ------------------------------------------
+# 帮助信息
+# ------------------------------------------
 usage() {
   cat <<'USAGE'
 Usage:
-  bash vllm-infer/cluster_deploy_ray_vllm.sh [--prepare-only|--ray-only|--serve-only]
+  bash cluster_deploy_ray_vllm.sh [--prepare-only|--ray-only|--serve-only]
 
-Environment:
-  NODES_FILE
-  MASTER_NODE
-  SSH_USER_HOST_PREFIX
-  SSH_OPTS
-  PARALLELISM
+Description:
+  该脚本用于在集群节点上拉起容器环境，并部署 Ray 集群及 vLLM 模型服务。
+  环境变量请在同目录下的 set_env.sh 中配置。
 
-  IMAGE_NAME
-  IMAGE_TAR
-  RUN_CONTAINER_SCRIPT
-  CONTAINER_NAME
-
-  RAY_PORT
-  ASCEND_RT_VISIBLE_DEVICES
-  RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES
-
-  VLLM_START_SCRIPT
-  VLLM_HOST
-  VLLM_PORT
-
-Notes:
-  - 节点名会按 NODES_FILE 每行一个读取，空行会被忽略
-  - MASTER_NODE 为空时默认取节点列表第一行
+Options:
+  --prepare-only   仅在各节点准备 Docker 容器
+  --ray-only       仅启动 Ray 集群 (包括 head 和 worker 节点)
+  --serve-only     仅在 Master 节点上启动 vLLM 模型服务
+  -h, --help       显示帮助信息
 USAGE
 }
 
+# ------------------------------------------
+# 参数解析
+# ------------------------------------------
 MODE="all"
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   usage
@@ -66,33 +59,38 @@ elif [[ "${1:-}" == "--ray-only" ]]; then
 elif [[ "${1:-}" == "--serve-only" ]]; then
   MODE="serve"
 elif [[ -n "${1:-}" ]]; then
-  echo "Unknown option: $1" >&2
+  log_err "未知选项: $1"
   usage >&2
   exit 2
 fi
 
+# ------------------------------------------
+# 辅助函数
+# ------------------------------------------
+
+# 获取非空节点列表
 read_nodes() {
+  if [[ ! -f "$NODES_FILE" ]]; then
+    log_err "节点列表文件未找到: $NODES_FILE"
+    exit 2
+  fi
   awk 'NF {print $1}' "$NODES_FILE"
 }
 
-ensure_nodes_file() {
-  if [[ ! -f "$NODES_FILE" ]]; then
-    echo "NODES_FILE not found: $NODES_FILE" >&2
-    exit 2
-  fi
-}
-
+# 拼接 SSH 目标地址
 ssh_target() {
   local node="$1"
   printf "%s%s" "$SSH_USER_HOST_PREFIX" "$node"
 }
 
+# 执行 SSH 命令
 ssh_run() {
   local node="$1"
   shift
   ssh ${SSH_OPTS} "$(ssh_target "$node")" "$@"
 }
 
+# 并发数控制
 limit_jobs() {
   local max="$1"
   while [[ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$max" ]]; do
@@ -100,34 +98,7 @@ limit_jobs() {
   done
 }
 
-prepare_node() {
-  local node="$1"
-  ssh_run "$node" bash -lc "set -euo pipefail
-if ! command -v docker >/dev/null 2>&1; then
-  echo '[${node}] docker not found' >&2
-  exit 127
-fi
-if docker image inspect '${IMAGE_NAME}' >/dev/null 2>&1; then
-  :
-else
-  if [ ! -f '${IMAGE_TAR}' ]; then
-    echo '[${node}] image tar not found: ${IMAGE_TAR}' >&2
-    exit 2
-  fi
-  docker load -i '${IMAGE_TAR}'
-fi
-if [ ! -f '${RUN_CONTAINER_SCRIPT}' ]; then
-  echo '[${node}] run script not found: ${RUN_CONTAINER_SCRIPT}' >&2
-  exit 2
-fi
-export IMAGE_NAME='${IMAGE_NAME}'
-export CONTAINER_NAME='${CONTAINER_NAME}'
-bash '${RUN_CONTAINER_SCRIPT}'
-docker ps --format '{{.Names}}' | grep -Fx '${CONTAINER_NAME}' >/dev/null
-echo '[${node}] container ready: ${CONTAINER_NAME}'
-"
-}
-
+# 推断主节点
 detect_master() {
   if [[ -n "$MASTER_NODE" ]]; then
     echo "$MASTER_NODE"
@@ -136,112 +107,269 @@ detect_master() {
   read_nodes | head -n 1
 }
 
-ray_in_container() {
+# ------------------------------------------
+# 容器内远程执行逻辑定义
+# 注意: 下列带 _remote 前缀的函数将通过 declare -f 被序列化发送至远程执行
+# ------------------------------------------
+
+_remote_prepare_node() {
+  local image_name="$1"
+  local image_tar="$2"
+  local run_container_script="$3"
+  local container_name="$4"
+
+  set -euo pipefail
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "[ERROR] docker not found" >&2
+    exit 127
+  fi
+
+  if docker image inspect "${image_name}" >/dev/null 2>&1; then
+    : # 镜像已存在
+  else
+    if [ ! -f "${image_tar}" ]; then
+      echo "[ERROR] image tar not found: ${image_tar}" >&2
+      exit 2
+    fi
+    echo "[INFO] Loading image from ${image_tar}..."
+    docker load -i "${image_tar}"
+  fi
+
+  if [ ! -f "${run_container_script}" ]; then
+    echo "[ERROR] run script not found: ${run_container_script}" >&2
+    exit 2
+  fi
+
+  export IMAGE_NAME="${image_name}"
+  export CONTAINER_NAME="${container_name}"
+  bash "${run_container_script}"
+
+  if docker ps --format '{{.Names}}' | grep -Fx "${container_name}" >/dev/null; then
+    echo "[INFO] Container ready: ${container_name}"
+  else
+    echo "[ERROR] Failed to start container: ${container_name}" >&2
+    exit 1
+  fi
+}
+
+_remote_stop_ray() {
+  set -euo pipefail
+  ray stop -f >/dev/null 2>&1 || true
+}
+
+_remote_start_ray_head() {
+  local ray_port="$1"
+  local dashboard_port="$2"
+  local npus="$3"
+
+  set -euo pipefail
+
+  local local_ip
+  local_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [[ -z "$local_ip" ]]; then
+    local_ip="$(hostname -i 2>/dev/null | awk '{print $1}')"
+  fi
+
+  # 注意：由于 Ray 内部规定 'GPU' 是内置资源，不能放在 --resources (自定义资源) 字典里。
+  # 所以我们在 --resources 中只放 NPU，通过 --num-gpus 来满足 vLLM 的 GPU 调度需求。
+  local resources_json="{\"NPU\": ${npus}}"
+
+  ray start --head \
+      --port="${ray_port}" \
+      --node-ip-address="$local_ip" \
+      --dashboard-host=0.0.0.0 \
+      --dashboard-port="${dashboard_port}" \
+      --num-gpus="${npus}" \
+      --resources="${resources_json}" >/dev/null 2>&1
+  
+  # 返回 IP 供外部调用
+  echo "$local_ip"
+}
+
+_remote_start_ray_worker() {
+  local head_ip="$1"
+  local ray_port="$2"
+  local npus="$3"
+
+  set -euo pipefail
+
+  local local_ip
+  local_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  if [[ -z "$local_ip" ]]; then
+    local_ip="$(hostname -i 2>/dev/null | awk '{print $1}')"
+  fi
+
+  # 同样地，给 Worker 节点声明 NPU，并通过 --num-gpus 满足 GPU 请求
+  local resources_json="{\"NPU\": ${npus}}"
+
+  ray start --address="${head_ip}:${ray_port}" \
+      --node-ip-address="$local_ip" \
+      --num-gpus="${npus}" \
+      --resources="${resources_json}"
+}
+
+_remote_serve_vllm() {
+  local vllm_start_script="$1"
+  local vllm_host="$2"
+  local vllm_port="$3"
+
+  set -euo pipefail
+  if [ ! -f "${vllm_start_script}" ]; then
+    echo "[ERROR] vllm start script not found: ${vllm_start_script}" >&2
+    exit 2
+  fi
+
+  export HOST="${vllm_host}"
+  export PORT="${vllm_port}"
+  
+  echo "[INFO] Starting vLLM service..."
+  nohup bash "${vllm_start_script}" >/tmp/vllm_serve.log 2>&1 &
+  echo $! >/tmp/vllm_serve.pid
+  echo "[INFO] vLLM service started with PID $(cat /tmp/vllm_serve.pid)"
+}
+
+# ------------------------------------------
+# 主控调度逻辑
+# ------------------------------------------
+
+# 包装器：将本地函数发送到远端执行，并预先 source 环境配置，在容器内执行
+remote_exec_in_container() {
   local node="$1"
-  local script="$2"
-  ssh_run "$node" bash -lc "set -euo pipefail
-docker exec -i '${CONTAINER_NAME}' bash -s
-" <<<"$script"
+  local func_name="$2"
+  shift 2
+  local args=("$@")
+
+  local func_code call_code
+  func_code="$(declare -f "$func_name")"
+  
+  local args_str=""
+  for arg in "${args[@]}"; do
+      args_str+=" '${arg}'"
+  done
+  call_code="${func_name}${args_str}"
+
+  # 宿主机环境 source
+  local ssh_cmd="cd '${SCRIPT_DIR}' && source set_env.sh && \
+      docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -s"
+
+  # 容器内环境 source + 执行函数
+  echo "cd '${SCRIPT_DIR}' && source set_env.sh 2>/dev/null || true; ${func_code}; ${call_code}" \
+      | ssh_run "$node" "$ssh_cmd"
+}
+
+prepare_node() {
+  local node="$1"
+  log_info "[${node}] 开始环境准备..."
+  
+  local func_code call_code
+  func_code="$(declare -f _remote_prepare_node)"
+  call_code="_remote_prepare_node '${IMAGE_NAME}' '${IMAGE_TAR}' '${RUN_CONTAINER_SCRIPT}' '${CONTAINER_NAME}'"
+
+  # prepare_node 在宿主机执行，不需要进容器
+  if ! echo "${func_code}; ${call_code}" | ssh_run "$node" bash -lc "bash -s"; then
+     log_err "[${node}] 环境准备失败"
+     return 1
+  fi
+  log_info "[${node}] 环境准备完成"
+}
+
+stop_ray_node() {
+  local node=$1
+  log_info "[${node}] 停止旧的 Ray 进程..."
+  remote_exec_in_container "$node" _remote_stop_ray || true
 }
 
 start_ray_head() {
   local node="$1"
-  ray_in_container "$node" "$(cat <<EOS
-set -euo pipefail
-export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES='${RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES}'
-export ASCEND_RT_VISIBLE_DEVICES='${ASCEND_RT_VISIBLE_DEVICES}'
-local_ip="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
-if [[ -z "\$local_ip" ]]; then
-  local_ip="\$(hostname -i 2>/dev/null | awk '{print \$1}')"
-fi
-nic_name="\$(ip route show default 2>/dev/null | awk '{print \$5; exit}')"
-if [[ -z "\$nic_name" ]]; then
-  nic_name="eth0"
-fi
-export HCCL_IF_IP="\$local_ip"
-export GLOO_SOCKET_IFNAME="\$nic_name"
-export TP_SOCKET_IFNAME="\$nic_name"
-export HCCL_SOCKET_IFNAME="\$nic_name"
-ray stop -f || true
-ray start --head --port='${RAY_PORT}' --node-ip-address="\$local_ip"
-echo "\$local_ip"
-EOS
-)"
+  log_info "[${node}] 正在启动 Ray Head 节点..."
+
+  stop_ray_node "$node"
+
+  # 注意：由于我们要获取返回的 IP，我们将输出通过 tail -n 1 截取
+  # 传入 dashboard port 和 npus_per_node (假设为8, 后续可从 set_env 中取)
+  local npus="${NPUS_PER_NODE:-8}"
+  local dash_port="${RAY_DASHBOARD_PORT:-8266}"
+
+  remote_exec_in_container "$node" _remote_start_ray_head \
+      "${RAY_PORT}" "${dash_port}" "${npus}" \
+      | tail -n 1
 }
 
 start_ray_worker() {
   local node="$1"
   local head_ip="$2"
-  ray_in_container "$node" "$(cat <<EOS
-set -euo pipefail
-export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES='${RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES}'
-export ASCEND_RT_VISIBLE_DEVICES='${ASCEND_RT_VISIBLE_DEVICES}'
-local_ip="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
-if [[ -z "\$local_ip" ]]; then
-  local_ip="\$(hostname -i 2>/dev/null | awk '{print \$1}')"
-fi
-nic_name="\$(ip route get '${head_ip}' 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i==\"dev\"){print \$(i+1); exit}}')"
-if [[ -z "\$nic_name" ]]; then
-  nic_name="\$(ip route show default 2>/dev/null | awk '{print \$5; exit}')"
-fi
-if [[ -z "\$nic_name" ]]; then
-  nic_name="eth0"
-fi
-export HCCL_IF_IP="\$local_ip"
-export GLOO_SOCKET_IFNAME="\$nic_name"
-export TP_SOCKET_IFNAME="\$nic_name"
-export HCCL_SOCKET_IFNAME="\$nic_name"
-ray stop -f || true
-ray start --address='${head_ip}:${RAY_PORT}' --node-ip-address="\$local_ip"
-EOS
-)"
+  log_info "[${node}] 正在加入 Ray 集群 (连接至 ${head_ip})..."
+
+  stop_ray_node "$node"
+
+  local npus="${NPUS_PER_NODE:-8}"
+
+  if ! remote_exec_in_container "$node" _remote_start_ray_worker \
+      "${head_ip}" "${RAY_PORT}" "${npus}"; then
+    log_err "[${node}] 加入 Ray 集群失败"
+    return 1
+  fi
+  log_info "[${node}] 已成功加入 Ray 集群"
 }
 
 serve_vllm_on_master() {
   local node="$1"
-  ray_in_container "$node" "$(cat <<EOS
-set -euo pipefail
-if [ ! -f '${VLLM_START_SCRIPT}' ]; then
-  echo 'vllm start script not found: ${VLLM_START_SCRIPT}' >&2
-  exit 2
-fi
-export HOST='${VLLM_HOST}'
-export PORT='${VLLM_PORT}'
-nohup bash '${VLLM_START_SCRIPT}' >/tmp/vllm_serve.log 2>&1 &
-echo \$! >/tmp/vllm_serve.pid
-EOS
-)"
-  echo "vLLM log: ${node}:/tmp/vllm_serve.log"
+  log_info "[${node}] 正在启动 vLLM 服务..."
+
+  if ! remote_exec_in_container "$node" _remote_serve_vllm \
+      "${VLLM_START_SCRIPT}" "${VLLM_HOST}" "${VLLM_PORT}"; then
+    log_err "[${node}] 启动 vLLM 服务失败"
+    return 1
+  fi
+  log_info "vLLM 服务日志位于 ${node}:/tmp/vllm_serve.log"
 }
 
-ensure_nodes_file
+# ------------------------------------------
+# 主流程入口
+# ------------------------------------------
 
 nodes="$(read_nodes)"
 if [[ -z "$nodes" ]]; then
-  echo "No nodes found in NODES_FILE: $NODES_FILE" >&2
+  log_err "NODES_FILE 中未找到任何节点信息"
   exit 2
 fi
 
 master="$(detect_master)"
 if [[ -z "$master" ]]; then
-  echo "MASTER_NODE not set and cannot infer master from NODES_FILE" >&2
+  log_err "MASTER_NODE 未设置，且无法从 NODES_FILE 推断主节点"
   exit 2
 fi
 
+log_info "目标节点列表: $(echo $nodes | tr '\n' ' ')"
+log_info "主节点: $master"
+log_info "执行模式: $MODE"
+
+# 1. 准备阶段
 if [[ "$MODE" == "prepare" || "$MODE" == "all" ]]; then
+  log_info "=== 开始准备节点 ==="
   for node in $nodes; do
     limit_jobs "$PARALLELISM"
     (prepare_node "$node") &
   done
   wait
+  log_info "=== 节点准备完成 ==="
 fi
 
+# 2. 部署 Ray 集群阶段
 if [[ "$MODE" == "ray" || "$MODE" == "all" ]]; then
+  log_info "=== 开始部署 Ray 集群 ==="
   head_ip="$(start_ray_head "$master" | tail -n 1)"
   if [[ -z "$head_ip" ]]; then
-    echo "Failed to detect head ip on master: $master" >&2
+    log_err "无法检测到 Master 节点($master)的 IP，Ray 启动失败"
     exit 1
   fi
+  log_info "Ray Head IP 为: $head_ip"
+
+  # 加入等待头节点初始化的逻辑，提高健壮性
+  local wait_time="${WAIT_TIME:-3}"
+  log_info "等待 ${wait_time}s 以确保 Head 节点初始化完成..."
+  sleep "$wait_time"
+
   for node in $nodes; do
     if [[ "$node" == "$master" ]]; then
       continue
@@ -250,9 +378,20 @@ if [[ "$MODE" == "ray" || "$MODE" == "all" ]]; then
     (start_ray_worker "$node" "$head_ip") &
   done
   wait
-  ssh_run "$master" bash -lc "docker exec '${CONTAINER_NAME}' ray status || true"
+  
+  log_info "正在验证 Ray 集群状态..."
+  local ssh_cmd="cd '${SCRIPT_DIR}' && source set_env.sh && \
+      docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" \
+      bash -c \"cd '${SCRIPT_DIR}' && source set_env.sh && ray status\""
+  ssh_run "$master" "$ssh_cmd" || log_warn "获取 Ray 状态失败，集群可能仍在初始化中"
+  log_info "=== Ray 集群部署完成 ==="
 fi
 
+# 3. 启动 vLLM 服务阶段
 if [[ "$MODE" == "serve" || "$MODE" == "all" ]]; then
+  log_info "=== 开始启动 vLLM 服务 ==="
   serve_vllm_on_master "$master"
+  log_info "=== vLLM 服务启动操作完成 ==="
 fi
+
+log_info "任务执行完毕"
