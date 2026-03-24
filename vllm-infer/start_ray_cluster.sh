@@ -25,7 +25,7 @@ fi
 # --- 1. 默认配置与常量 ---
 # 覆盖或使用环境变量，如果未定义则使用默认值
 PROJECT_DIR="${SCRIPT_DIR}"
-MASTER_PORT="${RAY_PORT:-6379}"         # Ray head node 默认端口
+MASTER_PORT="${RAY_PORT:-6312}"         # Ray head node 默认端口
 DASHBOARD_PORT="8266"                   # Ray 仪表盘默认端口
 NPUS_PER_NODE=8                         # 每个节点的 NPU 数量
 WAIT_TIME=3                             # 等待头节点初始化的时间 (秒)
@@ -140,11 +140,14 @@ remote_exec_func() {
 
     # 在远端宿主机：进入目录，source 环境变量（获取 CONTAINER_NAME 等）
     # 然后将代码通过管道喂给 docker exec
-    local ssh_cmd="cd '${PROJECT_DIR}' && source set_env.sh && docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -s"
+    local ssh_cmd="cd '${PROJECT_DIR}' && source set_env.sh && \
+        docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -s"
     
-    # 因为 set_env.sh 是在宿主机 source 的，容器内可能缺少部分从宿主机传导的环境变量
-    # 所以我们将容器内执行的脚本再次 source 一下 /workspace (如果挂载的话) 或者简单直接执行功能函数
-    echo "source /workspace/set_env.sh 2>/dev/null || true; ${func_code}; ${call_code}" | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$node" "$ssh_cmd"
+    # 容器内执行逻辑：
+    # 1. source 项目目录下的 set_env.sh，确保容器内加载了 Ascend 环境变量及 Ray 所需变量
+    # 2. 执行传入的函数
+    echo "cd '${PROJECT_DIR}' && source set_env.sh; ${func_code}; ${call_code}" \
+        | ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$node" "$ssh_cmd"
 }
 
 stop_ray_node() {
@@ -224,12 +227,14 @@ for node in "${NODE_HOSTS[@]}"; do
         ((errors++))
         continue
     fi
-    if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$node" "[ -d \"$PROJECT_DIR\" ]" >/dev/null 2>&1; then
+    if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$node" \
+        "[ -d \"$PROJECT_DIR\" ]" >/dev/null 2>&1; then
         log_error "Project directory $PROJECT_DIR not found on node $node."
         ((errors++))
         continue
     fi
-    if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$node" "[ -f \"$PROJECT_DIR/set_env.sh\" ]" >/dev/null 2>&1; then
+    if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$node" \
+        "[ -f \"$PROJECT_DIR/set_env.sh\" ]" >/dev/null 2>&1; then
         log_error "set_env.sh not found in $PROJECT_DIR on node $node."
         ((errors++))
         continue
@@ -297,7 +302,10 @@ echo -e "${BLUE}=============================================${NC}"
 echo ""
 echo -e "${BLUE}=============================================${NC}"
 log_info "Displaying Ray status..."
-if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$MASTER_ADDR" "cd '${PROJECT_DIR}' && source set_env.sh && docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" ray status"; then
+if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$MASTER_ADDR" \
+    "cd '${PROJECT_DIR}' && source set_env.sh && \
+    docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" \
+    bash -c \"cd '${PROJECT_DIR}' && source set_env.sh && ray status\""; then
     log_warn "Failed to retrieve Ray status. Cluster may still be initializing."
 fi
 echo -e "${BLUE}=============================================${NC}"
