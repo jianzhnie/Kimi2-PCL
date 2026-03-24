@@ -13,8 +13,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export MOE_TP_EXTEND_EP=1
 
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
-LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/kimi2-mcore2hf}"
-SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/kimi2-hf2mcore}"
+LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf}"
+SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf2mcore_iter900}"
 
 
 TP="${TP:-2}"
