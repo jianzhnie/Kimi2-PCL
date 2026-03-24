@@ -99,7 +99,7 @@ _remote_start_ray_head() {
     local master_addr="$4"
 
     set -euo pipefail
-    local resources_json="{\"NPU\": ${npus}, \"GPU\": ${npus}}"
+    local resources_json="{\"NPU\": ${npus}}"
     
     ray start --head \
         --port "${port}" \
@@ -116,7 +116,7 @@ _remote_start_ray_worker() {
     local npus="$3"
 
     set -euo pipefail
-    local resources_json="{\"NPU\": ${npus}, \"GPU\": ${npus}}"
+    local resources_json="{\"NPU\": ${npus}}"
     
     ray start --address "${master_addr}:${port}" \
         --num-gpus="${npus}" \
