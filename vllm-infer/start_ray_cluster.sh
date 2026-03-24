@@ -99,13 +99,14 @@ _remote_start_ray_head() {
     local master_addr="$4"
 
     set -euo pipefail
-    local resources_json="{\"NPU\": ${npus}}"
+    local resources_json="{\"NPU\": ${npus}, \"GPU\": ${npus}}"
     
     ray start --head \
         --port "${port}" \
         --node-ip-address "${master_addr}" \
         --dashboard-host=0.0.0.0 \
         --dashboard-port="${dashboard_port}" \
+        --num-gpus="${npus}" \
         --resources="${resources_json}"
 }
 
@@ -115,9 +116,11 @@ _remote_start_ray_worker() {
     local npus="$3"
 
     set -euo pipefail
-    local resources_json="{\"NPU\": ${npus}}"
+    local resources_json="{\"NPU\": ${npus}, \"GPU\": ${npus}}"
     
-    ray start --address "${master_addr}:${port}" --resources="${resources_json}"
+    ray start --address "${master_addr}:${port}" \
+        --num-gpus="${npus}" \
+        --resources="${resources_json}"
 }
 
 # 包装器：将本地函数发送到远端执行，并预先 source 环境配置
