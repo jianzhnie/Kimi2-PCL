@@ -19,7 +19,7 @@ fi
 # 3. Consolidated mounts where possible (kept originals for safety if symlinks exist)
 # 4. Added conflict check above
 
-docker run --rm \
+docker run -d \
     -u root \
     --name ${CONTAINER_NAME} \
     --ipc=host \
@@ -48,5 +48,5 @@ docker run --rm \
     -v /root/.cache:/root/.cache \
     -v /llm_workspace_1P:/llm_workspace_1P:rw \
     -v /root/.ssh:/root/.ssh \
-    -dit ${IMAGE_NAME} \
+    -it ${IMAGE_NAME} \
     /bin/bash -c "while true; do sleep 1000; done"
