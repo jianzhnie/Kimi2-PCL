@@ -47,9 +47,6 @@ try:
 except ImportError as e:
     _require("accelerate", e)
 
-from models.configuration_deepseek_1t import DeepseekV3Config
-from models.modeling_deepseek import DeepseekV3ForCausalLM
-
 
 def _shard_paths(ckpt: Path) -> Tuple[List[Path], Path | None]:
     """Return list of .safetensors shard files and optional index path."""
@@ -78,8 +75,9 @@ def _read_specs_from_shard(path: Path) -> Dict[str, Tuple[int, ...]]:
     return out
 
 
-def _build_empty_model(config: DeepseekV3Config) -> "torch.nn.Module":
+def _build_empty_model(config) -> "torch.nn.Module":
     with init_empty_weights():
+        from models.modeling_deepseek import DeepseekV3ForCausalLM
         model = DeepseekV3ForCausalLM(config)
     return model
 
@@ -119,6 +117,17 @@ def main() -> None:
         action="store_true",
         help="Only compare key sets, not shapes (faster if you only need key coverage)",
     )
+    ap.add_argument(
+        "--strict-index",
+        action="store_true",
+        help="Treat any mismatch between shard contents and index weight_map as an error",
+    )
+    ap.add_argument(
+        "--report-limit",
+        type=int,
+        default=200,
+        help="Maximum number of items to print per mismatch category",
+    )
     args = ap.parse_args()
     ckpt: Path = args.checkpoint.expanduser().resolve()
 
@@ -131,6 +140,7 @@ def main() -> None:
 
     print(f"Checkpoint: {ckpt}")
     print(f"Loading config from {cfg_path}")
+    from models.configuration_deepseek_1t import DeepseekV3Config
     config = DeepseekV3Config.from_pretrained(str(ckpt))
 
     print("Building empty DeepseekV3ForCausalLM (no weight memory) …")
@@ -152,6 +162,16 @@ def main() -> None:
     # Per-file: keys + shapes; global union; overlap detection
     key_to_shard: Dict[str, str] = {}
     union_specs: Dict[str, Tuple[int, ...]] = {}
+    per_file_mismatches: List[str] = []
+    per_file_shape_mismatches: List[str] = []
+    observed_dims = {
+        "q_proj_out": set(),
+        "k_proj_out": set(),
+        "v_proj_out": set(),
+        "o_proj_in": set(),
+        "q_layernorm_dim": set(),
+        "k_layernorm_dim": set(),
+    }
     for shard_path in shards:
         if not shard_path.is_file():
             raise SystemExit(f"Missing shard file: {shard_path}")
@@ -166,18 +186,43 @@ def main() -> None:
                 )
             key_to_shard[k] = rel
             union_specs[k] = specs[k]
+            if k.endswith(".q_proj.weight"):
+                observed_dims["q_proj_out"].add(specs[k][0])
+            elif k.endswith(".k_proj.weight"):
+                observed_dims["k_proj_out"].add(specs[k][0])
+            elif k.endswith(".v_proj.weight"):
+                observed_dims["v_proj_out"].add(specs[k][0])
+            elif k.endswith(".o_proj.weight"):
+                observed_dims["o_proj_in"].add(specs[k][1])
+            elif k.endswith(".q_layernorm.weight"):
+                observed_dims["q_layernorm_dim"].add(specs[k][0])
+            elif k.endswith(".k_layernorm.weight"):
+                observed_dims["k_layernorm_dim"].add(specs[k][0])
 
         # Cross-check index weight_map for this file
         if weight_map:
             mapped_here = sorted(k for k, fn in weight_map.items() if fn == rel)
             keys_here = set(specs.keys())
-            if set(mapped_here) != keys_here:
-                only_map = sorted(keys_here - set(mapped_here))
-                only_idx = sorted(set(mapped_here) - keys_here)
+            mapped_set = set(mapped_here)
+            if mapped_set != keys_here:
+                only_map = sorted(keys_here - mapped_set)
+                only_idx = sorted(mapped_set - keys_here)
                 if only_map:
-                    print(f"  WARN: keys in file but not in weight_map for this file (first 10): {only_map[:10]}")
+                    msg = f"Index mismatch: keys present in {rel} but not mapped in index (first {min(10, len(only_map))}): {only_map[:10]}"
+                    print(f"  {msg}")
+                    per_file_mismatches.append(msg)
                 if only_idx:
-                    print(f"  WARN: keys in weight_map for this file but missing in file (first 10): {only_idx[:10]}")
+                    msg = f"Index mismatch: keys mapped to {rel} in index but missing in file (first {min(10, len(only_idx))}): {only_idx[:10]}"
+                    print(f"  {msg}")
+                    per_file_mismatches.append(msg)
+
+            # Per-file shapes vs model for overlapping keys
+            expected_specs_subset = {k: v for k, v in expected_specs.items() if k in keys_here}
+            for k in sorted(expected_specs_subset.keys() & keys_here):
+                if expected_specs_subset[k] != specs[k]:
+                    per_file_shape_mismatches.append(
+                        f"  {rel} shape mismatch {k!r}: model {expected_specs_subset[k]} vs checkpoint {specs[k]}"
+                    )
 
     ckpt_keys = set(union_specs.keys())
     missing_in_ckpt = expected_keys - ckpt_keys
@@ -190,16 +235,16 @@ def main() -> None:
     print(f"  In checkpoint:    {len(ckpt_keys)}")
     print(f"  Missing in checkpoint: {len(missing_in_ckpt)}")
     if missing_in_ckpt:
-        for k in sorted(missing_in_ckpt)[:200]:
+        for k in sorted(missing_in_ckpt)[: args.report_limit]:
             print(f"    - {k}")
-        if len(missing_in_ckpt) > 200:
-            print(f"    ... and {len(missing_in_ckpt) - 200} more")
+        if len(missing_in_ckpt) > args.report_limit:
+            print(f"    ... and {len(missing_in_ckpt) - args.report_limit} more")
     print(f"  Extra in checkpoint (not in model): {len(extra_in_ckpt)}")
     if extra_in_ckpt:
-        for k in sorted(extra_in_ckpt)[:200]:
+        for k in sorted(extra_in_ckpt)[: args.report_limit]:
             print(f"    + {k}")
-        if len(extra_in_ckpt) > 200:
-            print(f"    ... and {len(extra_in_ckpt) - 200} more")
+        if len(extra_in_ckpt) > args.report_limit:
+            print(f"    ... and {len(extra_in_ckpt) - args.report_limit} more")
 
     if not args.skip_shape_check:
         shape_issues = _compare_shapes(expected_specs, union_specs, "tensor")
@@ -209,16 +254,44 @@ def main() -> None:
         if not shape_issues:
             print("  None — all overlapping keys match shapes.")
         else:
-            print(f"  Found {len(shape_issues)}:")
-            for line in shape_issues[:500]:
+            print(f"  Found {len(shape_issues)} (showing up to {min(500, args.report_limit)}):")
+            for line in shape_issues[: min(500, args.report_limit)]:
                 print(line)
-            if len(shape_issues) > 500:
-                print(f"  ... and {len(shape_issues) - 500} more")
+            if len(shape_issues) > args.report_limit:
+                print(f"  ... and {len(shape_issues) - args.report_limit} more")
+
+        print("\n" + "=" * 60)
+        print("SUMMARY: per-file shape mismatches")
+        print("=" * 60)
+        if not per_file_shape_mismatches:
+            print("  None — all per-file overlapping keys match shapes.")
+        else:
+            print(f"  Found {len(per_file_shape_mismatches)} (showing up to {min(500, args.report_limit)}):")
+            for line in per_file_shape_mismatches[: min(500, args.report_limit)]:
+                print(line)
+            if len(per_file_shape_mismatches) > args.report_limit:
+                print(f"  ... and {len(per_file_shape_mismatches) - args.report_limit} more")
+        print("\n" + "=" * 60)
+        print("HEAD DIM DIAGNOSTICS")
+        print("=" * 60)
+        exp_q_out = config.num_attention_heads * (config.qk_nope_head_dim + config.qk_rope_head_dim)
+        exp_k_out = getattr(config, "num_key_value_heads", config.num_attention_heads) * (config.qk_nope_head_dim + config.qk_rope_head_dim)
+        exp_v_out = getattr(config, "num_key_value_heads", config.num_attention_heads) * config.v_head_dim
+        exp_o_in = config.num_attention_heads * config.v_head_dim
+        print(f"  Expected q_proj out: {exp_q_out}  | Observed: {sorted(observed_dims['q_proj_out'])}")
+        print(f"  Expected k_proj out: {exp_k_out}  | Observed: {sorted(observed_dims['k_proj_out'])}")
+        print(f"  Expected v_proj out: {exp_v_out}  | Observed: {sorted(observed_dims['v_proj_out'])}")
+        print(f"  Expected o_proj in : {exp_o_in}   | Observed: {sorted(observed_dims['o_proj_in'])}")
+        print(f"  Expected q_ln dim  : {config.qk_nope_head_dim + config.qk_rope_head_dim} | Observed: {sorted(observed_dims['q_layernorm_dim'])}")
+        print(f"  Expected k_ln dim  : {config.qk_nope_head_dim + config.qk_rope_head_dim} | Observed: {sorted(observed_dims['k_layernorm_dim'])}")
 
     ok = not missing_in_ckpt and not extra_in_ckpt
     if not args.skip_shape_check:
         shape_ok = not _compare_shapes(expected_specs, union_specs, "tensor")
         ok = ok and shape_ok
+        ok = ok and not per_file_shape_mismatches
+    if args.strict_index and weight_map:
+        ok = ok and not per_file_mismatches
 
     print("\n" + "=" * 60)
     if ok:
