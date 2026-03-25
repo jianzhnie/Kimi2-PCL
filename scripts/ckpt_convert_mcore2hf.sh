@@ -10,8 +10,8 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
-LOAD_DIR="/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2-base-1T_4k_k8s_mfu33_L32_1024_Arc_Opt2_no_recompute_6144_dies/aea8dbbd-0011-4170-8176-e6c7627132ff"
-SAVE_DIR="/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf"
+LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2-base-1T_4k_k8s_mfu33_L32_1024_Arc_Opt2_no_recompute_6144_dies/aea8dbbd-0011-4170-8176-e6c7627132ff}"
+SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf}"
 
 
 TP="${TP:-2}"
@@ -38,6 +38,11 @@ QK_HEAD_DIM="${QK_HEAD_DIM:-128}"
 V_HEAD_DIM="${V_HEAD_DIM:-128}"
 QK_POS_EMB_HEAD_DIM="${QK_POS_EMB_HEAD_DIM:-64}"
 MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"
+
+if [[ ! -d "${LOAD_DIR}" ]]; then
+  echo "LOAD_DIR does not exist: ${LOAD_DIR}" >&2
+  exit 2
+fi
 
 EXTRA_ARGS=()
 if [[ -n "${SCHEDULES_METHOD}" ]]; then

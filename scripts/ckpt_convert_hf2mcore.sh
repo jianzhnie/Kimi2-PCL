@@ -42,6 +42,11 @@ V_HEAD_DIM="${V_HEAD_DIM:-128}"
 QK_POS_EMB_HEAD_DIM="${QK_POS_EMB_HEAD_DIM:-64}"
 MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"
 
+if [[ ! -d "${LOAD_DIR}" ]]; then
+  echo "LOAD_DIR does not exist: ${LOAD_DIR}" >&2
+  exit 2
+fi
+
 EXTRA_ARGS=()
 if [[ -n "${SCHEDULES_METHOD}" ]]; then
   EXTRA_ARGS+=(--schedules-method "${SCHEDULES_METHOD}")
