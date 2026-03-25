@@ -176,7 +176,6 @@ _remote_start_ray_head() {
 
   ray start --head \
       --port="${ray_port}" \
-      --node-ip-address="$local_ip" \
       --dashboard-host=0.0.0.0 \
       --dashboard-port="${dashboard_port}" \
       --num-gpus="${npus}" \
@@ -203,7 +202,6 @@ _remote_start_ray_worker() {
   local resources_json="{\"NPU\": ${npus}}"
 
   ray start --address="${head_ip}:${ray_port}" \
-      --node-ip-address="$local_ip" \
       --num-gpus="${npus}" \
       --resources="${resources_json}"
 }
