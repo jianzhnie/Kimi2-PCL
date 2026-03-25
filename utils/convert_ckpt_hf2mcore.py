@@ -119,6 +119,7 @@ class CkptConvert:
         num_experts: int,
         num_attention_heads: int,
         qk_head_dim: int,
+        qk_pos_emb_head_dim: int,
         v_head_dim: int,
         moe_grouped_gemm: bool,
         moe_tp_extend_ep: bool,
@@ -164,6 +165,7 @@ class CkptConvert:
         self.num_experts = num_experts
         self.num_attention_heads = num_attention_heads
         self.qk_head_dim = qk_head_dim
+        self.qk_pos_emb_head_dim = qk_pos_emb_head_dim
         self.v_head_dim = v_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
         self.moe_tp_extend_ep = moe_tp_extend_ep
@@ -701,6 +703,38 @@ class CkptConvert:
         q_norm_key = f'{prefix}.q_layernorm.weight'
         k_norm_key = f'{prefix}.k_layernorm.weight'
 
+        if self.num_query_groups is None:
+            raise ValueError(
+                'num_query_groups is required for HF->Megatron QKV conversion')
+        if self.num_query_groups <= 0:
+            raise ValueError('num_query_groups must be > 0')
+        if self.num_attention_heads % self.tp_size != 0:
+            raise ValueError(
+                f'num_attention_heads={self.num_attention_heads} must be divisible by tp_size={self.tp_size}'
+            )
+        if self.num_attention_heads % self.num_query_groups != 0:
+            raise ValueError(
+                f'num_attention_heads={self.num_attention_heads} must be divisible by num_query_groups={self.num_query_groups}'
+            )
+
+        expected_q_head_dim = self.qk_head_dim + self.qk_pos_emb_head_dim
+        expected_q_rows = self.num_attention_heads * expected_q_head_dim
+        expected_kv_heads = self.num_query_groups
+        expected_k_rows = expected_kv_heads * expected_q_head_dim
+        expected_v_rows = expected_kv_heads * self.v_head_dim
+        if q_weight.shape[0] != expected_q_rows:
+            raise ValueError(
+                f'Q projection row mismatch: expected {expected_q_rows}, got {q_weight.shape[0]}'
+            )
+        if k_weight.shape[0] != expected_k_rows:
+            raise ValueError(
+                f'K projection row mismatch: expected {expected_k_rows}, got {k_weight.shape[0]}'
+            )
+        if v_weight.shape[0] != expected_v_rows:
+            raise ValueError(
+                f'V projection row mismatch: expected {expected_v_rows}, got {v_weight.shape[0]}'
+            )
+
         q_tp = torch.chunk(q_weight, self.tp_size, dim=0)
         k_tp = torch.chunk(k_weight, self.tp_size, dim=0)
         v_tp = torch.chunk(v_weight, self.tp_size, dim=0)
@@ -767,7 +801,15 @@ class CkptConvert:
         else:
             router_w = router_w_raw
         router_b_raw = weights.pop(
-            f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias')
+            f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias',
+            None)
+        if router_b_raw is None:
+            router_b_raw = weights.pop(f'model.layers.{hf_layer}.mlp.gate.bias',
+                                       None)
+        if router_b_raw is None:
+            raise KeyError(
+                f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias (or gate.bias) is required'
+            )
         if router_b_raw.shape[0] != self.num_experts:
             router_b = router_b_raw[:self.num_experts].clone()
         else:
@@ -1082,6 +1124,7 @@ class CkptConvert:
             num_experts=self.num_experts,
             num_attention_heads=self.num_attention_heads,
             qk_head_dim=self.qk_head_dim,
+            qk_pos_emb_head_dim=self.qk_pos_emb_head_dim,
             v_head_dim=self.v_head_dim,
             moe_grouped_gemm=self.moe_grouped_gemm,
             moe_tp_extend_ep=self.moe_tp_extend_ep,
@@ -1266,7 +1309,7 @@ def get_args():
                         default=None,
                         help='Write sha256 manifest json to this path.')
 
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
     return args
 
 
@@ -1332,6 +1375,7 @@ def main() -> None:
         num_experts=num_experts,
         num_attention_heads=num_attention_heads,
         qk_head_dim=qk_head_dim,
+        qk_pos_emb_head_dim=qk_rope_head_dim,
         v_head_dim=v_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
         moe_tp_extend_ep=args.moe_tp_extend_ep,

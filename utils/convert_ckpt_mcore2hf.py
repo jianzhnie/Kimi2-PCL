@@ -48,13 +48,15 @@ def _mp_prefix(tp_rank: int, pp_rank: int, ep_rank: int, tp: int, pp: int,
 
 
 def _resolve_iter_dir(load_dir: str) -> str:
-    if os.path.isdir(os.path.join(load_dir, 'iter_0000001')):
-        return os.path.join(load_dir, 'iter_0000001')
     latest = os.path.join(load_dir, 'latest_checkpointed_iteration.txt')
     if os.path.isfile(latest):
         with open(latest) as f:
             it = f.read().strip()
-        return os.path.join(load_dir, f'iter_{int(it):07d}')
+        latest_dir = os.path.join(load_dir, f'iter_{int(it):07d}')
+        if os.path.isdir(latest_dir):
+            return latest_dir
+    if os.path.isdir(os.path.join(load_dir, 'iter_0000001')):
+        return os.path.join(load_dir, 'iter_0000001')
     if os.path.basename(load_dir).startswith('iter_'):
         return load_dir
     raise FileNotFoundError(f'无法定位迭代目录: {load_dir}')
@@ -234,6 +236,11 @@ class MgCkptConvert:
         self.qk_pos_emb_head_dim = qk_pos_emb_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
         self.moe_tp_extend_ep = moe_tp_extend_ep
+        if self.moe_tp_extend_ep:
+            logger.warning(
+                '--moe-tp-extend-ep is currently accepted but not used in '
+                'mcore->hf reconstruction; conversion assumes standard EP layout.'
+            )
         self.schedules_method = schedules_method
         self.dualpipe = schedules_method == 'dualpipev'
         self.vpp_stage = vpp_stage
