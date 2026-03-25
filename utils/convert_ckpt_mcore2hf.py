@@ -1030,11 +1030,17 @@ class MgCkptConvert:
             hf_layer][1]
         router = self._reconstruct_router_lazy(models, pp_rank, vpp_rank,
                                                f'{prefix}.router.weight')
-        router_bias = self._reconstruct_router_lazy(
-            models, pp_rank, vpp_rank, f'{prefix}.router.expert_bias')
-
         hf[f'model.layers.{hf_layer}.mlp.gate.weight'] = router
-        hf[f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'] = router_bias
+        
+        try:
+            router_bias = self._reconstruct_router_lazy(
+                models, pp_rank, vpp_rank, f'{prefix}.router.expert_bias')
+            hf[f'model.layers.{hf_layer}.mlp.gate.bias'] = router_bias
+            # If the config uses noaux_tc, we also populate e_score_correction_bias 
+            # to prevent missing key errors, assuming it might be used as such.
+            hf[f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'] = router_bias.clone()
+        except ValueError:
+            pass
 
         shared_fc1 = self._gather_tp_row(
             models, f'{prefix}.shared_experts.linear_fc1.weight')
