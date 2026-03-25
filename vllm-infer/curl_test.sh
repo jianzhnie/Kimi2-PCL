@@ -8,4 +8,3 @@ curl http://localhost:8000/v1/chat/completions \
     "max_tokens": 200,
     "stream": false
   }'
-

@@ -180,7 +180,7 @@ _remote_start_ray_head() {
       --dashboard-port="${dashboard_port}" \
       --num-gpus="${npus}" \
       --resources="${resources_json}" >/dev/null 2>&1
-  
+
   # 返回 IP 供外部调用
   echo "$local_ip"
 }
@@ -219,7 +219,7 @@ _remote_serve_vllm() {
 
   export HOST="${vllm_host}"
   export PORT="${vllm_port}"
-  
+
   echo "[INFO] Starting vLLM service..."
   nohup bash "${vllm_start_script}" >/tmp/vllm_serve.log 2>&1 &
   echo $! >/tmp/vllm_serve.pid
@@ -239,7 +239,7 @@ remote_exec_in_container() {
 
   local func_code call_code
   func_code="$(declare -f "$func_name")"
-  
+
   local args_str=""
   for arg in "${args[@]}"; do
       args_str+=" '${arg}'"
@@ -258,7 +258,7 @@ remote_exec_in_container() {
 prepare_node() {
   local node="$1"
   log_info "[${node}] 开始环境准备..."
-  
+
   local func_code call_code
   func_code="$(declare -f _remote_prepare_node)"
   call_code="_remote_prepare_node '${IMAGE_NAME}' '${IMAGE_TAR}' '${RUN_CONTAINER_SCRIPT}' '${CONTAINER_NAME}'"
@@ -376,7 +376,7 @@ if [[ "$MODE" == "ray" || "$MODE" == "all" ]]; then
     (start_ray_worker "$node" "$head_ip") &
   done
   wait
-  
+
   log_info "正在验证 Ray 集群状态..."
   local ssh_cmd="cd '${SCRIPT_DIR}' && source set_env.sh && \
       docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" \

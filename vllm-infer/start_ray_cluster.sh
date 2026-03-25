@@ -100,7 +100,7 @@ _remote_start_ray_head() {
 
     set -euo pipefail
     local resources_json="{\"NPU\": ${npus}}"
-    
+
     # 如果环境变量中设置了 RAY_NODE_IP_ADDRESS，优先使用它
     local node_ip_flag=""
     if [[ -n "${RAY_NODE_IP_ADDRESS:-}" ]]; then
@@ -123,7 +123,7 @@ _remote_start_ray_worker() {
 
     set -euo pipefail
     local resources_json="{\"NPU\": ${npus}}"
-    
+
     # 同样优先使用明确指定的节点 IP
     local node_ip_flag=""
     if [[ -n "${RAY_NODE_IP_ADDRESS:-}" ]]; then
@@ -143,10 +143,10 @@ remote_exec_func() {
     local func_name="$2"
     shift 2
     local args=("$@")
-    
+
     local func_code call_code
     func_code="$(declare -f "$func_name")"
-    
+
     # 构造带参数的调用字符串
     local args_str=""
     for arg in "${args[@]}"; do
@@ -158,7 +158,7 @@ remote_exec_func() {
     # 然后将代码通过管道喂给 docker exec
     local ssh_cmd="cd '${PROJECT_DIR}' && source set_env.sh && \
         docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -s"
-    
+
     # 容器内执行逻辑：
     # 1. source 项目目录下的 set_env.sh，确保容器内加载了 Ascend 环境变量及 Ray 所需变量
     # 2. 执行传入的函数
@@ -270,7 +270,7 @@ fi
 log_info "Waiting ${WAIT_TIME}s for head node to initialize..."
 sleep $WAIT_TIME
 
-success_count=1  
+success_count=1
 failed_count=0
 failed_nodes=()
 
@@ -325,4 +325,3 @@ if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$MASTER_ADDR" \
     log_warn "Failed to retrieve Ray status. Cluster may still be initializing."
 fi
 echo -e "${BLUE}=============================================${NC}"
-

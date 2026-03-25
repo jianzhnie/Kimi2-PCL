@@ -4,7 +4,7 @@
 
 **1. 确认 Ray 集群正常运行**
 ```bash
-bash vllm-infer/start_ray_cluster.sh 
+bash vllm-infer/start_ray_cluster.sh
 # 确保输出显示 128 个 NPU (16 个节点) 都已就绪
 ```
 

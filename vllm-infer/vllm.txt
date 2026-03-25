@@ -121,7 +121,7 @@ vllm serve Kimi-K2-Thinking \
 --trust-remote-code \
 --no-enable-prefix-caching
 
---enforce-eager 
+--enforce-eager
 ASCEND_LAUNCH_BLOCKING=1
 # 测试ok
 vllm serve /mnt/model_test/models/vllm-ascend/Kimi-K2-Instruct-W8A8 --served-model-name kimi-k2-thinking --gpu-memory-utilization 0.7 --enable_expert_parallel --trust-remote-code --no-enable-prefix-caching --quantization ascend --load-format safetensors --dtype bfloat16 -tp 64 --enforce-eager --distributed-executor-backend ray
@@ -222,5 +222,3 @@ HF_HUB_OFFLINE=1 vllm serve /mnt/xufan_400T/models/MiniMax-M2.5/ --served-model-
 
 # GLM-5
 vllm serve /mnt/xufan_400T/models/ZhipuAI/GLM-5/ --served-model-name GLM --gpu-memory-utilization 0.9 --enable_expert_parallel --max-num-seqs 256 --max-num-batched-tokens 4096 --max-model-len 8192 --enable-chunked-prefill --trust-remote-code --no-enable-prefix-caching -tp 32 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}' --enforce-eager --distributed-executor-backend ray
-
-
