@@ -24,7 +24,10 @@ NUM_ATTENTION_HEADS = 64
 QK_HEAD_DIM = 128
 QK_POS_EMB_HEAD_DIM = 64
 V_HEAD_DIM = 128
-NUM_QUERY_GROUPS = 2
+# NUM_QUERY_GROUPS 表示 KV head 总数（num_key_value_heads），
+# 对于 Kimi2-1T 为 32（64 Q heads / 2 GQA groups = 32 KV heads）。
+# 注意：不要将 GQA 分组比（2）赋值给此常量。
+NUM_KEY_VALUE_HEADS = 32
 FFN_HIDDEN_SIZE = 18432
 MOE_FFN_HIDDEN_SIZE = 12288
 VOCAB_SIZE = 163840
@@ -202,7 +205,7 @@ class MgCkptConvert:
         num_layer_list: str | None,
         noop_layers: str | None,
         rotary_base: float,
-        num_query_groups: int | None = None,
+        num_key_value_heads: int | None = None,
         vocab_size: int | None = None,
         max_position_embeddings: int | None = None,
         tie_word_embeddings: bool = False,
@@ -247,7 +250,7 @@ class MgCkptConvert:
         self.num_layer_list = num_layer_list
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
         self.rotary_base = rotary_base
-        self.num_query_groups = num_query_groups
+        self.num_key_value_heads = num_key_value_heads
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.tie_word_embeddings = tie_word_embeddings
@@ -281,6 +284,8 @@ class MgCkptConvert:
 
         self._validate()
 
+        self.num_real_layers = self.num_layers - len(self.noop_layers_list)
+
         if self.vpp_size is None:
             self.pprank_layer_idxs: dict[int, list[int]] = defaultdict(list)
             self.layer2loc: dict[int, tuple[int, int]] = {}
@@ -291,8 +296,6 @@ class MgCkptConvert:
                                                list[int]]] = defaultdict(dict)
             self.layer2loc_vpp: dict[int, tuple[int, int, int]] = {}
             self._build_vpprank_layer_map()
-
-        self.num_real_layers = self.num_layers - len(self.noop_layers_list)
 
         # 修正：使用 qk_pos_emb_head_dim 计算 inv_dim
         self._reset_inv_freq()
@@ -423,11 +426,13 @@ class MgCkptConvert:
         if 'num_experts' in cfg:
             cfg['num_experts'] = self.num_experts
 
-        kv_heads = self.detected_num_kv_heads or self.num_query_groups
+        # kv_heads 优先从权重自动检测（detected_num_kv_heads）or 命令行参数 num_key_value_heads（应为 KV head 总数，如 32）。
+        # 注意：num_key_value_heads 必须传入 KV head 总数，而非 GQA 分组比(num_query_groups=2)；
+        #      传入 GQA 分组比会导致写出的 config 中 num_key_value_heads 错误。
+        #      应改为传入 KV head 总数（如 32）。
+
+        kv_heads = self.detected_num_kv_heads or self.num_key_value_heads
         if kv_heads is not None:
-            if kv_heads > self.num_attention_heads:
-                # If user passed ratio instead of count
-                kv_heads = self.num_attention_heads // kv_heads
             cfg['num_key_value_heads'] = kv_heads
             cfg['group_query_attention'] = kv_heads < self.num_attention_heads
             if cfg['group_query_attention']:
@@ -487,6 +492,8 @@ class MgCkptConvert:
                 shutil.copyfile(src, os.path.join(self.hf_save_dir, fn))
 
     def _validate(self) -> None:
+        if not os.path.isdir(self.mg_load_dir):
+            raise FileNotFoundError(f'加载目录不存在: {self.mg_load_dir}')
         if self.num_layers <= 0:
             raise ValueError('num_layers 必须 > 0')
         if self.tp_size <= 0 or self.pp_size <= 0 or self.ep_size <= 0:
@@ -495,6 +502,10 @@ class MgCkptConvert:
             raise ValueError('num_experts 必须能整除 ep_size')
         if self.dualpipe and self.vpp_size is None:
             raise ValueError('dualpipev 需要 vpp checkpoint (model0/model1)')
+        if self.num_attention_heads % self.tp_size != 0:
+            raise ValueError(
+                f'num_attention_heads ({self.num_attention_heads}) 必须能整除 tp_size ({self.tp_size})'
+            )
 
     def _detect_vpp(self) -> tuple[int | None, list[str] | None]:
         ckpt_path = self._resolve_rank_ckpt_path(0, 0, None)
@@ -1038,14 +1049,13 @@ class MgCkptConvert:
         router = self._reconstruct_router_lazy(models, pp_rank, vpp_rank,
                                                f'{prefix}.router.weight')
         hf[f'model.layers.{hf_layer}.mlp.gate.weight'] = router
-        
+
         try:
             router_bias = self._reconstruct_router_lazy(
                 models, pp_rank, vpp_rank, f'{prefix}.router.expert_bias')
-            hf[f'model.layers.{hf_layer}.mlp.gate.bias'] = router_bias
-            # If the config uses noaux_tc, we also populate e_score_correction_bias 
-            # to prevent missing key errors, assuming it might be used as such.
-            hf[f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'] = router_bias.clone()
+            # 只写规范键名 e_score_correction_bias，避免与 gate.bias 同时存在
+            # 导致 hf2mcore 中 _assert_consumed 报"未消费权重"错误。
+            hf[f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias'] = router_bias
         except ValueError:
             pass
 
@@ -1082,6 +1092,13 @@ class MgCkptConvert:
                     del d
                     gc.collect()
 
+                # Megatron grouped_gemm 存储格式（hf2mcore 写入时）：
+                #   w1: [hidden_size, num_local * (intermed*2)]  (permute 后 reshape)
+                #   w2: [num_local * intermed, hidden_size]      (直接 reshape)
+                # 还原步骤（可逆性已验证）：
+                #   w1_3d: view(hidden, num_local, intermed*2) → permute(1,0,2) → [num_local, hidden, intermed*2]
+                #   fc1 = w1_3d[li].t() → [intermed*2, hidden]，即 cat([gate, up], dim=0)
+                #   w2_3d: view(num_local, intermed, hidden)；down = w2_3d[li].t() → [hidden, intermed]
                 local_w1 = shards_w1[0] if len(shards_w1) == 1 else torch.cat(
                     shards_w1, dim=1)
                 local_w2 = shards_w2[0] if len(shards_w2) == 1 else torch.cat(
@@ -1270,7 +1287,7 @@ class MgCkptConvert:
                 num_layer_list=self.num_layer_list,
                 noop_layers=','.join(map(str, self.noop_layers_list)),
                 rotary_base=float(self.rotary_base),
-                num_query_groups=self.num_query_groups,
+                num_key_value_heads=self.num_key_value_heads,
                 vocab_size=self.vocab_size,
                 max_position_embeddings=self.max_position_embeddings,
                 tie_word_embeddings=self.tie_word_embeddings,
@@ -1430,10 +1447,10 @@ def get_args():
     parser.add_argument('--tie-word-embeddings',
                         action='store_true',
                         help='Tie word embeddings and output layer.')
-    parser.add_argument('--num-query-groups',
+    parser.add_argument('--num-key-value-heads',
                         type=int,
                         default=None,
-                        help='Override num query groups (GQA).')
+                        help='Override num key value heads (GQA).')
     parser.add_argument('--vocab-size',
                         type=int,
                         default=None,
@@ -1495,7 +1512,7 @@ def main() -> None:
         num_layer_list=args.num_layer_list,
         noop_layers=args.noop_layers,
         rotary_base=args.rotary_base,
-        num_query_groups=args.num_query_groups,
+        num_key_value_heads=args.num_key_value_heads,
         vocab_size=args.vocab_size,
         max_position_embeddings=args.max_position_embeddings,
         tie_word_embeddings=tie_word_embeddings,

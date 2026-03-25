@@ -115,7 +115,7 @@ class CkptConvert:
         ffn_hidden_size: int | None,
         moe_ffn_hidden_size: int | None,
         vocab_size: int | None,
-        num_query_groups: int | None,
+        num_key_value_heads: int | None,
         num_experts: int,
         num_attention_heads: int,
         qk_head_dim: int,
@@ -161,7 +161,7 @@ class CkptConvert:
         self.ffn_hidden_size = ffn_hidden_size
         self.moe_ffn_hidden_size = moe_ffn_hidden_size
         self.vocab_size = vocab_size
-        self.num_query_groups = num_query_groups
+        self.num_key_value_heads = num_key_value_heads
         self.num_experts = num_experts
         self.num_attention_heads = num_attention_heads
         self.qk_head_dim = qk_head_dim
@@ -373,11 +373,12 @@ class CkptConvert:
             raise ValueError('ffn-hidden-size 必须 > 0')
         if self.moe_ffn_hidden_size is not None and self.moe_ffn_hidden_size <= 0:
             raise ValueError('moe-ffn-hidden-size 必须 > 0')
-        if self.num_query_groups is not None:
-            if self.num_query_groups <= 0:
-                raise ValueError('num-query-groups 必须 > 0')
-            if self.num_attention_heads % self.num_query_groups != 0:
-                raise ValueError('num-attention-heads 必须能整除 num-query-groups')
+        if self.num_key_value_heads is not None:
+            if self.num_key_value_heads <= 0:
+                raise ValueError('num-key-value-heads 必须 > 0')
+            if self.num_attention_heads % self.num_key_value_heads != 0:
+                raise ValueError(
+                    'num-attention-heads 必须能整除 num-key-value-heads')
         if self.moe_tp_extend_ep:
             if self.tp_size <= 1:
                 raise ValueError('moe-tp-extend-ep 需要 tp_size > 1 才有意义')
@@ -703,23 +704,24 @@ class CkptConvert:
         q_norm_key = f'{prefix}.q_layernorm.weight'
         k_norm_key = f'{prefix}.k_layernorm.weight'
 
-        if self.num_query_groups is None:
+        if self.num_key_value_heads is None:
             raise ValueError(
-                'num_query_groups is required for HF->Megatron QKV conversion')
-        if self.num_query_groups <= 0:
-            raise ValueError('num_query_groups must be > 0')
+                'num_key_value_heads is required for HF->Megatron QKV conversion'
+            )
+        if self.num_key_value_heads <= 0:
+            raise ValueError('num_key_value_heads must be > 0')
         if self.num_attention_heads % self.tp_size != 0:
             raise ValueError(
                 f'num_attention_heads={self.num_attention_heads} must be divisible by tp_size={self.tp_size}'
             )
-        if self.num_attention_heads % self.num_query_groups != 0:
+        if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError(
-                f'num_attention_heads={self.num_attention_heads} must be divisible by num_query_groups={self.num_query_groups}'
+                f'num_attention_heads={self.num_attention_heads} must be divisible by num_key_value_heads={self.num_key_value_heads}'
             )
 
         expected_q_head_dim = self.qk_head_dim + self.qk_pos_emb_head_dim
         expected_q_rows = self.num_attention_heads * expected_q_head_dim
-        expected_kv_heads = self.num_query_groups
+        expected_kv_heads = self.num_key_value_heads
         expected_k_rows = expected_kv_heads * expected_q_head_dim
         expected_v_rows = expected_kv_heads * self.v_head_dim
         if q_weight.shape[0] != expected_q_rows:
@@ -801,19 +803,28 @@ class CkptConvert:
         else:
             router_w = router_w_raw
         router_b_raw = weights.pop(
-            f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias',
-            None)
+            f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias', None)
+        # 始终 pop gate.bias（无论 e_score_correction_bias 是否存在），
+        # 防止旧 checkpoint 中同时含有两者时触发 _assert_consumed 报错。
+        fallback_b = weights.pop(f'model.layers.{hf_layer}.mlp.gate.bias',
+                                 None)
         if router_b_raw is None:
-            router_b_raw = weights.pop(f'model.layers.{hf_layer}.mlp.gate.bias',
-                                       None)
-        if router_b_raw is None:
-            raise KeyError(
-                f'model.layers.{hf_layer}.mlp.gate.e_score_correction_bias (or gate.bias) is required'
+            router_b_raw = fallback_b
+        # expert bias 为可选字段；部分旧版 checkpoint 不含此项，跳过即可。
+        has_router_bias = router_b_raw is not None
+        if not has_router_bias:
+            logger.warning(
+                'layer %d: mlp.gate.e_score_correction_bias not found in HF checkpoint, '
+                'skipping expert bias (moe_router_enable_expert_bias=False path).',
+                hf_layer,
             )
-        if router_b_raw.shape[0] != self.num_experts:
-            router_b = router_b_raw[:self.num_experts].clone()
+        if has_router_bias:
+            if router_b_raw.shape[0] != self.num_experts:
+                router_b = router_b_raw[:self.num_experts].clone()
+            else:
+                router_b = router_b_raw
         else:
-            router_b = router_b_raw
+            router_b = None
 
         shared_gate = weights.pop(
             f'model.layers.{hf_layer}.mlp.shared_experts.gate_proj.weight')
@@ -868,8 +879,9 @@ class CkptConvert:
                 tp_rank = ep_rank % self.tp_size
                 mg_model[ep_rank][tp_rank][router_key] = router_w[
                     ep_rank * num_local:(ep_rank + 1) * num_local].clone()
-                mg_model[ep_rank][tp_rank][router_bias_key] = router_b[
-                    ep_rank * num_local:(ep_rank + 1) * num_local].clone()
+                if router_b is not None:
+                    mg_model[ep_rank][tp_rank][router_bias_key] = router_b[
+                        ep_rank * num_local:(ep_rank + 1) * num_local].clone()
                 mg_model[ep_rank][tp_rank][shared_fc1_key] = shared_fc1_shards[
                     tp_rank]
                 mg_model[ep_rank][tp_rank][shared_fc2_key] = shared_fc2_shards[
@@ -884,7 +896,8 @@ class CkptConvert:
             for ep_rank in range(self.ep_size):
                 for tp_rank in range(self.tp_size):
                     mg_model[ep_rank][tp_rank][router_key] = router_w
-                    mg_model[ep_rank][tp_rank][router_bias_key] = router_b
+                    if router_b is not None:
+                        mg_model[ep_rank][tp_rank][router_bias_key] = router_b
                     mg_model[ep_rank][tp_rank][
                         shared_fc1_key] = shared_fc1_shards[tp_rank]
                     mg_model[ep_rank][tp_rank][
@@ -1120,7 +1133,7 @@ class CkptConvert:
             ffn_hidden_size=self.ffn_hidden_size,
             moe_ffn_hidden_size=self.moe_ffn_hidden_size,
             vocab_size=self.vocab_size,
-            num_query_groups=self.num_query_groups,
+            num_key_value_heads=self.num_key_value_heads,
             num_experts=self.num_experts,
             num_attention_heads=self.num_attention_heads,
             qk_head_dim=self.qk_head_dim,
@@ -1245,10 +1258,10 @@ def get_args():
         default=None,
         help='Override attention heads (default: from HF config).',
     )
-    parser.add_argument('--num-query-groups',
+    parser.add_argument('--num-key-value-heads',
                         type=int,
                         default=None,
-                        help='Override num query groups.')
+                        help='Override num key value heads.')
     parser.add_argument('--qk-head-dim',
                         type=int,
                         default=None,
@@ -1340,9 +1353,10 @@ def main() -> None:
     qk_rope_head_dim = args.qk_pos_emb_head_dim or hf_cfg.get(
         'qk_rope_head_dim') or hf_cfg.get(
             'qk_pos_emb_head_dim') or QK_POS_EMB_HEAD_DIM
-    num_query_groups = args.num_query_groups or hf_cfg.get('num_query_groups')
-    num_kv_heads = hf_cfg.get('num_key_value_heads') or hf_cfg.get(
-        'num_kv_heads') or num_query_groups
+    # num_key_value_heads 语义：KV head 总数（即 num_key_value_heads）。
+    # 优先从 HF config 读取 num_key_value_heads，其次 num_kv_heads，
+    num_key_value_heads = hf_cfg.get(
+        'num_key_value_heads') or args.num_key_value_heads
 
     tie_word_embeddings = bool(hf_cfg.get('tie_word_embeddings'))
     if getattr(args, 'tie_word_embeddings', False):
@@ -1352,7 +1366,7 @@ def main() -> None:
         str(num_layers),
         str(hf_cfg.get('hidden_size')),
         str(hf_cfg.get('num_attention_heads')),
-        str(num_kv_heads),
+        str(num_key_value_heads),
         str(hf_cfg.get('qk_nope_head_dim') or hf_cfg.get('qk_head_dim')),
         str(qk_rope_head_dim),
         str(hf_cfg.get('v_head_dim')),
@@ -1371,7 +1385,7 @@ def main() -> None:
         ffn_hidden_size=ffn_hidden_size,
         moe_ffn_hidden_size=moe_ffn_hidden_size,
         vocab_size=vocab_size,
-        num_query_groups=num_query_groups,
+        num_key_value_heads=num_key_value_heads,
         num_experts=num_experts,
         num_attention_heads=num_attention_heads,
         qk_head_dim=qk_head_dim,

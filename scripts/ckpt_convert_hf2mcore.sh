@@ -6,15 +6,37 @@ if [[ -f "${HOME}/.bashrc" ]]; then
   set -u
 fi
 
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+# 可选的昇腾环境设置（如果存在）
+if [[ -f "/usr/local/Ascend/ascend-toolkit/set_env.sh" ]]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+# 默认启用 MOE_TP_EXTEND_EP（用于昇腾等硬件优化）
+# 可通过 MOE_TP_EXTEND_EP=0 禁用
+export MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-1}"
 
-export MOE_TP_EXTEND_EP=1
+# 检查 REPO_ROOT 是否有效
+if [[ ! -d "${REPO_ROOT}" ]]; then
+  echo "ERROR: REPO_ROOT does not exist: ${REPO_ROOT}" >&2
+  exit 1
+fi
 
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf}"
 SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf2mcore_iter900}"
+
+if [[ -z "${LOAD_DIR}" ]]; then
+  echo "ERROR: LOAD_DIR must be set (source HuggingFace checkpoint directory)" >&2
+  echo "Usage: LOAD_DIR=/path/to/hf/ckpt SAVE_DIR=/path/to/output $0" >&2
+  exit 1
+fi
+
+if [[ -z "${SAVE_DIR}" ]]; then
+  echo "ERROR: SAVE_DIR must be set (target Megatron-Core format output directory)" >&2
+  echo "Usage: LOAD_DIR=/path/to/hf/ckpt SAVE_DIR=/path/to/output $0" >&2
+  exit 1
+fi
 
 
 TP="${TP:-2}"
@@ -36,15 +58,38 @@ MOE_FFN_HIDDEN_SIZE="${MOE_FFN_HIDDEN_SIZE:-12288}"
 VOCAB_SIZE="${VOCAB_SIZE:-163840}"
 NUM_EXPERTS="${NUM_EXPERTS:-128}"
 NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-64}"
-NUM_QUERY_GROUPS="${NUM_QUERY_GROUPS:-2}"
+NUM_KEY_VALUE_HEADS="${NUM_KEY_VALUE_HEADS:-32}"
 QK_HEAD_DIM="${QK_HEAD_DIM:-128}"
 V_HEAD_DIM="${V_HEAD_DIM:-128}"
 QK_POS_EMB_HEAD_DIM="${QK_POS_EMB_HEAD_DIM:-64}"
 MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"
 
 if [[ ! -d "${LOAD_DIR}" ]]; then
-  echo "LOAD_DIR does not exist: ${LOAD_DIR}" >&2
+  echo "ERROR: LOAD_DIR does not exist: ${LOAD_DIR}" >&2
   exit 2
+fi
+
+# 检查源目录是否包含必要的文件
+if [[ ! -f "${LOAD_DIR}/config.json" ]]; then
+  echo "WARNING: config.json not found in LOAD_DIR: ${LOAD_DIR}" >&2
+  echo "  The conversion may fail if config.json is not present." >&2
+fi
+
+# 创建输出目录（如果不存在）
+if [[ ! -d "${SAVE_DIR}" ]]; then
+  echo "Creating SAVE_DIR: ${SAVE_DIR}"
+  mkdir -p "${SAVE_DIR}" || {
+    echo "ERROR: Failed to create SAVE_DIR: ${SAVE_DIR}" >&2
+    exit 3
+  }
+fi
+
+# 检查转换脚本是否存在
+CONVERT_SCRIPT="${REPO_ROOT}/utils/convert_ckpt_hf2mcore.py"
+if [[ ! -f "${CONVERT_SCRIPT}" ]]; then
+  echo "ERROR: Conversion script not found: ${CONVERT_SCRIPT}" >&2
+  echo "Please check REPO_ROOT setting (current: ${REPO_ROOT})" >&2
+  exit 4
 fi
 
 EXTRA_ARGS=()
@@ -68,11 +113,23 @@ fi
 if [[ -n "${VPP_STAGE:-}" ]]; then
   EXTRA_ARGS+=(--vpp-stage "${VPP_STAGE}")
 fi
+QK_LAYERNORM="${QK_LAYERNORM:-1}"   # Kimi2-1T 模型启用 QK LayerNorm，默认开启
+
 if [[ -n "${CAST_DTYPE}" ]]; then
   EXTRA_ARGS+=(--cast-dtype "${CAST_DTYPE}")
 fi
+if [[ "${QK_LAYERNORM:-1}" == "1" ]]; then
+  EXTRA_ARGS+=(--qk-layernorm)
+fi
 
-python "${REPO_ROOT}/utils/convert_ckpt_hf2mcore.py" \
+echo "Starting conversion..."
+echo "  LOAD_DIR: ${LOAD_DIR}"
+echo "  SAVE_DIR: ${SAVE_DIR}"
+echo "  TP=${TP}, PP=${PP}, EP=${EP}"
+echo "  MOE_TP_EXTEND_EP=${MOE_TP_EXTEND_EP:-0}"
+echo ""
+
+python "${CONVERT_SCRIPT}" \
   --load-dir "${LOAD_DIR}" \
   --save-dir "${SAVE_DIR}" \
   --num-layers "${NUM_LAYERS}" \
@@ -91,7 +148,7 @@ python "${REPO_ROOT}/utils/convert_ckpt_hf2mcore.py" \
   --vocab-size "${VOCAB_SIZE}" \
   --num-experts "${NUM_EXPERTS}" \
   --num-attention-heads "${NUM_ATTENTION_HEADS}" \
-  --num-query-groups "${NUM_QUERY_GROUPS}" \
+  --num-key-value-heads "${NUM_KEY_VALUE_HEADS}" \
   --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}" \
   --qk-head-dim "${QK_HEAD_DIM}" \
   --v-head-dim "${V_HEAD_DIM}" \
