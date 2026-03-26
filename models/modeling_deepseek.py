@@ -96,7 +96,8 @@ class DeepseekV3RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance +
                                                     self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
+        # Convert weight to input dtype for multiplication to preserve output dtype
+        return (self.weight.to(input_dtype) * hidden_states).to(input_dtype)
 
 
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
@@ -246,11 +247,16 @@ def yarn_find_correction_range(low_rot,
                                dim,
                                base=10000,
                                max_position_embeddings=2048):
-    low = math.floor(
+    # Note: yarn_find_correction_dim is monotonically decreasing with num_rotations
+    # So low_rot (faster rotations) -> higher dim, high_rot (slower rotations) -> lower dim
+    low_dim = math.floor(
         yarn_find_correction_dim(low_rot, dim, base, max_position_embeddings))
-    high = math.ceil(
+    high_dim = math.ceil(
         yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings))
-    return max(low, 0), min(high, dim - 1)  # Clamp values just in case
+    # Ensure correct ordering: return (smaller, larger) as (low, high) dimension bounds
+    low = max(min(low_dim, high_dim), 0)
+    high = min(max(low_dim, high_dim), dim - 1)
+    return low, high
 
 
 def yarn_get_mscale(scale=1, mscale=1):
