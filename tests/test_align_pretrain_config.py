@@ -3,16 +3,9 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
-import unittest
+import pytest
 
 import torch
-
-
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-UTILS_DIR = os.path.join(REPO_ROOT, 'utils')
-if UTILS_DIR not in sys.path:
-    sys.path.insert(0, UTILS_DIR)
 
 
 def _sha256_tensor(t: torch.Tensor) -> str:
@@ -78,7 +71,7 @@ def _write_rank_ckpt(base_dir: str, tp_rank: int, pp_rank: int, ep_rank: int,
                _use_new_zipfile_serialization=True)
 
 
-def _build_dummy_mcore_ckpt(base_dir: str) -> dict[str, int]:
+def _build_dummy_mcore_ckpt(base_dir: str, moe_grouped_gemm: bool = True) -> dict[str, int]:
     tp_size = 2
     pp_size = 2
     ep_size = 2
@@ -177,10 +170,17 @@ def _build_dummy_mcore_ckpt(base_dir: str) -> dict[str, int]:
                     dst[f'{mlp_prefix}.shared_experts.linear_fc2.weight'] = rand(
                         (hidden_size, moe_ffn_hidden // tp_size))
 
-                    dst[f'{mlp_prefix}.experts.weight1'] = rand(
-                        (hidden_size, num_local * 2 * moe_ffn_hidden))
-                    dst[f'{mlp_prefix}.experts.weight2'] = rand(
-                        (num_local * moe_ffn_hidden, hidden_size))
+                    if moe_grouped_gemm:
+                        dst[f'{mlp_prefix}.experts.weight1'] = rand(
+                            (hidden_size, num_local * 2 * moe_ffn_hidden))
+                        dst[f'{mlp_prefix}.experts.weight2'] = rand(
+                            (num_local * moe_ffn_hidden, hidden_size))
+                    else:
+                        for li in range(num_local):
+                            dst[f'{mlp_prefix}.experts.local_experts.{li}.linear_fc1.weight'] = rand(
+                                (2 * moe_ffn_hidden // tp_size, hidden_size))
+                            dst[f'{mlp_prefix}.experts.local_experts.{li}.linear_fc2.weight'] = rand(
+                                (hidden_size, moe_ffn_hidden // tp_size))
 
             _write_rank_ckpt(base_dir, tp_rank, pp_rank, ep_rank, model0, model1)
 
@@ -208,162 +208,133 @@ def _build_dummy_mcore_ckpt(base_dir: str) -> dict[str, int]:
     }
 
 
-class TestAlignPretrainConfig(unittest.TestCase):
+def test_pretrain_config_matches_1t_success(repo_root):
+    """
+    Test purpose: Verify that the 1t pretrain script matches the 1t config.
+    Inputs: repo_root fixture.
+    Expected behavior: The parameters extracted from the script match the json config.
+    """
+    import pretrain_config
+    script = os.path.join(repo_root, 'scripts', 'pretrain_kimi2_1t_4k.sh')
+    cfg_path = os.path.join(repo_root, 'models', 'config_1t.json')
 
-    def test_pretrain_script_matches_config_1t(self) -> None:
-        script = os.path.join(REPO_ROOT, 'scripts', 'pretrain_kimi2_1t_4k.sh')
-        cfg_path = os.path.join(REPO_ROOT, 'models', 'config_1t.json')
+    cfg = pretrain_config.parse_pretrain_script(script)
+    with open(cfg_path) as f:
+        hf_cfg = json.load(f)
 
-        import pretrain_config
+    assert int(pretrain_config.get_int(cfg, '--num-layers')) == int(hf_cfg['num_hidden_layers'])
+    assert int(pretrain_config.get_int(cfg, '--hidden-size')) == int(hf_cfg['hidden_size'])
+    assert int(pretrain_config.get_int(cfg, '--num-attention-heads')) == int(hf_cfg['num_attention_heads'])
+    assert int(pretrain_config.get_int(cfg, '--vocab-size')) == int(hf_cfg['vocab_size'])
+    assert float(pretrain_config.get_float(cfg, '--rotary-base')) == float(hf_cfg['rope_theta'])
+    assert pretrain_config.get_bool(cfg, '--use-flash-attn') is True
+    assert pretrain_config.get_bool(cfg, '--bf16') is True
+    assert pretrain_config.get_bool(cfg, '--moe-grouped-gemm') is True
+    assert pretrain_config.get_flag(cfg, '--schedules-method') == 'dualpipev'
 
-        cfg = pretrain_config.parse_pretrain_script(script)
-        with open(cfg_path) as f:
-            hf_cfg = json.load(f)
-
-        self.assertEqual(int(pretrain_config.get_int(cfg, '--num-layers')),
-                         int(hf_cfg['num_hidden_layers']))
-        self.assertEqual(int(pretrain_config.get_int(cfg, '--hidden-size')),
-                         int(hf_cfg['hidden_size']))
-        self.assertEqual(
-            int(pretrain_config.get_int(cfg, '--num-attention-heads')),
-            int(hf_cfg['num_attention_heads']))
-        self.assertEqual(int(pretrain_config.get_int(cfg, '--vocab-size')),
-                         int(hf_cfg['vocab_size']))
-        self.assertEqual(float(pretrain_config.get_float(cfg, '--rotary-base')),
-                         float(hf_cfg['rope_theta']))
-        self.assertTrue(pretrain_config.get_bool(cfg, '--use-flash-attn'))
-        self.assertTrue(pretrain_config.get_bool(cfg, '--bf16'))
-        self.assertTrue(pretrain_config.get_bool(cfg, '--moe-grouped-gemm'))
-        self.assertEqual(pretrain_config.get_flag(cfg, '--schedules-method'),
-                         'dualpipev')
-
-        self.assertFalse(bool(hf_cfg['tie_word_embeddings']))
-        rope = hf_cfg['rope_scaling']
-        self.assertEqual(str(rope['type']), 'yarn')
-        self.assertEqual(float(rope['factor']), 32.0)
-        self.assertEqual(int(rope['original_max_position_embeddings']), 4096)
-
-    def test_dummy_roundtrip_mcore_hf_mcore(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            mcore_in = os.path.join(td, 'mcore_in')
-            hf_mid = os.path.join(td, 'hf_mid')
-            mcore_out = os.path.join(td, 'mcore_out')
-            os.makedirs(mcore_in, exist_ok=True)
-
-            p = _build_dummy_mcore_ckpt(mcore_in)
-
-            cmd_m2h = [
-                sys.executable,
-                os.path.join(REPO_ROOT, 'utils', 'convert_ckpt_mcore2hf.py'),
-                '--load-dir',
-                mcore_in,
-                '--save-dir',
-                hf_mid,
-                '--num-layers',
-                str(p['num_layers']),
-                '--first-k-dense-replace',
-                str(p['first_k_dense_replace']),
-                '--source-tensor-parallel-size',
-                str(p['tp_size']),
-                '--source-pipeline-parallel-size',
-                str(p['pp_size']),
-                '--source-expert-parallel-size',
-                str(p['ep_size']),
-                '--moe-grouped-gemm',
-                '--moe-tp-extend-ep',
-                '--schedules-method',
-                'dualpipev',
-                '--hidden-size',
-                str(p['hidden_size']),
-                '--ffn-hidden-size',
-                str(p['ffn_hidden']),
-                '--moe-ffn-hidden-size',
-                str(p['moe_ffn_hidden']),
-                '--vocab-size',
-                str(p['vocab_size']),
-                '--num-experts',
-                str(p['num_experts']),
-                '--num-attention-heads',
-                str(p['num_attention_heads']),
-                '--num-key-value-heads',
-                str(p['num_attention_heads'] // p['num_query_groups']),
-                '--qk-head-dim',
-                str(p['qk_head_dim']),
-                '--v-head-dim',
-                str(p['v_head_dim']),
-                '--qk-pos-emb-head-dim',
-                str(p['qk_pos_emb_head_dim']),
-                '--rotary-base',
-                str(p['rotary_base']),
-                '--pp-workers',
-                '1',
-                '--io-threads',
-                '2',
-            ]
-            subprocess.check_call(cmd_m2h, cwd=REPO_ROOT)
-
-            self.assertTrue(os.path.isfile(os.path.join(hf_mid, 'config.json')))
-            self.assertTrue(
-                os.path.isfile(os.path.join(hf_mid,
-                                            'model.safetensors.index.json')))
-
-            cmd_h2m = [
-                sys.executable,
-                os.path.join(REPO_ROOT, 'utils', 'convert_ckpt_hf2mcore.py'),
-                '--load-dir',
-                hf_mid,
-                '--save-dir',
-                mcore_out,
-                '--num-layers',
-                str(p['num_layers']),
-                '--first-k-dense-replace',
-                str(p['first_k_dense_replace']),
-                '--target-tensor-parallel-size',
-                str(p['tp_size']),
-                '--target-pipeline-parallel-size',
-                str(p['pp_size']),
-                '--target-expert-parallel-size',
-                str(p['ep_size']),
-                '--moe-grouped-gemm',
-                '--moe-tp-extend-ep',
-                '--schedules-method',
-                'dualpipev',
-                '--pp-workers',
-                '1',
-            ]
-            subprocess.check_call(cmd_h2m, cwd=REPO_ROOT)
-
-            iter_in = os.path.join(mcore_in, 'iter_0000001')
-            iter_out = os.path.join(mcore_out, 'iter_0000001')
-            self.assertTrue(os.path.isdir(iter_out))
-
-            for pp_rank in range(p['pp_size']):
-                for ep_rank in range(p['ep_size']):
-                    tp_rank = ep_rank % p['tp_size']
-                    mp = f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_rank:03}'
-                    pin = os.path.join(iter_in, mp, 'model_optim_rng.pt')
-                    pout = os.path.join(iter_out, mp, 'model_optim_rng.pt')
-                    self.assertTrue(os.path.isfile(pout))
-
-                    sin = torch.load(pin, map_location='cpu', weights_only=False)
-                    sout = torch.load(pout,
-                                      map_location='cpu',
-                                      weights_only=False)
-
-                    for k in ['model0', 'model1']:
-                        din = sin[k]
-                        dout = sout[k]
-                        self.assertEqual(set(din.keys()), set(dout.keys()))
-                        for tk in din.keys():
-                            self.assertEqual(tuple(din[tk].shape),
-                                             tuple(dout[tk].shape))
-                            self.assertEqual(din[tk].dtype, dout[tk].dtype)
-                            hin = _sha256_tensor(din[tk])
-                            hout = _sha256_tensor(dout[tk])
-                            self.assertEqual(hin,
-                                             hout,
-                                             msg=f'{mp} {k} {tk}')
+    assert bool(hf_cfg['tie_word_embeddings']) is False
+    rope = hf_cfg['rope_scaling']
+    assert str(rope['type']) == 'yarn'
+    assert float(rope['factor']) == 32.0
+    assert int(rope['original_max_position_embeddings']) == 4096
 
 
-if __name__ == '__main__':
-    unittest.main()
+@pytest.mark.parametrize("moe_grouped_gemm", [True, False])
+@pytest.mark.parametrize("pp_workers", [1, 2])
+@pytest.mark.benchmark
+def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root, moe_grouped_gemm, pp_workers):
+    """
+    Test purpose: Verify that dummy mcore checkpoint can be converted to HF and back to mcore without data loss.
+    Inputs: tmp_path fixture.
+    Expected behavior: Roundtrip checkpoint conversion yields identical weights.
+    """
+    mcore_in = str(tmp_path / 'mcore_in')
+    hf_mid = str(tmp_path / 'hf_mid')
+    mcore_out = str(tmp_path / 'mcore_out')
+    os.makedirs(mcore_in, exist_ok=True)
+
+    p = _build_dummy_mcore_ckpt(mcore_in, moe_grouped_gemm=moe_grouped_gemm)
+
+    cmd_m2h = [
+        'convert_ckpt_mcore2hf.py',
+        '--load-dir', mcore_in,
+        '--save-dir', hf_mid,
+        '--num-layers', str(p['num_layers']),
+        '--first-k-dense-replace', str(p['first_k_dense_replace']),
+        '--source-tensor-parallel-size', str(p['tp_size']),
+        '--source-pipeline-parallel-size', str(p['pp_size']),
+        '--source-expert-parallel-size', str(p['ep_size']),
+        '--moe-tp-extend-ep',
+        '--schedules-method', 'dualpipev',
+        '--hidden-size', str(p['hidden_size']),
+        '--ffn-hidden-size', str(p['ffn_hidden']),
+        '--moe-ffn-hidden-size', str(p['moe_ffn_hidden']),
+        '--vocab-size', str(p['vocab_size']),
+        '--num-experts', str(p['num_experts']),
+        '--num-attention-heads', str(p['num_attention_heads']),
+        '--num-key-value-heads', str(p['num_attention_heads'] // p['num_query_groups']),
+        '--qk-head-dim', str(p['qk_head_dim']),
+        '--v-head-dim', str(p['v_head_dim']),
+        '--qk-pos-emb-head-dim', str(p['qk_pos_emb_head_dim']),
+        '--rotary-base', str(p['rotary_base']),
+        '--pp-workers', str(pp_workers),
+        '--io-threads', '2',
+    ]
+    if moe_grouped_gemm:
+        cmd_m2h.append('--moe-grouped-gemm')
+    cmd_m2h.append('--moe-tp-extend-ep')
+
+    import convert_ckpt_mcore2hf
+    with pytest.MonkeyPatch().context() as m:
+        m.setattr(sys, 'argv', cmd_m2h)
+        convert_ckpt_mcore2hf.main()
+
+    assert os.path.isfile(os.path.join(hf_mid, 'config.json'))
+    assert os.path.isfile(os.path.join(hf_mid, 'model.safetensors.index.json'))
+
+    cmd_h2m = [
+        'convert_ckpt_hf2mcore.py',
+        '--load-dir', hf_mid,
+        '--save-dir', mcore_out,
+        '--num-layers', str(p['num_layers']),
+        '--first-k-dense-replace', str(p['first_k_dense_replace']),
+        '--target-tensor-parallel-size', str(p['tp_size']),
+        '--target-pipeline-parallel-size', str(p['pp_size']),
+        '--target-expert-parallel-size', str(p['ep_size']),
+        '--schedules-method', 'dualpipev',
+        '--pp-workers', str(pp_workers),
+    ]
+    if moe_grouped_gemm:
+        cmd_h2m.append('--moe-grouped-gemm')
+    cmd_h2m.append('--moe-tp-extend-ep')
+        
+    import convert_ckpt_hf2mcore
+    with pytest.MonkeyPatch().context() as m:
+        m.setattr(sys, 'argv', cmd_h2m)
+        convert_ckpt_hf2mcore.main()
+
+    iter_in = os.path.join(mcore_in, 'iter_0000001')
+    iter_out = os.path.join(mcore_out, 'iter_0000001')
+    assert os.path.isdir(iter_out)
+
+    for pp_rank in range(p['pp_size']):
+        for ep_rank in range(p['ep_size']):
+            tp_rank = ep_rank % p['tp_size']
+            mp = f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_rank:03}'
+            pin = os.path.join(iter_in, mp, 'model_optim_rng.pt')
+            pout = os.path.join(iter_out, mp, 'model_optim_rng.pt')
+            assert os.path.isfile(pout)
+
+            sin = torch.load(pin, map_location='cpu', weights_only=False)
+            sout = torch.load(pout, map_location='cpu', weights_only=False)
+
+            for k in ['model0', 'model1']:
+                din = sin[k]
+                dout = sout[k]
+                assert set(din.keys()) == set(dout.keys())
+                for tk in din.keys():
+                    assert tuple(din[tk].shape) == tuple(dout[tk].shape)
+                    assert din[tk].dtype == dout[tk].dtype
+                    hin = _sha256_tensor(din[tk])
+                    hout = _sha256_tensor(dout[tk])
+                    assert hin == hout, f'{mp} {k} {tk}'
