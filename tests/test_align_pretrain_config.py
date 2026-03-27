@@ -9,6 +9,7 @@ import torch
 
 
 def _sha256_tensor(t: torch.Tensor) -> str:
+    """Return deterministic SHA256 for tensor byte content on CPU."""
     t = t.detach().cpu()
     if not t.is_contiguous():
         t = t.contiguous()
@@ -19,6 +20,7 @@ def _sha256_tensor(t: torch.Tensor) -> str:
 
 
 def _dualpipe_layers(num_layers: int, pp_size: int) -> list[int]:
+    """Build dualpipe layer traversal order used by conversion tests."""
     layers_each_pp = num_layers // pp_size
     layer_pop_num = layers_each_pp // 2
     all_layers = list(range(num_layers))
@@ -32,6 +34,7 @@ def _dualpipe_layers(num_layers: int, pp_size: int) -> list[int]:
 
 def _stage_layers_dualpipe(num_layers: int, pp_size: int,
                            vpp_stage: int) -> dict[tuple[int, int], list[int]]:
+    """Map (pp_rank, vpp_rank) to HF layer ids for dualpipe scheduling."""
     dualpipe_layers = _dualpipe_layers(num_layers, pp_size)
     out: dict[tuple[int, int], list[int]] = {}
     pp_rank = 0
@@ -50,6 +53,7 @@ def _stage_layers_dualpipe(num_layers: int, pp_size: int,
 def _write_rank_ckpt(base_dir: str, tp_rank: int, pp_rank: int, ep_rank: int,
                      model0: dict[str, torch.Tensor],
                      model1: dict[str, torch.Tensor]) -> None:
+    """Write one synthetic mcore rank checkpoint file to disk."""
     iter_dir = os.path.join(base_dir, 'iter_0000001')
     os.makedirs(iter_dir, exist_ok=True)
     mp_dir = os.path.join(iter_dir,
@@ -72,6 +76,7 @@ def _write_rank_ckpt(base_dir: str, tp_rank: int, pp_rank: int, ep_rank: int,
 
 
 def _build_dummy_mcore_ckpt(base_dir: str, moe_grouped_gemm: bool = True) -> dict[str, int]:
+    """Build a minimal yet structurally complete synthetic mcore checkpoint tree."""
     tp_size = 2
     pp_size = 2
     ep_size = 2

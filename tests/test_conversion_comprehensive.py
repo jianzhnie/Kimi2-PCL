@@ -8,7 +8,6 @@ Coverage targets:
 
 import json
 import os
-import sys
 import tempfile
 import hashlib
 from pathlib import Path
@@ -18,11 +17,8 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-# Ensure utils are in path
-sys.path.insert(0, str(Path(__file__).parent.parent / "utils"))
-
 # Import conversion modules
-from convert_ckpt_hf2mcore import (
+from utils.convert_ckpt_hf2mcore import (
     _parse_int_list,
     _read_hf_config,
     _ensure_iter_path,
@@ -33,11 +29,11 @@ from convert_ckpt_hf2mcore import (
     CkptConvert,
 )
 
-from check_model_weights import (
+from utils.check_model_weights import (
     _shard_paths,
 )
 
-from convert_ckpt_mcore2hf import (
+from utils.convert_ckpt_mcore2hf import (
     _resolve_iter_dir,
     _mp_prefix as _mp_prefix_mcore,
     _dtype_from_str as _dtype_from_str_mcore,
@@ -521,7 +517,7 @@ class TestMgCkptConvertInitialization:
     @patch.object(MgCkptConvert, '_detect_vpp', return_value=(None, ['model']))
     def test_basic_initialization(self, mock_detect, base_mg_convert_kwargs):
         """Test basic initialization"""
-        with patch('convert_ckpt_mcore2hf._resolve_iter_dir', return_value='/tmp/unused'):
+        with patch('utils.convert_ckpt_mcore2hf._resolve_iter_dir', return_value='/tmp/unused'):
             converter = MgCkptConvert(**base_mg_convert_kwargs)
             assert converter.mg_load_dir == "/tmp/mcore"
             assert converter.tp_size == 1
@@ -532,7 +528,7 @@ class TestMgCkptConvertQKVLayout:
 
     @pytest.fixture
     def converter(self):
-        with patch('convert_ckpt_mcore2hf._resolve_iter_dir', return_value='/tmp/unused'), \
+        with patch('utils.convert_ckpt_mcore2hf._resolve_iter_dir', return_value='/tmp/unused'), \
              patch.object(MgCkptConvert, '_detect_vpp', return_value=(None, ['model'])):
             return MgCkptConvert(
                 mg_load_dir='/tmp/unused',

@@ -10,7 +10,6 @@ Coverage targets:
 import json
 import math
 import os
-import sys
 import tempfile
 import hashlib
 from pathlib import Path
@@ -20,10 +19,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-# Ensure utils are in path
-sys.path.insert(0, str(Path(__file__).parent.parent / "utils"))
-
-from check_model_weights import (
+from utils.check_model_weights import (
     _shard_paths,
     _read_specs_from_shard,
     _build_empty_model,
@@ -202,7 +198,7 @@ class TestBuildEmptyModel:
             num_attention_heads=4,
         )
 
-        with patch("check_model_weights.init_empty_weights"):
+        with patch("utils.check_model_weights.init_empty_weights"):
             model = _build_empty_model(config)
             assert model is not None
 
@@ -411,7 +407,7 @@ class TestCheckMain:
     """Test main function of check_model_weights"""
 
     @patch("sys.argv", ["check_model_weights.py", "--estimate-params"])
-    @patch("check_model_weights.print_parameter_estimate")
+    @patch("utils.check_model_weights.print_parameter_estimate")
     def test_main_estimate_params(self, mock_print):
         """Test --estimate-params flag"""
         # check_main returns exit code, doesn't raise SystemExit
@@ -420,8 +416,8 @@ class TestCheckMain:
         mock_print.assert_called_once()
 
     @patch("sys.argv", ["check_model_weights.py", "--verify-config"])
-    @patch("check_model_weights.verify_config_consistency", return_value=True)
-    @patch("check_model_weights.verify_pretrain_script_consistency")
+    @patch("utils.check_model_weights.verify_config_consistency", return_value=True)
+    @patch("utils.check_model_weights.verify_pretrain_script_consistency")
     def test_main_verify_config(self, mock_script, mock_verify):
         """Test --verify-config flag"""
         exit_code = check_main()
@@ -429,9 +425,9 @@ class TestCheckMain:
         mock_verify.assert_called_once()
 
     @patch("sys.argv", ["check_model_weights.py", "--verify-all"])
-    @patch("check_model_weights.print_parameter_estimate")
-    @patch("check_model_weights.verify_config_consistency", return_value=True)
-    @patch("check_model_weights.verify_pretrain_script_consistency")
+    @patch("utils.check_model_weights.print_parameter_estimate")
+    @patch("utils.check_model_weights.verify_config_consistency", return_value=True)
+    @patch("utils.check_model_weights.verify_pretrain_script_consistency")
     def test_main_verify_all(self, mock_script, mock_verify, mock_print):
         """Test --verify-all flag"""
         exit_code = check_main()
@@ -440,7 +436,7 @@ class TestCheckMain:
         mock_print.assert_called_once()
 
     @patch("sys.argv", ["check_model_weights.py", "dummy_path", "--skip-shape-check"])
-    @patch("check_model_weights._main_check_checkpoint")
+    @patch("utils.check_model_weights._main_check_checkpoint")
     def test_main_check_checkpoint(self, mock_check):
         """Test checkpoint path argument"""
         check_main()
@@ -464,7 +460,7 @@ class TestIntegration:
 
     def test_full_checkpoint_validation(self, temp_checkpoint_dir):
         """Test full checkpoint validation flow"""
-        from check_model_weights import _main_check_checkpoint
+        from utils.check_model_weights import _main_check_checkpoint
         from argparse import Namespace
 
         args = Namespace(
@@ -482,7 +478,7 @@ class TestIntegration:
 
     def test_checkpoint_with_shape_check(self, temp_checkpoint_dir):
         """Test checkpoint validation with shape checking"""
-        from check_model_weights import _main_check_checkpoint
+        from utils.check_model_weights import _main_check_checkpoint
         from argparse import Namespace
 
         args = Namespace(
@@ -506,7 +502,7 @@ class TestEdgeCases:
 
     def test_missing_dependency_error(self):
         """Test error when dependency is missing"""
-        from check_model_weights import _require
+        from utils.check_model_weights import _require
 
         mock_error = ImportError("No module named 'test_module'")
         with pytest.raises(SystemExit):

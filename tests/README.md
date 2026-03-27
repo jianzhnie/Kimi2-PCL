@@ -75,22 +75,35 @@ tests/
 
 ## 快速开始
 
-### 运行所有测试
+### 运行所有测试（并行）
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -n auto -v
 ```
 
-### 运行带覆盖率
+### 运行带覆盖率（阈值 90%）
 
 ```bash
-python -m pytest tests/ --cov=models --cov=utils --cov-report=html
+python -m pytest -q -n auto -m "not benchmark" \
+  --cov=models --cov=utils \
+  --cov-report=term-missing --cov-report=html \
+  --cov-fail-under=90
 ```
 
-### 运行性能基准
+### 运行性能基准（JSON + 直方图）
 
 ```bash
-python -m pytest tests/ -m benchmark -v
+python -m pytest -q -m benchmark --benchmark-only \
+  --benchmark-json=.benchmarks/benchmark.json \
+  --benchmark-histogram=.benchmarks/histogram
+python scripts/check_benchmark_threshold.py .benchmarks/benchmark.json --max-mean-seconds 1.0
+```
+
+### 校验平均单测耗时（阈值 1s）
+
+```bash
+python -m pytest -q -m "not benchmark" --junitxml=pytest-junit.xml
+python scripts/check_pytest_timing_threshold.py pytest-junit.xml --max-average-seconds 1.0
 ```
 
 ### 运行特定模块
