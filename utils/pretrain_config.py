@@ -35,9 +35,17 @@ def _expand_vars(s: str, vars_: dict[str, str]) -> str:
 
 def _parse_assignments(lines: list[str]) -> dict[str, str]:
     out: dict[str, str] = {}
+    in_block = False
     for ln in lines:
         line = ln.strip()
         if not line or line.startswith('#'):
+            continue
+        if in_block:
+            if line == '"':
+                in_block = False
+            continue
+        if re.match(r'^[A-Za-z_][A-Za-z0-9_]*\s*=\s*"\s*$', line):
+            in_block = True
             continue
         if '=' not in line:
             continue
@@ -94,6 +102,8 @@ def _extract_torchrun_section(lines: list[str]) -> list[str]:
 
 def _normalize_arg_text(s: str) -> str:
     s = s.replace('\\\n', '\n')
+    s = s.replace('\\t', '\t')
+    s = s.replace('\\n', '\n')
     s = s.replace('\\', ' ')
     s = re.sub(r'\s+', ' ', s).strip()
     return s
@@ -114,13 +124,13 @@ def parse_pretrain_script(path: str) -> PretrainScriptConfig:
     for m in re.finditer(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}', torchrun_text):
         used_block_names.add(m.group(1))
 
-    arg_texts: list[str] = []
-    for bn in sorted(used_block_names):
+    # Replace block variable references with block content
+    for bn in used_block_names:
         if bn in blocks:
-            arg_texts.append(blocks[bn])
-    arg_texts.append(torchrun_text)
+            torchrun_text = torchrun_text.replace(f'${bn}', blocks[bn])
+            torchrun_text = torchrun_text.replace(f'${{{bn}}}', blocks[bn])
 
-    merged = '\n'.join(arg_texts)
+    merged = torchrun_text
     merged = _expand_vars(merged, variables)
     merged = _normalize_arg_text(merged)
 
