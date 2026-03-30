@@ -25,10 +25,10 @@ fi
 # --- 1. 默认配置与常量 ---
 # 覆盖或使用环境变量，如果未定义则使用默认值
 PROJECT_DIR="${SCRIPT_DIR}"
-MASTER_PORT="${RAY_PORT:-6312}"         # Ray head node 默认端口
-DASHBOARD_PORT="8266"                   # Ray 仪表盘默认端口
-NPUS_PER_NODE=8                         # 每个节点的 NPU 数量
-WAIT_TIME=3                             # 等待头节点初始化的时间 (秒)
+MASTER_PORT="${RAY_PORT:-6379}"                 # Ray head node 端口
+DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8266}"    # Ray 仪表盘端口
+NPUS_PER_NODE=8                                 # 每个节点的 NPU 数量
+WAIT_TIME=1                                     # 等待头节点初始化的时间 (秒)
 NODE_LIST_FILE="${NODES_FILE:-${SCRIPT_DIR}/node_list.txt}"
 
 # 颜色输出定义

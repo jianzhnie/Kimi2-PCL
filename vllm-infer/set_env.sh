@@ -29,6 +29,7 @@ export VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${SCRIPT_DIR}/vllm_model_server.s
 # 3. Ray 与 vLLM 配置
 # ------------------------------------------
 export RAY_PORT="${RAY_PORT:-6379}"
+export RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8266}"
 export VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
 export VLLM_PORT="${VLLM_PORT:-8000}"
 
