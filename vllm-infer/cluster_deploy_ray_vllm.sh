@@ -124,6 +124,12 @@ _remote_prepare_node() {
     exit 127
   fi
 
+  # 确保 Docker 服务已启动
+  echo "[INFO] Starting Docker service..."
+  systemctl daemon-reload && systemctl start docker || {
+    echo "[WARN] Failed to start Docker via systemctl, trying to check Docker status..." >&2
+  }
+
   if docker image inspect "${image_name}" >/dev/null 2>&1; then
     : # 镜像已存在
   else
