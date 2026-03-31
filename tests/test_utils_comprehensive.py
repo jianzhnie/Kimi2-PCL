@@ -38,7 +38,7 @@ from utils.check_model_weights import (
 
 @pytest.fixture
 def temp_checkpoint_dir():
-    """Create a temporary checkpoint directory with dummy files"""
+    """Create a temporary checkpoint directory with complete dummy files"""
     with tempfile.TemporaryDirectory() as tmpdir:
         ckpt_dir = Path(tmpdir)
 
@@ -48,21 +48,43 @@ def temp_checkpoint_dir():
             "hidden_size": 64,
             "num_hidden_layers": 2,
             "num_attention_heads": 4,
+            "num_key_value_heads": 2,
             "intermediate_size": 128,
             "model_type": "kimi_k2",
         }
         with open(ckpt_dir / "config.json", "w") as f:
             json.dump(config, f)
 
-        # Create dummy safetensors file
+        # Create complete dummy safetensors file with all required weights
         dummy_weights = {
+            # Embeddings and output
             "model.embed_tokens.weight": torch.randn(128, 64),
+            "model.norm.weight": torch.randn(64),
+            "lm_head.weight": torch.randn(128, 64),
+            # Layer 0 - attention
             "model.layers.0.self_attn.q_proj.weight": torch.randn(64, 64),
             "model.layers.0.self_attn.k_proj.weight": torch.randn(32, 64),
             "model.layers.0.self_attn.v_proj.weight": torch.randn(32, 64),
             "model.layers.0.self_attn.o_proj.weight": torch.randn(64, 64),
-            "model.norm.weight": torch.randn(64),
-            "lm_head.weight": torch.randn(128, 64),
+            # Layer 0 - layernorm
+            "model.layers.0.input_layernorm.weight": torch.randn(64),
+            "model.layers.0.post_attention_layernorm.weight": torch.randn(64),
+            # Layer 0 - MLP (dense for first 2 layers)
+            "model.layers.0.mlp.gate_proj.weight": torch.randn(128, 64),
+            "model.layers.0.mlp.up_proj.weight": torch.randn(128, 64),
+            "model.layers.0.mlp.down_proj.weight": torch.randn(64, 128),
+            # Layer 1 - attention
+            "model.layers.1.self_attn.q_proj.weight": torch.randn(64, 64),
+            "model.layers.1.self_attn.k_proj.weight": torch.randn(32, 64),
+            "model.layers.1.self_attn.v_proj.weight": torch.randn(32, 64),
+            "model.layers.1.self_attn.o_proj.weight": torch.randn(64, 64),
+            # Layer 1 - layernorm
+            "model.layers.1.input_layernorm.weight": torch.randn(64),
+            "model.layers.1.post_attention_layernorm.weight": torch.randn(64),
+            # Layer 1 - MLP
+            "model.layers.1.mlp.gate_proj.weight": torch.randn(128, 64),
+            "model.layers.1.mlp.up_proj.weight": torch.randn(128, 64),
+            "model.layers.1.mlp.down_proj.weight": torch.randn(64, 128),
         }
         save_file(dummy_weights, ckpt_dir / "model.safetensors")
 

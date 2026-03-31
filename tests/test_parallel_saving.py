@@ -262,7 +262,9 @@ def create_moe_hf_model(model_dir: str) -> None:
 
 def get_convert_script_path() -> str:
     """Get the path to the convert script."""
-    script_path = os.path.join(os.path.dirname(__file__), "convert_ckpt_hf2mcore.py")
+    # Script is in utils directory, not tests directory
+    repo_root = os.path.dirname(os.path.dirname(__file__))
+    script_path = os.path.join(repo_root, "utils", "convert_ckpt_hf2mcore.py")
     if not os.path.exists(script_path):
         raise FileNotFoundError(f"Convert script not found: {script_path}")
     return script_path

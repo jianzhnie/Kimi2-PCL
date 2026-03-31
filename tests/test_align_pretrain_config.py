@@ -83,6 +83,8 @@ def _build_dummy_mcore_ckpt(base_dir: str, moe_grouped_gemm: bool = True) -> dic
     num_layers = 4
     first_k_dense_replace = 2
 
+    # Use consistent dimensions: head_dim must equal hidden_size / num_attention_heads
+    # For standard GQA: q_head_dim = k_head_dim = hidden_size / num_attention_heads
     hidden_size = 16
     vocab_size = 32
     ffn_hidden = 32
@@ -90,9 +92,11 @@ def _build_dummy_mcore_ckpt(base_dir: str, moe_grouped_gemm: bool = True) -> dic
     num_experts = 4
     num_attention_heads = 4
     num_query_groups = 2
-    qk_head_dim = 4
-    qk_pos_emb_head_dim = 2
-    v_head_dim = 4
+    # head_dim = hidden_size / num_attention_heads = 4
+    # For standard GQA without MLA, we use uniform head_dim for Q/K/V
+    qk_head_dim = 4  # Q/K head dimension (without rope)
+    qk_pos_emb_head_dim = 0  # No separate RoPE dimension for standard GQA
+    v_head_dim = 4  # V head dimension
 
     vpp_stage = (num_layers // pp_size) // 2
     stage_map = _stage_layers_dualpipe(num_layers, pp_size, vpp_stage)
@@ -126,8 +130,8 @@ def _build_dummy_mcore_ckpt(base_dir: str, moe_grouped_gemm: bool = True) -> dic
             stage_shared[(vpp_rank, hf_layer)] = {
                 'input_ln': rand((hidden_size, )),
                 'pre_mlp_ln': rand((hidden_size, )),
-                'q_ln': rand((qk_head_dim + qk_pos_emb_head_dim, )),
-                'k_ln': rand((qk_head_dim + qk_pos_emb_head_dim, )),
+                # Note: Standard GQA model does not use q/k_layernorm
+                # These are only used in MLA architecture
             }
         final_ln_shared = rand((hidden_size, ))
 
@@ -156,8 +160,8 @@ def _build_dummy_mcore_ckpt(base_dir: str, moe_grouped_gemm: bool = True) -> dic
                     (qkv_rows, hidden_size))
                 dst[f'{prefix}.self_attention.linear_proj.weight'] = rand(
                     (hidden_size, hidden_size // tp_size))
-                dst[f'{prefix}.self_attention.q_layernorm.weight'] = sh['q_ln']
-                dst[f'{prefix}.self_attention.k_layernorm.weight'] = sh['k_ln']
+                # Note: q_layernorm and k_layernorm are only used in MLA architecture
+                # Standard GQA model does not include these weights
 
                 mlp_prefix = f'{prefix}.mlp'
                 if hf_layer < first_k_dense_replace:

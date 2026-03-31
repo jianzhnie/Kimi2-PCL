@@ -355,9 +355,6 @@ class TestCkptConvertInitialization:
             "num_key_value_heads": 2,
             "num_experts": 1,
             "num_attention_heads": 4,
-            "qk_head_dim": 16,
-            "v_head_dim": 16,
-            "qk_pos_emb_head_dim": 8,
             "moe_grouped_gemm": False,
             "moe_tp_extend_ep": False,
             "schedules_method": None,
@@ -371,7 +368,6 @@ class TestCkptConvertInitialization:
             "cast_dtype": None,
             "tie_word_embeddings": False,
             "hf_io_threads": 1,
-            "qk_layernorm": True,
         }
 
     @patch.object(CkptConvert, '_validate')
@@ -413,9 +409,6 @@ class TestCkptConvertLayerMapping:
                 num_key_value_heads=2,
                 num_experts=4,
                 num_attention_heads=4,
-                qk_head_dim=16,
-                v_head_dim=16,
-                qk_pos_emb_head_dim=8,
                 moe_grouped_gemm=False,
                 moe_tp_extend_ep=False,
                 schedules_method=None,
@@ -429,7 +422,6 @@ class TestCkptConvertLayerMapping:
                 cast_dtype=None,
                 tie_word_embeddings=False,
                 hf_io_threads=1,
-                qk_layernorm=True,
             )
 
     def test_first_k_dense_replace(self, converter):
