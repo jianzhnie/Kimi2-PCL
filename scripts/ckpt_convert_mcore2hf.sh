@@ -99,11 +99,18 @@ if [[ -n "${CAST_DTYPE}" ]]; then
   EXTRA_ARGS+=(--cast-dtype "${CAST_DTYPE}")
 fi
 
+# QK LayerNorm 支持 (Kimi2-1T 模型默认启用)
+QK_LAYERNORM="${QK_LAYERNORM:-1}"
+if [[ "${QK_LAYERNORM}" == "1" ]]; then
+  EXTRA_ARGS+=(--qk-layernorm)
+fi
+
 echo "Starting conversion..."
 echo "  LOAD_DIR: ${LOAD_DIR}"
 echo "  SAVE_DIR: ${SAVE_DIR}"
 echo "  TP=${TP}, PP=${PP}, EP=${EP}"
 echo "  NUM_LAYERS=${NUM_LAYERS}, NUM_EXPERTS=${NUM_EXPERTS}"
+echo "  QK_LAYERNORM=${QK_LAYERNORM}"
 echo ""
 
 python "${CONVERT_SCRIPT}" \

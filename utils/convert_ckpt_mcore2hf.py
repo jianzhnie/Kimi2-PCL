@@ -216,6 +216,7 @@ class MgCkptConvert:
         io_threads: int = 4,
         disable_mmap: bool = False,
         extra_config_kwargs: dict | None = None,
+        qk_layernorm: bool = False,
     ):
         self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
         self.log_rank_load = os.environ.get('CKPT_CONVERT_LOG_RANK',
@@ -264,6 +265,7 @@ class MgCkptConvert:
         self.io_threads = max(1, int(io_threads))
         self.disable_mmap = bool(disable_mmap)
         self.extra_config_kwargs = extra_config_kwargs or {}
+        self.qk_layernorm = qk_layernorm
         self._target_dtype = _dtype_from_str(
             cast_dtype) if cast_dtype else None
         self._sparse_cache: dict[tuple[int, int, int, int | None],
@@ -415,6 +417,7 @@ class MgCkptConvert:
         cfg['qk_nope_head_dim'] = self.qk_head_dim
         cfg['qk_rope_head_dim'] = self.qk_pos_emb_head_dim
         cfg['v_head_dim'] = self.v_head_dim
+        cfg['qk_layernorm'] = self.qk_layernorm
         cfg['rope_theta'] = float(self.rotary_base)
         cfg['ep_size'] = self.ep_size
         cfg['first_k_dense_replace'] = self.first_k_dense_replace
@@ -1451,6 +1454,9 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override num key value heads (GQA).')
+    parser.add_argument('--qk-layernorm',
+                        action='store_true',
+                        help='Enable QK LayerNorm (must match training config)')
     parser.add_argument('--vocab-size',
                         type=int,
                         default=None,
@@ -1523,6 +1529,7 @@ def main() -> None:
         io_threads=args.io_threads,
         disable_mmap=args.disable_mmap,
         extra_config_kwargs=extra_config_kwargs,
+        qk_layernorm=args.qk_layernorm,
     )
     converter.run()
     _write_sha256_manifest(args.save_dir, args.sha256_manifest)
