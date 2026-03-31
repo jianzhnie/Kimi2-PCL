@@ -8,7 +8,7 @@ from collections import defaultdict
 from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
                                 as_completed)
 from multiprocessing import get_context
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 from safetensors import safe_open
@@ -16,13 +16,25 @@ from safetensors import safe_open
 logger.basicConfig(format='')
 logger.getLogger().setLevel(logger.INFO)
 
-HIDDEN_SIZE = 7168
-NUM_EXPERTS = 128
-FIRST_K_DENSE_REPLACE = 2
-NUM_ATTENTION_HEADS = 64
-QK_HEAD_DIM = 128
-QK_POS_EMB_HEAD_DIM = 64
-V_HEAD_DIM = 128
+# Default model configuration - can be overridden via HF config or CLI args
+DEFAULT_MODEL_CONFIG = {
+    'hidden_size': 7168,
+    'num_experts': 128,
+    'first_k_dense_replace': 2,
+    'num_attention_heads': 64,
+    'qk_head_dim': 128,
+    'qk_pos_emb_head_dim': 64,
+    'v_head_dim': 128,
+}
+
+# Keep for backward compatibility
+HIDDEN_SIZE = DEFAULT_MODEL_CONFIG['hidden_size']
+NUM_EXPERTS = DEFAULT_MODEL_CONFIG['num_experts']
+FIRST_K_DENSE_REPLACE = DEFAULT_MODEL_CONFIG['first_k_dense_replace']
+NUM_ATTENTION_HEADS = DEFAULT_MODEL_CONFIG['num_attention_heads']
+QK_HEAD_DIM = DEFAULT_MODEL_CONFIG['qk_head_dim']
+QK_POS_EMB_HEAD_DIM = DEFAULT_MODEL_CONFIG['qk_pos_emb_head_dim']
+V_HEAD_DIM = DEFAULT_MODEL_CONFIG['v_head_dim']
 
 
 def _parse_int_list(value: Optional[str]) -> Optional[list[int]]:
@@ -131,6 +143,7 @@ class CkptConvert:
         rotary_base: float = 50000.0,
         print_init_summary: bool = True,
         pp_workers: int = 1,
+        save_workers: int = 0,
         cast_dtype: str | None = None,
         tie_word_embeddings: bool | None = None,
         hf_io_threads: int = 1,
@@ -145,6 +158,7 @@ class CkptConvert:
                                                 '1') != '0'
         self.print_init_summary = print_init_summary
         self.pp_workers = int(pp_workers)
+        self.save_workers = int(save_workers)
         self.hf_io_threads = max(1, int(hf_io_threads))
         self.cast_dtype = cast_dtype
         self._target_dtype = _dtype_from_str(
@@ -386,20 +400,49 @@ class CkptConvert:
                 raise ValueError('moe-tp-extend-ep 需要 ep_size 能整除 tp_size')
 
     def _read_weight_map(self) -> dict[str, str]:
+        """Read weight map from HF model directory.
+        
+        Tries to load from index.json first, then falls back to single safetensors file.
+        
+        Returns:
+            Dictionary mapping tensor names to file names
+            
+        Raises:
+            FileNotFoundError: If neither index.json nor single safetensors file exists
+            json.JSONDecodeError: If index.json is malformed
+            RuntimeError: If there's an error reading the safetensors file
+        """
         index_path = os.path.join(self.hf_model_path,
                                   'model.safetensors.index.json')
         if os.path.isfile(index_path):
             if self.verbose:
                 logger.info('Using HF index: %s', index_path)
-            with open(index_path) as f:
-                return json.load(f)['weight_map']
+            try:
+                with open(index_path) as f:
+                    data = json.load(f)
+                    if 'weight_map' not in data:
+                        raise ValueError(
+                            f'Invalid index file: {index_path} missing "weight_map" key'
+                        )
+                    return data['weight_map']
+            except json.JSONDecodeError as e:
+                raise json.JSONDecodeError(
+                    f'Malformed index file {index_path}: {e}',
+                    e.doc,
+                    e.pos,
+                ) from e
 
         single = os.path.join(self.hf_model_path, 'model.safetensors')
         if os.path.isfile(single):
             if self.verbose:
                 logger.info('Using single HF safetensors: %s', single)
-            with safe_open(single, framework='pt', device='cpu') as f:
-                return {k: 'model.safetensors' for k in f.keys()}
+            try:
+                with safe_open(single, framework='pt', device='cpu') as f:
+                    return {k: 'model.safetensors' for k in f.keys()}
+            except Exception as e:
+                raise RuntimeError(
+                    f'Error reading safetensors file {single}: {e}'
+                ) from e
 
         raise FileNotFoundError(
             f'找不到 HF safetensors index 或单文件: {self.hf_model_path}')
@@ -518,12 +561,43 @@ class CkptConvert:
 
     def _load_safetensors_keys(self, filename: str,
                                keys: list[str]) -> dict[str, torch.Tensor]:
+        """Load specified keys from a safetensors file with error handling.
+        
+        Args:
+            filename: Name of the safetensors file
+            keys: List of tensor keys to load
+            
+        Returns:
+            Dictionary mapping keys to tensors
+            
+        Raises:
+            FileNotFoundError: If the file doesn't exist
+            KeyError: If a requested key is not found in the file
+            RuntimeError: If there's an error reading the file
+        """
         path = os.path.join(self.hf_model_path, filename)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'Safetensors file not found: {path}')
+        
         out: dict[str, torch.Tensor] = {}
         t0 = time.time()
-        with safe_open(path, framework='pt', device='cpu') as f:
-            for k in keys:
-                out[k] = f.get_tensor(k)
+        try:
+            with safe_open(path, framework='pt', device='cpu') as f:
+                available_keys = set(f.keys())
+                for k in keys:
+                    if k not in available_keys:
+                        raise KeyError(
+                            f'Tensor "{k}" not found in {filename}. '
+                            f'Available keys: {list(available_keys)[:10]}...'
+                        )
+                    out[k] = f.get_tensor(k)
+        except Exception as e:
+            if isinstance(e, (FileNotFoundError, KeyError)):
+                raise
+            raise RuntimeError(
+                f'Error reading safetensors file {filename}: {e}'
+            ) from e
+        
         if self.log_file_load:
             dt = time.time() - t0
             logger.info('Loaded %d tensors from %s (%.2fs)', len(keys),
@@ -671,6 +745,27 @@ class CkptConvert:
                 mg_model[ep_rank][tp_rank][
                     f'decoder.layers.{local_layer_idx}.pre_mlp_layernorm.weight'] = post_norm
 
+    def _validate_attention_config(self) -> None:
+        """Validate attention-related configuration parameters.
+        
+        Raises:
+            ValueError: If any configuration parameter is invalid
+        """
+        if self.num_key_value_heads is None:
+            raise ValueError(
+                'num_key_value_heads is required for HF->Megatron QKV conversion'
+            )
+        if self.num_key_value_heads <= 0:
+            raise ValueError('num_key_value_heads must be > 0')
+        if self.num_attention_heads % self.tp_size != 0:
+            raise ValueError(
+                f'num_attention_heads={self.num_attention_heads} must be divisible by tp_size={self.tp_size}'
+            )
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                f'num_attention_heads={self.num_attention_heads} must be divisible by num_key_value_heads={self.num_key_value_heads}'
+            )
+
     def _set_layer_attn(
         self,
         hf_layer: int,
@@ -704,20 +799,7 @@ class CkptConvert:
         q_norm_key = f'{prefix}.q_layernorm.weight'
         k_norm_key = f'{prefix}.k_layernorm.weight'
 
-        if self.num_key_value_heads is None:
-            raise ValueError(
-                'num_key_value_heads is required for HF->Megatron QKV conversion'
-            )
-        if self.num_key_value_heads <= 0:
-            raise ValueError('num_key_value_heads must be > 0')
-        if self.num_attention_heads % self.tp_size != 0:
-            raise ValueError(
-                f'num_attention_heads={self.num_attention_heads} must be divisible by tp_size={self.tp_size}'
-            )
-        if self.num_attention_heads % self.num_key_value_heads != 0:
-            raise ValueError(
-                f'num_attention_heads={self.num_attention_heads} must be divisible by num_key_value_heads={self.num_key_value_heads}'
-            )
+        self._validate_attention_config()
 
         expected_q_head_dim = self.qk_head_dim + self.qk_pos_emb_head_dim
         expected_q_rows = self.num_attention_heads * expected_q_head_dim
@@ -1047,13 +1129,59 @@ class CkptConvert:
             return d
         return {k: self._maybe_cast(v) for k, v in d.items()}
 
+    def _save_single_rank_file(
+        self,
+        pp_rank: int,
+        tp_rank: int,
+        ep_rank: int,
+        mg_model: Union[dict[int, dict[int, dict[str, torch.Tensor]]],
+                        dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]]],
+        vpp: bool,
+    ) -> None:
+        """保存单个 rank 的文件（线程安全版本）"""
+        prefix = _mp_prefix(tp_rank, pp_rank, ep_rank, self.tp_size,
+                            self.pp_size, self.ep_size)
+        outdir = os.path.join(self.iter_path, prefix)
+        outpath = os.path.join(outdir, 'model_optim_rng.pt')
+
+        if vpp:
+            payload = {
+                'model0':
+                self._cast_model_dict(mg_model[0][ep_rank][tp_rank]),
+                'model1':
+                self._cast_model_dict(mg_model[1][ep_rank][tp_rank]),
+                'checkpoint_version':
+                3.0,
+                'iteration':
+                1,
+                'args': {
+                    'rotary_base': self.rotary_base
+                },
+            }
+        else:
+            payload = {
+                'model':
+                self._cast_model_dict(mg_model[ep_rank][tp_rank]),
+                'checkpoint_version': 3.0,
+                'iteration': 1,
+                'args': {
+                    'rotary_base': self.rotary_base
+                },
+            }
+
+        torch.save(payload,
+                   outpath,
+                   pickle_protocol=4,
+                   _use_new_zipfile_serialization=True)
+
     def _save_pp_rank(
         self,
         pp_rank: int,
-        mg_model: dict[int, dict[int, dict[str, torch.Tensor]]]
-        | dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]],
+        mg_model: Union[dict[int, dict[int, dict[str, torch.Tensor]]],
+                        dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]]],
         vpp: bool,
     ) -> None:
+        """保存一个 PP rank 的所有权重文件，使用线程池并行化 EP×TP 保存"""
         t0 = time.time()
         if self.log_save_progress:
             logger.info(
@@ -1062,55 +1190,74 @@ class CkptConvert:
                 str(vpp),
                 self.iter_path,
             )
-        saved = 0
-        total = self.ep_size * self.tp_size
-        if self.moe_tp_extend_ep:
-            total = self.ep_size
+
+        # 生成所有要保存的 rank 组合
+        rank_tasks = []
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
-                if self.moe_tp_extend_ep and (ep_rank %
-                                              self.tp_size) != tp_rank:
+                if self.moe_tp_extend_ep and (ep_rank % self.tp_size) != tp_rank:
                     continue
-                prefix = _mp_prefix(tp_rank, pp_rank, ep_rank, self.tp_size,
-                                    self.pp_size, self.ep_size)
-                outdir = os.path.join(self.iter_path, prefix)
-                os.makedirs(outdir, exist_ok=True)
-                outpath = os.path.join(outdir, 'model_optim_rng.pt')
-                if vpp:
-                    payload = {
-                        'model0':
-                        self._cast_model_dict(mg_model[0][ep_rank][tp_rank]),
-                        'model1':
-                        self._cast_model_dict(mg_model[1][ep_rank][tp_rank]),
-                        'checkpoint_version':
-                        3.0,
-                        'iteration':
-                        1,
-                        'args': {
-                            'rotary_base': self.rotary_base
-                        },
-                    }
-                else:
-                    payload = {
-                        'model':
-                        self._cast_model_dict(mg_model[ep_rank][tp_rank]),
-                        'checkpoint_version': 3.0,
-                        'iteration': 1,
-                        'args': {
-                            'rotary_base': self.rotary_base
-                        },
-                    }
-                torch.save(payload,
-                           outpath,
-                           pickle_protocol=4,
-                           _use_new_zipfile_serialization=True)
-                saved += 1
-            if self.log_save_progress:
-                logger.info('Saved pp=%d ep=%d (%d/%d ranks)', int(pp_rank),
-                            int(ep_rank), int(saved), int(total))
+                rank_tasks.append((tp_rank, ep_rank))
+
+        # 预先创建所有输出目录（避免多线程同时创建导致的竞态条件）
+        for tp_rank, ep_rank in rank_tasks:
+            prefix = _mp_prefix(tp_rank, pp_rank, ep_rank, self.tp_size,
+                                self.pp_size, self.ep_size)
+            outdir = os.path.join(self.iter_path, prefix)
+            os.makedirs(outdir, exist_ok=True)
+
+        total_tasks = len(rank_tasks)
+        completed = 0
+
+        # 使用线程池并行保存
+        max_save_workers = min(self.ep_size * self.tp_size, 32)  # 限制最大线程数
+        if self.log_save_progress:
+            logger.info('Parallel saving: %d tasks with max %d workers',
+                        total_tasks, max_save_workers)
+
+        # 为了向后兼容，检查是否有保存线程数的环境变量
+        save_workers = int(os.environ.get('CKPT_CONVERT_SAVE_WORKERS', str(max_save_workers)))
+        save_workers = min(save_workers, max_save_workers)
+
+        if save_workers <= 1:
+            # 串行保存模式（向后兼容）
+            for tp_rank, ep_rank in rank_tasks:
+                self._save_single_rank_file(pp_rank, tp_rank, ep_rank, mg_model, vpp)
+                completed += 1
+                if self.log_save_progress and completed % 10 == 0:
+                    logger.info('Saved pp=%d progress: %d/%d', int(pp_rank),
+                                int(completed), int(total_tasks))
+        else:
+            # 并行保存模式
+            with ThreadPoolExecutor(max_workers=save_workers) as executor:
+                # 提交所有任务
+                future_to_rank = {}
+                for tp_rank, ep_rank in rank_tasks:
+                    future = executor.submit(
+                        self._save_single_rank_file,
+                        pp_rank, tp_rank, ep_rank, mg_model, vpp
+                    )
+                    future_to_rank[future] = (tp_rank, ep_rank)
+
+                # 等待任务完成并更新进度
+                for future in as_completed(future_to_rank):
+                    tp_rank, ep_rank = future_to_rank[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error('Error saving pp=%d tp=%d ep=%d: %s',
+                                     int(pp_rank), int(tp_rank), int(ep_rank), str(e))
+                        raise
+
+                    completed += 1
+                    if self.log_save_progress and completed % 10 == 0:
+                        logger.info('Saved pp=%d progress: %d/%d', int(pp_rank),
+                                    int(completed), int(total_tasks))
+
         if self.log_save_progress:
             dt = time.time() - t0
-            logger.info('Saved pp=%d done (%.2fs)', int(pp_rank), dt)
+            logger.info('Saved pp=%d done: %d files in %.2fs (%.2f files/s)',
+                        int(pp_rank), int(total_tasks), dt, total_tasks / max(dt, 0.01))
 
     def run(self) -> None:
         workers = int(self.pp_workers)
@@ -1149,6 +1296,7 @@ class CkptConvert:
             rotary_base=self.rotary_base,
             print_init_summary=False,
             pp_workers=1,
+            save_workers=self.save_workers,
             cast_dtype=self.cast_dtype,
             tie_word_embeddings=self.tie_word_embeddings,
             hf_io_threads=self.hf_io_threads,
@@ -1308,6 +1456,10 @@ def get_args():
                         type=int,
                         default=1,
                         help='Parallelize by pp_rank with processes.')
+    parser.add_argument('--save-workers',
+                        type=int,
+                        default=0,
+                        help='Parallelize saving within each pp_rank with threads (0=auto).')
     parser.add_argument('--cast-dtype',
                         type=str,
                         default=None,
@@ -1400,6 +1552,7 @@ def main() -> None:
         qlora_nf4=args.qlora_nf4,
         rotary_base=rotary_base,
         pp_workers=args.pp_workers,
+        save_workers=args.save_workers,
         cast_dtype=args.cast_dtype,
         tie_word_embeddings=tie_word_embeddings,
         qk_layernorm=args.qk_layernorm,
