@@ -16,13 +16,14 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 # 可通过 MOE_TP_EXTEND_EP=0 禁用
 export MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-1}"
 
+REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
+
 # 检查 REPO_ROOT 是否有效
 if [[ ! -d "${REPO_ROOT}" ]]; then
   echo "ERROR: REPO_ROOT does not exist: ${REPO_ROOT}" >&2
   exit 1
 fi
 
-REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf}"
 SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf2mcore_iter900}"
 
@@ -44,6 +45,7 @@ PP="${PP:-8}"
 EP="${EP:-64}"
 PP_WORKERS="${PP_WORKERS:-2}"
 IO_THREADS="${IO_THREADS:-2}"
+SAVE_WORKERS="${SAVE_WORKERS:-0}"
 CAST_DTYPE="${CAST_DTYPE:-bf16}"
 NUM_LAYERS="${NUM_LAYERS:-32}"
 FIRST_K_DENSE_REPLACE="${FIRST_K_DENSE_REPLACE:-2}"
@@ -126,6 +128,7 @@ echo "Starting conversion..."
 echo "  LOAD_DIR: ${LOAD_DIR}"
 echo "  SAVE_DIR: ${SAVE_DIR}"
 echo "  TP=${TP}, PP=${PP}, EP=${EP}"
+echo "  PP_WORKERS=${PP_WORKERS}, SAVE_WORKERS=${SAVE_WORKERS}"
 echo "  MOE_TP_EXTEND_EP=${MOE_TP_EXTEND_EP:-0}"
 echo ""
 
@@ -138,6 +141,7 @@ python "${CONVERT_SCRIPT}" \
   --target-pipeline-parallel-size "${PP}" \
   --target-expert-parallel-size "${EP}" \
   --pp-workers "${PP_WORKERS}" \
+  --save-workers "${SAVE_WORKERS}" \
   --hf-io-threads "${IO_THREADS}" \
   --moe-grouped-gemm \
   --rotary-base "${ROTARY_BASE}" \
