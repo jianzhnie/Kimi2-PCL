@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    workload: deepseek-vllm-ascend-sample
+  name: deepseek-vllm-ascend-sample
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      workload: deepseek-vllm-ascend-sample
+  template:
+    metadata:
+      labels:
+        workload: deepseek-vllm-ascend-sample
+    spec:
+      containers:
+      - command:
+        - bash
+        - -c
+        - sleep infinity
+        env:
+        - name: LOCAL_MODELS_CACHE
+          value: /models_local_cache
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        image: kcscis-a7cd2a69.ecis.zhengzhou-2.cmecloud.cn/ecloud/vllm-ascend:v0.14.0rc1
+        imagePullPolicy: Always
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - /bin/bash
+              - -c
+              - cp /usr/local/Ascend/driver/lib64/common/* /lib/ && cp /usr/local/Ascend/driver/lib64/driver/*
+                /lib/
+        name: deepseek
+        resources:
+          limits:
+            github.com/fuse: "1"
+            huawei.com/Ascend910: "8"
+          requests:
+            github.com/fuse: "1"
+            huawei.com/Ascend910: "8"
+        securityContext:
+          capabilities:
+            add:
+            - SYS_ADMIN
+        volumeMounts:
+        - mountPath: /models_local_cache
+          name: localcache
+        - mountPath: /usr/local/Ascend/driver
+          name: driver
+        - mountPath: /usr/local/Ascend/add-ons/
+          name: ascend-add-ons
+        - mountPath: /usr/local/sbin/npu-smi
+          name: npu-smi
+        - mountPath: /usr/local/sbin/
+          name: sbin
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /etc/hccn.conf
+          name: hccn
+      volumes:
+      - hostPath:
+          path: /var/lib/paascontainer/models
+          type: DirectoryOrCreate
+        name: localcache
+      - hostPath:
+          path: /usr/local/Ascend/driver
+          type: ""
+        name: driver
+      - hostPath:
+          path: /usr/local/Ascend/add-ons
+          type: ""
+        name: ascend-add-ons
+      - hostPath:
+          path: /usr/local/sbin/npu-smi
+          type: File
+        name: npu-smi
+      - hostPath:
+          path: /usr/local/sbin/
+          type: ""
+        name: sbin
+      - emptyDir:
+          medium: Memory
+          sizeLimit: 100Gi
+        name: dshm
+      - hostPath:
+          path: /etc/hccn.conf
+          type: File
+        name: hccn
