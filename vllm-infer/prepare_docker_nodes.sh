@@ -107,6 +107,11 @@ _remote_prepare_node() {
     echo "[WARN] Failed to start Docker via systemctl, trying to check Docker status..." >&2
   }
 
+  # 停止并删除所有已存在的容器
+  echo "[INFO] Stopping and removing all existing containers..."
+  docker ps -aq 2>/dev/null | xargs -r docker stop 2>/dev/null || true
+  docker ps -aq 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+
   if docker image inspect "${image_name}" >/dev/null 2>&1; then
     : # 镜像已存在
   else
