@@ -28,6 +28,20 @@ export VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${SCRIPT_DIR}/vllm_model_server.s
 # ------------------------------------------
 # 3. Ray 与 vLLM 配置
 # ------------------------------------------
+# 启用快速模式
+export RAY_FAST_MODE=1
+
+# 减少等待时间
+export RAY_WAIT_TIME=0
+
+# 并行任务数（根据节点数调整）
+export RAY_PARALLEL_JOBS=16
+
+# 端口搜索范围（减少可加速）
+export RAY_PORT_RANGE=20
+
+# 禁用 SSH 复用（如有问题）
+export RAY_SSH_MUX=0
 export RAY_PORT="${RAY_PORT:-6379}"
 export RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8266}"
 export VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
