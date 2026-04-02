@@ -26,6 +26,7 @@ docker run -d \
     --net=host \
     --ulimit memlock=-1 \
     --ulimit stack=67108864 \
+    --privileged=true \
     --device=/dev/davinci0 \
     --device=/dev/davinci1 \
     --device=/dev/davinci2 \

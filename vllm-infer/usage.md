@@ -149,18 +149,8 @@ docker exec -it vllm-ascend-env-a3 /bin/bash
 在容器内启动 vLLM 推理服务：
 
 ```bash
-bash /llm_workspace_1P/robin/Kimi2-PCL/vllm-infer/vllm_model_server.sh
-```
-
-或通过环境变量自定义参数：
-
-```bash
-# 使用自定义模型路径和参数
-MODEL_PATH=/path/to/model \
-TENSOR_PARALLEL_SIZE=8 \
-PIPELINE_PARALLEL_SIZE=8 \
-MAX_MODEL_LEN=32768 \
-bash vllm_model_server.sh
+cd /llm_workspace_1P/robin/Kimi2-PCL/vllm-infer
+bash run_vllm_test.sh
 ```
 
 ---

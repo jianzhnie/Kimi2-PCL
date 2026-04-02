@@ -31,23 +31,57 @@ log_err()  { echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $*" >&2; }
 usage() {
   cat <<'USAGE'
 Usage:
-  bash prepare_docker_nodes.sh [OPTIONS]
+  bash prepare_docker_nodes.sh [start|stop] [OPTIONS]
 
 Description:
   该脚本用于在集群节点上准备 Docker 容器环境。
   环境变量请在同目录下的 set_env.sh 中配置。
 
 Options:
-  -h, --help       显示帮助信息
+  -h, --help           显示帮助信息
+  -a, --action <start|stop>
+                       start: 优雅停止并清理旧容器，加载镜像并启动新容器（默认）
+                       stop:  仅优雅停止并清理旧容器，不启动新容器
 USAGE
 }
 
 # ------------------------------------------
 # 参数解析
 # ------------------------------------------
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+ACTION="start"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -a|--action)
+      if [[ -n "${2:-}" && "${2:-}" != -* ]]; then
+        ACTION="$2"
+        shift 2
+      else
+        log_err "选项 $1 需要一个参数: start 或 stop"
+        usage
+        exit 1
+      fi
+      ;;
+    start|stop)
+      ACTION="$1"
+      shift
+      ;;
+    *)
+      log_err "未知参数: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ "$ACTION" != "start" && "$ACTION" != "stop" ]]; then
+  log_err "动作参数必须是 start 或 stop，当前值: $ACTION"
   usage
-  exit 0
+  exit 1
 fi
 
 # ------------------------------------------
@@ -94,6 +128,7 @@ _remote_prepare_node() {
   local image_tar="$2"
   local run_container_script="$3"
   local container_name="$4"
+  local action="${5:-start}"
 
   set -euo pipefail
   if ! command -v docker >/dev/null 2>&1; then
@@ -107,36 +142,41 @@ _remote_prepare_node() {
     echo "[WARN] Failed to start Docker via systemctl, trying to check Docker status..." >&2
   }
 
-  # 停止并删除所有已存在的容器
+  # 优雅 stop & kill 并删除所有已存在的容器
   echo "[INFO] Stopping and removing all existing containers..."
   docker ps -aq 2>/dev/null | xargs -r docker stop 2>/dev/null || true
+  docker ps -aq 2>/dev/null | xargs -r docker kill 2>/dev/null || true
   docker ps -aq 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
 
-  if docker image inspect "${image_name}" >/dev/null 2>&1; then
-    : # 镜像已存在
-  else
-    if [ ! -f "${image_tar}" ]; then
-      echo "[ERROR] image tar not found: ${image_tar}" >&2
+  if [[ "$action" == "start" ]]; then
+    if docker image inspect "${image_name}" >/dev/null 2>&1; then
+      : # 镜像已存在
+    else
+      if [ ! -f "${image_tar}" ]; then
+        echo "[ERROR] image tar not found: ${image_tar}" >&2
+        exit 2
+      fi
+      echo "[INFO] Loading image from ${image_tar}..."
+      docker load -i "${image_tar}"
+    fi
+
+    if [ ! -f "${run_container_script}" ]; then
+      echo "[ERROR] run script not found: ${run_container_script}" >&2
       exit 2
     fi
-    echo "[INFO] Loading image from ${image_tar}..."
-    docker load -i "${image_tar}"
-  fi
 
-  if [ ! -f "${run_container_script}" ]; then
-    echo "[ERROR] run script not found: ${run_container_script}" >&2
-    exit 2
-  fi
+    export IMAGE_NAME="${image_name}"
+    export CONTAINER_NAME="${container_name}"
+    bash "${run_container_script}"
 
-  export IMAGE_NAME="${image_name}"
-  export CONTAINER_NAME="${container_name}"
-  bash "${run_container_script}"
-
-  if docker ps --format '{{.Names}}' | grep -Fx "${container_name}" >/dev/null; then
-    echo "[INFO] Container ready: ${container_name}"
+    if docker ps --format '{{.Names}}' | grep -Fx "${container_name}" >/dev/null; then
+      echo "[INFO] Container ready: ${container_name}"
+    else
+      echo "[ERROR] Failed to start container: ${container_name}" >&2
+      exit 1
+    fi
   else
-    echo "[ERROR] Failed to start container: ${container_name}" >&2
-    exit 1
+    echo "[INFO] Action is 'stop', skipping image load and container start."
   fi
 }
 
@@ -150,7 +190,7 @@ prepare_node() {
 
   local func_code call_code
   func_code="$(declare -f _remote_prepare_node)"
-  call_code="_remote_prepare_node '${IMAGE_NAME}' '${IMAGE_TAR}' '${RUN_CONTAINER_SCRIPT}' '${CONTAINER_NAME}'"
+  call_code="_remote_prepare_node '${IMAGE_NAME}' '${IMAGE_TAR}' '${RUN_CONTAINER_SCRIPT}' '${CONTAINER_NAME}' '${ACTION}'"
 
   # prepare_node 在宿主机执行，不需要进容器
   if ! echo "${func_code}; ${call_code}" | ssh_run "$node" bash -lc "bash -s"; then
@@ -171,6 +211,7 @@ if [[ -z "$nodes" ]]; then
 fi
 
 log_info "目标节点列表: $(echo $nodes | tr '\n' ' ')"
+log_info "动作模式: ${ACTION}"
 log_info "=== 开始准备节点 ==="
 
 for node in $nodes; do

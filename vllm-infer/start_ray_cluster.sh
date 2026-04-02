@@ -113,7 +113,10 @@ _remote_start_ray_head() {
         --dashboard-host=0.0.0.0 \
         --dashboard-port="${dashboard_port}" \
         --num-gpus="${npus}" \
-        --resources="${resources_json}"
+        --resources="${resources_json}" \
+        --metrics-export-port=50000 \
+        --min-worker-port=40000 \
+        --max-worker-port=49999
 }
 
 _remote_start_ray_worker() {
@@ -133,7 +136,10 @@ _remote_start_ray_worker() {
     ray start --address "${master_addr}:${port}" \
         ${node_ip_flag} \
         --num-gpus="${npus}" \
-        --resources="${resources_json}"
+        --resources="${resources_json}" \
+        --metrics-export-port=50000 \
+        --min-worker-port=40000 \
+        --max-worker-port=49999
 }
 
 # 包装器：将本地函数发送到远端执行，并预先 source 环境配置

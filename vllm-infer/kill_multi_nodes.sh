@@ -167,8 +167,10 @@ escape_regex() {
 # 并发数控制
 limit_jobs() {
     local max="$1"
-    while [[ "$(jobs -rp | wc -l)" -ge "$max" ]]; do
-        wait -n 2>/dev/null || sleep 0.1
+    while [[ "$(jobs -rp 2>/dev/null | wc -l)" -ge "$max" ]]; do
+        # 使用 wait -n 等待任意一个作业完成，忽略中断信号
+        wait -n 2>/dev/null || true
+        sleep 0.1
     done
 }
 
@@ -477,35 +479,51 @@ declare -i SUCCESS_COUNT=0
 declare -i FAILED_COUNT=0
 declare -i TIMEOUT_COUNT=0
 
+# 创建临时目录和文件
+TMP_LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kill_nodes_$$.XXXXXX")
+export TMP_LOG_DIR
+
+# 为每个节点创建独立的日志文件以避免竞争
 for node in "${NODES[@]}"; do
     [[ -z "$node" ]] && continue
     limit_jobs "$MAX_JOBS"
     
+    # 使用独立的日志文件避免竞争
+    local_log="${TMP_LOG_DIR}/${node}.log"
+    
     # 使用子 shell 捕获每个节点的结果
     (
-        if kill_processes_on_node "$node" "$DRY_RUN" "$QUIET"; then
-            echo "RESULT:$node:success" >> "${TMPDIR:-/tmp}/kill_nodes_$$.log"
-        elif [[ $? -eq 124 ]]; then
-            echo "RESULT:$node:timeout" >> "${TMPDIR:-/tmp}/kill_nodes_$$.log"
+        set +e
+        kill_processes_on_node "$node" "$DRY_RUN" "$QUIET"
+        exit_code=$?
+        if [[ $exit_code -eq 0 ]]; then
+            echo "RESULT:$node:success" > "$local_log"
+        elif [[ $exit_code -eq 124 ]]; then
+            echo "RESULT:$node:timeout" > "$local_log"
         else
-            echo "RESULT:$node:failed" >> "${TMPDIR:-/tmp}/kill_nodes_$$.log"
+            echo "RESULT:$node:failed" > "$local_log"
         fi
     ) &
 done
 
-# 等待所有后台任务完成
+# 等待所有后台任务完成（禁用 ERR 陷阱避免被信号中断）
+set +e
 wait
+set -e
 
 # 统计结果
-if [[ -f "${TMPDIR:-/tmp}/kill_nodes_$$.log" ]]; then
-    while IFS=: read -r _ node status; do
-        case $status in
-            success) ((SUCCESS_COUNT++)) ;;
-            timeout) ((TIMEOUT_COUNT++)); TIMEOUT_NODES+=("$node") ;;
-            failed) ((FAILED_COUNT++)); FAILED_NODES+=("$node") ;;
-        esac
-    done < "${TMPDIR:-/tmp}/kill_nodes_$$.log"
-    rm -f "${TMPDIR:-/tmp}/kill_nodes_$$.log"
+if [[ -d "$TMP_LOG_DIR" ]]; then
+    for log_file in "$TMP_LOG_DIR"/*.log; do
+        [[ -f "$log_file" ]] || continue
+        while IFS=: read -r _ node status; do
+            case $status in
+                success) ((SUCCESS_COUNT++)) ;;
+                timeout) ((TIMEOUT_COUNT++)); TIMEOUT_NODES+=("$node") ;;
+                failed) ((FAILED_COUNT++)); FAILED_NODES+=("$node") ;;
+            esac
+        done < "$log_file"
+    done
+    rm -rf "$TMP_LOG_DIR"
 fi
 
 # 输出汇总
