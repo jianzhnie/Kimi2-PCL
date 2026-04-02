@@ -44,9 +44,11 @@ if [ -f "/usr/local/Ascend/ascend-toolkit/set_env.sh" ]; then
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
 fi
 
-if [ -f "/usr/local/Ascend/nnal/atb/set_env.sh" ]; then
-    source /usr/local/Ascend/nnal/atb/set_env.sh
-fi
+# if [ -f "/usr/local/Ascend/nnal/atb/set_env.sh" ]; then
+#     source /usr/local/Ascend/nnal/atb/set_env.sh
+# fi
+
+source /llm_workspace_1P/expert_monitor/ATB/ascend-transformer-boost-master/output/atb/set_env.sh
 
 # 恢复 set -u 检查 (如果原来是开启状态)
 # 但通常 set_env.sh 被 source 时，我们确保接下来的脚本继续保持严格模式
