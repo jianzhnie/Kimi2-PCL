@@ -20,7 +20,7 @@
 #   export SKIP_ENV_CHECK=1          # 跳过 SSH 连通性检查
 #
 # 使用方法:
-#   ./deploy_deepseek_v3.2_multinode.sh
+#   ./deploy_vllm_multinode.sh
 #
 # 前置条件:
 #   - 各节点之间 SSH 免密登录已配置
@@ -52,9 +52,12 @@ export DP_RPC_PORT="${DP_RPC_PORT:-12890}"
 # 分布式并行配置 (参考 vllm_model_server.sh)
 export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-8}"
 export PIPELINE_PARALLEL_SIZE="${PIPELINE_PARALLEL_SIZE:-8}"
+# export DISTRIBUTED_EXECUTOR_BACKEND="${DISTRIBUTED_EXECUTOR_BACKEND:-ray}"
 export ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-1}"
 export EXPERT_PARALLEL_SIZE="${EXPERT_PARALLEL_SIZE:-$((TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE))}"
 
+# A2 每节点 8 卡
+NPUS_PER_NODE=8
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
@@ -97,7 +100,35 @@ log_info "Loaded ${TOTAL_NODES} nodes from ${NODE_LIST_FILE}"
 log_info "Master node: ${NODE0}"
 
 # ------------------------------------------------------------------------------
-# 3. 获取节点 IP
+# 3. 配置合法性检查
+# ------------------------------------------------------------------------------
+TOTAL_CARDS=$((TOTAL_NODES * NPUS_PER_NODE))
+CARDS_PER_INSTANCE=$((TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE))
+
+if [[ ${CARDS_PER_INSTANCE} -eq 0 ]]; then
+    log_fatal "Invalid config: TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE = 0"
+fi
+
+if [[ $((TOTAL_CARDS % CARDS_PER_INSTANCE)) -ne 0 ]]; then
+    log_fatal "Card mismatch: TOTAL_CARDS (${TOTAL_CARDS}) is not divisible by CARDS_PER_INSTANCE (${CARDS_PER_INSTANCE}). Please adjust TP/PP."
+fi
+
+DP_SIZE=$((TOTAL_CARDS / CARDS_PER_INSTANCE))
+
+if [[ ${DP_SIZE} -lt 1 ]]; then
+    log_fatal "Invalid config: DP_SIZE (${DP_SIZE}) must be >= 1. Please reduce TP or PP."
+fi
+
+if [[ ${CARDS_PER_INSTANCE} -le ${NPUS_PER_NODE} ]]; then
+    DP_SIZE_LOCAL=$((NPUS_PER_NODE / CARDS_PER_INSTANCE))
+else
+    DP_SIZE_LOCAL=1
+fi
+
+log_info "Config check passed: TOTAL_CARDS=${TOTAL_CARDS}, TP=${TENSOR_PARALLEL_SIZE}, PP=${PIPELINE_PARALLEL_SIZE}, DP=${DP_SIZE}, DP_LOCAL=${DP_SIZE_LOCAL}"
+
+# ------------------------------------------------------------------------------
+# 4. 获取节点 IP
 # ------------------------------------------------------------------------------
 get_node_ip() {
     local node=$1
@@ -132,7 +163,7 @@ fi
 log_info "Node0 IP (DP master): ${NODE0_IP}"
 
 # ------------------------------------------------------------------------------
-# 4. SSH 连通性检查
+# 5. SSH 连通性检查
 # ------------------------------------------------------------------------------
 if [[ "${SKIP_ENV_CHECK}" != "true" && "${DRY_RUN}" != "true" && "${DRY_RUN}" != "1" ]]; then
     log_info "Checking SSH connectivity..."
@@ -148,7 +179,7 @@ if [[ "${SKIP_ENV_CHECK}" != "true" && "${DRY_RUN}" != "true" && "${DRY_RUN}" !=
 fi
 
 # ------------------------------------------------------------------------------
-# 5. vLLM 参数探测函数 (参考 vllm_model_server.sh)
+# 6. vLLM 参数探测函数 (参考 vllm_model_server.sh)
 # ------------------------------------------------------------------------------
 vllm_help() {
     vllm serve --help 2>/dev/null || true
@@ -176,7 +207,7 @@ has_flag() {
 }
 
 # ------------------------------------------------------------------------------
-# 6. 环境变量导出字符串构建
+# 7. 环境变量导出字符串构建
 # ------------------------------------------------------------------------------
 build_env_exports() {
     local local_ip=$1
@@ -198,12 +229,12 @@ build_env_exports() {
 }
 
 # ------------------------------------------------------------------------------
-# 7. 构建 vLLM 启动参数 (参考 vllm_model_server.sh 的分块构建方式)
+# 8. 构建 vLLM 启动参数 (参考 vllm_model_server.sh 的分块构建方式)
 # ------------------------------------------------------------------------------
 build_vllm_args_declare() {
     local is_headless="$1"
     local node_idx="$2"
-    local total_nodes="$3"
+    local dp_start_rank="$3"
     local node0_ip="$4"
 
     local tp_size="${TENSOR_PARALLEL_SIZE}"
@@ -219,8 +250,8 @@ build_vllm_args_declare() {
     args+=(--seed 1024)
     args+=(--tensor-parallel-size "${tp_size}")
     args+=(--pipeline-parallel-size "${pp_size}")
-    args+=(--data-parallel-size "${total_nodes}")
-    args+=(--data-parallel-size-local 1)
+    args+=(--data-parallel-size "${DP_SIZE}")
+    args+=(--data-parallel-size-local "${DP_SIZE_LOCAL}")
     args+=(--data-parallel-address "${node0_ip}")
     args+=(--data-parallel-rpc-port "${DP_RPC_PORT}")
     args+=(--max-num-seqs "${MAX_NUM_SEQS}")
@@ -231,7 +262,7 @@ build_vllm_args_declare() {
 
     if [[ "${is_headless}" == "true" ]]; then
         args+=(--headless)
-        args+=(--data-parallel-start-rank "${node_idx}")
+        args+=(--data-parallel-start-rank "${dp_start_rank}")
     fi
 
     # A2  compilation-config
@@ -293,7 +324,7 @@ build_vllm_args_declare() {
 }
 
 # ------------------------------------------------------------------------------
-# 8. 标准多节点部署
+# 9. 标准多节点部署
 # ------------------------------------------------------------------------------
 deploy_standard() {
     local tp_size="${TENSOR_PARALLEL_SIZE}"
@@ -302,7 +333,7 @@ deploy_standard() {
 
     log_info "============================================================"
     log_info "Standard Multi-Node Deployment (A2)"
-    log_info "Nodes: ${TOTAL_NODES} | DP: ${TOTAL_NODES} | TP: ${tp_size} | PP: ${pp_size} | EP: ${ep_size}"
+    log_info "Nodes: ${TOTAL_NODES} | DP: ${DP_SIZE} | TP: ${tp_size} | PP: ${pp_size} | EP: ${ep_size}"
     log_info "============================================================"
 
     local idx=0
@@ -316,8 +347,10 @@ deploy_standard() {
             is_headless="true"
         fi
 
+        local dp_start_rank=$((idx * NPUS_PER_NODE / CARDS_PER_INSTANCE))
+
         local array_decl
-        array_decl=$(build_vllm_args_declare "${is_headless}" "${idx}" "${TOTAL_NODES}" "${NODE0_IP}")
+        array_decl=$(build_vllm_args_declare "${is_headless}" "${idx}" "${dp_start_rank}" "${NODE0_IP}")
 
         local env_exports
         env_exports=$(build_env_exports "${local_ip}")
@@ -340,7 +373,7 @@ deploy_standard() {
 }
 
 # ------------------------------------------------------------------------------
-# 9. 主流程
+# 10. 主流程
 # ------------------------------------------------------------------------------
 deploy_standard
 
