@@ -3,10 +3,11 @@
 # DeepSeek-V3.2 Multi-Node Deployment Script for Ascend NPU
 # ==============================================================================
 # 基于 https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/DeepSeek-V3.2.html
+# 以及 https://docs.vllm.ai/en/stable/serving/parallelism_scaling/#running-vllm-with-multiprocessing
 #
 # 功能:
 #   1. 自动读取 node_list.txt 获取多节点列表
-#   2. 支持 A2 系列 Ascend NPU 的标准多节点部署
+#   2. 支持 A2 系列 Ascend NPU 的标准多节点部署 (Multiprocessing 后端)
 #   3. 自动配置网络环境变量 (HCCL/GLOO/TP 网卡绑定)
 #   4. 参考 vllm_model_server.sh 的命令构建方式, 清晰模块化
 #   5. 通过 SSH 在各节点并行启动 vllm-ascend 服务
@@ -44,15 +45,14 @@ DRY_RUN="${DRY_RUN:-false}"
 SKIP_ENV_CHECK="${SKIP_ENV_CHECK:-false}"
 
 # vLLM 模型与推理配置 (可通过环境变量覆盖)
-export MODEL_PATH="${MODEL_PATH:-/llm_workspace_1P/robin/hfhub/models/deepseek-ai/DeepSeek-V3.1}"
-export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-deepseek_v3_1}"
+export MODEL_PATH="${MODEL_PATH:-/llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base}"
+export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi_k2_base}"
 export VLLM_PORT="${VLLM_PORT:-8077}"
 export DP_RPC_PORT="${DP_RPC_PORT:-12890}"
 
 # 分布式并行配置 (参考 vllm_model_server.sh)
 export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-8}"
 export PIPELINE_PARALLEL_SIZE="${PIPELINE_PARALLEL_SIZE:-8}"
-export DISTRIBUTED_EXECUTOR_BACKEND="${DISTRIBUTED_EXECUTOR_BACKEND:-ray}"
 export ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-1}"
 export EXPERT_PARALLEL_SIZE="${EXPERT_PARALLEL_SIZE:-$((TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE))}"
 
@@ -91,8 +91,8 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
 done < "${NODE_LIST_FILE}"
 TOTAL_NODES=${#ALL_NODES[@]}
 
-if [[ ${TOTAL_NODES} -lt 2 ]]; then
-    log_fatal "Need at least 2 nodes for multi-node deployment, got ${TOTAL_NODES}"
+if [[ ${TOTAL_NODES} -lt 1 ]]; then
+    log_fatal "Need at least 1 node in ${NODE_LIST_FILE}"
 fi
 
 NODE0="${ALL_NODES[0]}"
@@ -125,7 +125,19 @@ else
     DP_SIZE_LOCAL=1
 fi
 
-log_info "Config check passed: TOTAL_CARDS=${TOTAL_CARDS}, TP=${TENSOR_PARALLEL_SIZE}, PP=${PIPELINE_PARALLEL_SIZE}, DP=${DP_SIZE}, DP_LOCAL=${DP_SIZE_LOCAL}"
+if [[ ${CARDS_PER_INSTANCE} -gt ${NPUS_PER_NODE} ]]; then
+    NODES_PER_INSTANCE=$((CARDS_PER_INSTANCE / NPUS_PER_NODE))
+    if [[ $((TOTAL_NODES % NODES_PER_INSTANCE)) -ne 0 ]]; then
+        log_fatal "Node mismatch: each instance needs ${NODES_PER_INSTANCE} nodes, but total nodes ${TOTAL_NODES} is not divisible."
+    fi
+    if [[ $((DP_SIZE * NODES_PER_INSTANCE)) -ne ${TOTAL_NODES} ]]; then
+        log_fatal "Config mismatch: DP_SIZE (${DP_SIZE}) * NODES_PER_INSTANCE (${NODES_PER_INSTANCE}) != TOTAL_NODES (${TOTAL_NODES})."
+    fi
+else
+    NODES_PER_INSTANCE=1
+fi
+
+log_info "Config check passed: TOTAL_CARDS=${TOTAL_CARDS}, TP=${TENSOR_PARALLEL_SIZE}, PP=${PIPELINE_PARALLEL_SIZE}, DP=${DP_SIZE}, DP_LOCAL=${DP_SIZE_LOCAL}, NODES_PER_INSTANCE=${NODES_PER_INSTANCE}"
 
 # ------------------------------------------------------------------------------
 # 4. 获取节点 IP
@@ -236,9 +248,13 @@ build_env_exports() {
 # ------------------------------------------------------------------------------
 build_vllm_args_declare() {
     local is_headless="$1"
-    local node_idx="$2"
+    local node_rank="$2"
     local dp_start_rank="$3"
-    local node0_ip="$4"
+    local dp_size_local="$4"
+    local master_addr="$5"
+    local nnodes="$6"
+    local vllm_port="$7"
+    local use_internal_dp="$8"
 
     local tp_size="${TENSOR_PARALLEL_SIZE}"
     local pp_size="${PIPELINE_PARALLEL_SIZE}"
@@ -247,26 +263,43 @@ build_vllm_args_declare() {
     local -a args=()
     args+=(serve "${MODEL_PATH}")
     args+=(--host 0.0.0.0)
-    args+=(--port "${VLLM_PORT}")
+    args+=(--port "${vllm_port}")
     args+=(--trust-remote-code)
     args+=(--served-model-name "${SERVED_MODEL_NAME}")
     args+=(--seed 1024)
     args+=(--tensor-parallel-size "${tp_size}")
     args+=(--pipeline-parallel-size "${pp_size}")
-    args+=(--data-parallel-size "${DP_SIZE}")
-    args+=(--data-parallel-size-local "${DP_SIZE_LOCAL}")
-    args+=(--data-parallel-address "${node0_ip}")
-    args+=(--data-parallel-rpc-port "${DP_RPC_PORT}")
+
+    # 多节点 Multiprocessing 参数
+    # 参考: https://docs.vllm.ai/en/stable/serving/parallelism_scaling/#running-vllm-with-multiprocessing
+    if [[ "${nnodes}" -gt 1 ]]; then
+        args+=(--distributed-executor-backend mp)
+        args+=(--nnodes "${nnodes}")
+        args+=(--node-rank "${node_rank}")
+        args+=(--master-addr "${master_addr}")
+    fi
+
+    # Data Parallel 参数（仅在单节点实例模式下使用内部 DP）
+    if [[ "${use_internal_dp}" == "true" && "${DP_SIZE}" -gt 1 ]]; then
+        args+=(--data-parallel-size "${DP_SIZE}")
+        args+=(--data-parallel-size-local "${dp_size_local}")
+        args+=(--data-parallel-address "${NODE0_IP}")
+        args+=(--data-parallel-rpc-port "${DP_RPC_PORT}")
+        if [[ "${is_headless}" == "true" ]]; then
+            args+=(--headless)
+            args+=(--data-parallel-start-rank "${dp_start_rank}")
+        fi
+    else
+        if [[ "${is_headless}" == "true" ]]; then
+            args+=(--headless)
+        fi
+    fi
+
     args+=(--max-num-seqs "${MAX_NUM_SEQS}")
     args+=(--max-model-len "${MAX_MODEL_LEN}")
     args+=(--max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}")
     args+=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
     args+=(--no-enable-prefix-caching)
-
-    if [[ "${is_headless}" == "true" ]]; then
-        args+=(--headless)
-        args+=(--data-parallel-start-rank "${dp_start_rank}")
-    fi
 
     # A2  compilation-config
     args+=(--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_capture_sizes":[8, 16, 24, 32, 40, 48]}')
@@ -327,7 +360,50 @@ build_vllm_args_declare() {
 }
 
 # ------------------------------------------------------------------------------
-# 9. 标准多节点部署
+# 9. 在远程节点启动 vLLM 的辅助函数
+# ------------------------------------------------------------------------------
+launch_on_node() {
+    local node="$1"
+    local local_ip="$2"
+    local is_headless="$3"
+    local node_rank="$4"
+    local dp_start_rank="$5"
+    local dp_size_local="$6"
+    local master_addr="$7"
+    local nnodes="$8"
+    local vllm_port="$9"
+    local use_internal_dp="${10}"
+
+    local array_decl
+    array_decl=$(build_vllm_args_declare "${is_headless}" "${node_rank}" "${dp_start_rank}" "${dp_size_local}" "${master_addr}" "${nnodes}" "${vllm_port}" "${use_internal_dp}")
+
+    local env_exports
+    env_exports=$(build_env_exports "${local_ip}")
+
+    # 容器内执行的命令
+    local inner_cmd
+    inner_cmd="export SCRIPT_DIR='${SCRIPT_DIR}' && cd '${SCRIPT_DIR}' && source set_vlm_env.sh"$'\n'"${env_exports}"$'\n'"${array_decl}"$'\n'"nohup vllm \"\${args[@]}\" > ${SCRIPT_DIR}/vllm_${node}_${vllm_port}.log 2>&1 &"$'\n'"echo PID:\$!"
+
+    # 远端宿主机命令：进入目录、source 环境变量、然后通过 docker exec 执行容器内命令
+    local ssh_cmd
+    ssh_cmd="export SCRIPT_DIR='${SCRIPT_DIR}' && cd '${SCRIPT_DIR}' && source set_vlm_env.sh && docker exec -i \${CONTAINER_NAME:-vllm-ascend-env-a3} bash -s"
+
+    log_info "Launching on ${node} (IP: ${local_ip}, port: ${vllm_port}, node_rank: ${node_rank}, headless: ${is_headless})..."
+    if [[ "${DRY_RUN}" == "true" || "${DRY_RUN}" == "1" ]]; then
+        echo "---------- Node: ${node} (host command) ----------"
+        echo "${ssh_cmd}"
+        echo "---------- Node: ${node} (container inner command) ----------"
+        echo "${inner_cmd}"
+        echo "-----------------------------------"
+    else
+        local pid
+        pid=$(echo "${inner_cmd}" | ssh ${SSH_OPTS} "${node}" "${ssh_cmd}")
+        log_info "Started vLLM on ${node}, PID=${pid}, log=${SCRIPT_DIR}/vllm_${node}_${vllm_port}.log"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# 10. 标准多节点部署
 # ------------------------------------------------------------------------------
 deploy_standard() {
     local tp_size="${TENSOR_PARALLEL_SIZE}"
@@ -335,55 +411,81 @@ deploy_standard() {
     local ep_size="${EXPERT_PARALLEL_SIZE}"
 
     log_info "============================================================"
-    log_info "Standard Multi-Node Deployment (A2)"
+    log_info "Standard Multi-Node Deployment (A2) via Multiprocessing"
     log_info "Nodes: ${TOTAL_NODES} | DP: ${DP_SIZE} | TP: ${tp_size} | PP: ${pp_size} | EP: ${ep_size}"
     log_info "============================================================"
 
-    local idx=0
-    for node in "${ALL_NODES[@]}"; do
-        local local_ip
-        local_ip=$(get_node_ip "${node}" "${NIC_NAME}")
-        [[ -n "${local_ip}" ]] || { log_warn "Skip ${node}: cannot detect IP on ${NIC_NAME}"; continue; }
+    if [[ ${CARDS_PER_INSTANCE} -gt ${NPUS_PER_NODE} ]]; then
+        # ----------------------------------------------------------------------
+        # 场景 A: 单个模型实例跨多个节点
+        # vLLM 内部 DP 模式不支持单个 DP engine 跨节点分布 TP/PP worker，
+        # 因此每个 DP 副本必须作为完全独立的 vLLM 实例启动，使用不同端口。
+        # 用户需要自行配置外部负载均衡（如 Nginx）分发请求到各实例 master。
+        # ----------------------------------------------------------------------
+        log_info "Mode: multi-node per instance (${NODES_PER_INSTANCE} nodes per instance, independent instances)"
 
-        local is_headless="false"
-        if [[ ${idx} -gt 0 ]]; then
-            is_headless="true"
+        if [[ ${DP_SIZE} -gt 1 ]]; then
+            log_warn "Internal DP is disabled because each instance spans multiple nodes."
+            log_warn "Please configure an external load balancer for ports ${VLLM_PORT}-$((VLLM_PORT + DP_SIZE - 1)) on master nodes."
         fi
 
-        local dp_start_rank=$((idx * NPUS_PER_NODE / CARDS_PER_INSTANCE))
+        for ((dp_idx = 0; dp_idx < DP_SIZE; dp_idx++)); do
+            local instance_start_node=$((dp_idx * NODES_PER_INSTANCE))
+            local instance_master_idx=${instance_start_node}
+            local instance_master_node="${ALL_NODES[$instance_master_idx]}"
+            local instance_master_ip
+            instance_master_ip=$(get_node_ip "${instance_master_node}" "${NIC_NAME}")
+            local instance_port=$((VLLM_PORT + dp_idx))
 
-        local array_decl
-        array_decl=$(build_vllm_args_declare "${is_headless}" "${idx}" "${dp_start_rank}" "${NODE0_IP}")
+            log_info "Deploying instance ${dp_idx}/${DP_SIZE} on nodes ${instance_start_node}..$((instance_start_node + NODES_PER_INSTANCE - 1)), master=${instance_master_node}:${instance_port}"
 
-        local env_exports
-        env_exports=$(build_env_exports "${local_ip}")
+            for ((offset = 0; offset < NODES_PER_INSTANCE; offset++)); do
+                local node_idx=$((instance_start_node + offset))
+                local node="${ALL_NODES[$node_idx]}"
+                local local_ip
+                local_ip=$(get_node_ip "${node}" "${NIC_NAME}")
+                [[ -n "${local_ip}" ]] || { log_warn "Skip ${node}: cannot detect IP on ${NIC_NAME}"; continue; }
 
-        # 容器内执行的命令
-        local inner_cmd
-        inner_cmd="export SCRIPT_DIR='${SCRIPT_DIR}' && cd '${SCRIPT_DIR}' && source set_vlm_env.sh"$'\n'"${env_exports}"$'\n'"${array_decl}"$'\n'"nohup vllm \"\${args[@]}\" > ${SCRIPT_DIR}/vllm_${node}.log 2>&1 &"$'\n'"echo PID:\$!"
+                local is_headless="false"
+                # 实例内的 worker 节点使用 --headless
+                if [[ ${offset} -gt 0 ]]; then
+                    is_headless="true"
+                fi
 
-        # 远端宿主机命令：进入目录、source 环境变量、然后通过 docker exec 执行容器内命令
-        local ssh_cmd
-        ssh_cmd="export SCRIPT_DIR='${SCRIPT_DIR}' && cd '${SCRIPT_DIR}' && source set_vlm_env.sh && docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -s"
+                launch_on_node "${node}" "${local_ip}" "${is_headless}" "${offset}" "0" "1" "${instance_master_ip}" "${NODES_PER_INSTANCE}" "${instance_port}" "false"
+            done
+        done
+    else
+        # ----------------------------------------------------------------------
+        # 场景 B: 单个模型实例可放在一个节点内 (单节点 TP/PP，多节点 DP)
+        # 此时不需要 --nnodes / --node-rank / --master-addr，但可能需要在同一节点上启动多个 DP 实例
+        # ----------------------------------------------------------------------
+        log_info "Mode: single-node per instance, ${DP_SIZE_LOCAL} instances per node"
 
-        log_info "Launching on ${node} (IP: ${local_ip})..."
-        if [[ "${DRY_RUN}" == "true" || "${DRY_RUN}" == "1" ]]; then
-            echo "---------- Node: ${node} (host command) ----------"
-            echo "${ssh_cmd}"
-            echo "---------- Node: ${node} (container inner command) ----------"
-            echo "${inner_cmd}"
-            echo "-----------------------------------"
-        else
-            local pid
-            pid=$(echo "${inner_cmd}" | ssh ${SSH_OPTS} "${node}" "${ssh_cmd}")
-            log_info "Started vLLM on ${node}, PID=${pid}, log=${SCRIPT_DIR}/vllm_${node}.log"
-        fi
-        idx=$((idx + 1))
-    done
+        for ((node_idx = 0; node_idx < TOTAL_NODES; node_idx++)); do
+            local node="${ALL_NODES[$node_idx]}"
+            local local_ip
+            local_ip=$(get_node_ip "${node}" "${NIC_NAME}")
+            [[ -n "${local_ip}" ]] || { log_warn "Skip ${node}: cannot detect IP on ${NIC_NAME}"; continue; }
+
+            for ((local_dp = 0; local_dp < DP_SIZE_LOCAL; local_dp++)); do
+                local dp_rank=$((node_idx * DP_SIZE_LOCAL + local_dp))
+                local port=$((VLLM_PORT + local_dp))
+                local is_headless="false"
+
+                # 只有全局第一个实例 (Node0, local_dp=0) 启动 API server
+                if [[ ${node_idx} -gt 0 || ${local_dp} -gt 0 ]]; then
+                    is_headless="true"
+                fi
+
+                launch_on_node "${node}" "${local_ip}" "${is_headless}" "0" "${dp_rank}" "${DP_SIZE_LOCAL}" "${local_ip}" "1" "${port}" "true"
+            done
+        done
+    fi
 }
 
 # ------------------------------------------------------------------------------
-# 10. 主流程
+# 11. 主流程
 # ------------------------------------------------------------------------------
 deploy_standard
 
