@@ -75,6 +75,7 @@ Options:
   --auto-port             Automatically find available ports (recommended)
   --fast-mode             Skip non-critical checks for faster startup
   --parallel-jobs NUM     Number of parallel jobs (default: $PARALLEL_JOBS)
+  --verbose               Show detailed worker startup logs for debugging
   --help                  Show this help message
 
 Environment Variables:
@@ -103,6 +104,7 @@ log_debug() { log_message "DEBUG" "$CYAN" "$1"; }
 # --- 3. 参数解析 ---
 AUTO_PORT=false
 FORCE_CLEANUP=false
+VERBOSE=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -119,6 +121,7 @@ while [[ $# -gt 0 ]]; do
         --force-cleanup) FORCE_CLEANUP=true; shift ;;
         --fast-mode) FAST_MODE=true; shift ;;
         --parallel-jobs) PARALLEL_JOBS="$2"; shift 2 ;;
+        --verbose) VERBOSE=true; shift ;;
         --help|-h) usage; exit 0 ;;
         -*) log_fatal "Unknown option '$1'. Use --help for usage." ;;
         *) log_fatal "Unexpected argument '$1'. Use --help for usage." ;;
@@ -248,6 +251,7 @@ remote_exec_func() {
     local ssh_cmd="cd '${PROJECT_DIR}' && source set_env.sh && \
         docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -s"
 
+    # 通过SSH执行函数调用，保留错误输出用于调试
     echo "cd '${PROJECT_DIR}' && source set_env.sh; ${func_code}; ${call_code}" \
         | ssh $SSH_OPTS "$node" "$ssh_cmd"
 }
@@ -274,7 +278,7 @@ start_ray_node() {
         remote_exec_func "$node" _remote_start_ray_head "$MASTER_PORT" "$DASHBOARD_PORT" "$METRICS_PORT" "$NPUS_PER_NODE" "$MIN_WORKER_PORT" "$MAX_WORKER_PORT" "$node_ip"
     else
         log_info "[WORKER] Starting Ray worker on $node (IP: $node_ip)..."
-        remote_exec_func "$node" _remote_start_ray_worker "$MASTER_ADDR" "$MASTER_PORT" "$NPUS_PER_NODE" "$MIN_WORKER_PORT" "$MAX_WORKER_PORT" "$node_ip"
+        remote_exec_func "$node" _remote_start_ray_worker "$HEAD_IP" "$MASTER_PORT" "$NPUS_PER_NODE" "$MIN_WORKER_PORT" "$MAX_WORKER_PORT" "$node_ip"
     fi
 }
 
@@ -366,6 +370,7 @@ log_info "Worker port range: ${MIN_WORKER_PORT}-${MAX_WORKER_PORT}"
 # 并行清理
 log_info "Cleaning up existing Ray processes..."
 stop_ray_parallel "${NODE_HOSTS[@]}"
+sleep 2
 
 # 启动集群
 log_info "Starting Ray cluster..."
@@ -396,8 +401,11 @@ fi
 # 快速轮询等待
 if [[ "$WAIT_TIME" == "0" ]] || [[ "$WAIT_TIME" == "0.0" ]]; then
     log_info "Waiting for head node to be ready..."
-    if ! check_head_ready "$MASTER_ADDR" 10; then
+    if ! check_head_ready "$MASTER_ADDR" 30; then
         log_warn "Head node may not be fully ready"
+    else
+        log_info "Head node is ready, allowing extra 2s for GCS stabilization..."
+        sleep 2
     fi
 else
     log_info "Waiting ${WAIT_TIME}s..."
@@ -409,41 +417,95 @@ success_count=1
 failed_count=0
 failed_nodes=()
 
+# 处理中断，打印当前状态
+_interrupt_handler() {
+    log_warn "Interrupted! Current status: $success_count connected, $failed_count failed."
+    if [ ${#failed_nodes[@]} -gt 0 ]; then
+        log_warn "Failed nodes: ${failed_nodes[*]}"
+    fi
+    exit 130
+}
+trap _interrupt_handler SIGINT SIGTERM
+
 if [ ${#WORKERS[@]} -gt 0 ]; then
-    log_info "Starting ${#WORKERS[@]} worker nodes in parallel..."
+    log_info "Starting ${#WORKERS[@]} worker nodes in parallel (max ${PARALLEL_JOBS} concurrent, with retry)..."
+    log_info "Each worker has up to 30s per attempt (2 attempts). Please do not interrupt."
     
-    # 使用 FIFO 控制并发
-    exec 9>/tmp/ray_worker_flock
+    LOG_DIR="/tmp/ray_worker_logs_$(date +%s)"
+    mkdir -p "$LOG_DIR"
     
-    # 存储子进程 PID
-    declare -A worker_pids
-    for worker in "${WORKERS[@]}"; do
-        worker_ip="${NODE_IPS[$worker]}"
-        (
-            flock -n 9 || flock 9
-            if start_ray_node "$worker" false "$worker_ip" >/dev/null 2>&1; then
-                flock -u 9
-                exit 0
-            else
-                flock -u 9
+    total_workers=${#WORKERS[@]}
+    total_batches=$(((total_workers + PARALLEL_JOBS - 1) / PARALLEL_JOBS))
+    for ((i=0; i<total_workers; i+=PARALLEL_JOBS)); do
+        batch_pids=()
+        batch_workers=()
+        batch_num=$((i / PARALLEL_JOBS + 1))
+        for ((j=i; j<i+PARALLEL_JOBS && j<total_workers; j++)); do
+            worker="${WORKERS[j]}"
+            worker_ip="${NODE_IPS[$worker]}"
+            log_info "  -> Launching batch ${batch_num}/${total_batches}: $worker ($worker_ip)"
+            
+            (
+                exec </dev/null
+                log_file="${LOG_DIR}/${worker}.log"
+                rm -f "$log_file"
+                
+                for attempt in 1 2; do
+                    [[ $attempt -gt 1 ]] && echo "[RETRY] Attempt $attempt for $worker" >> "$log_file" 2>&1
+                    if command -v timeout >/dev/null 2>&1; then
+                        if timeout 30s start_ray_node "$worker" false "$worker_ip" >>"$log_file" 2>&1; then
+                            exit 0
+                        fi
+                    else
+                        if start_ray_node "$worker" false "$worker_ip" >>"$log_file" 2>&1; then
+                            exit 0
+                        fi
+                    fi
+                    [[ $attempt -lt 2 ]] && sleep 2
+                done
                 exit 1
+            ) &
+            batch_pids+=($!)
+            batch_workers+=("$worker")
+        done
+        
+        # 等待本批完成并立即收集结果
+        log_info "  Waiting for batch ${batch_num}/${total_batches} to complete..."
+        for idx in "${!batch_pids[@]}"; do
+            pid=${batch_pids[$idx]}
+            worker=${batch_workers[$idx]}
+            log_file="${LOG_DIR}/${worker}.log"
+            wait_rc=0
+            wait "$pid" || wait_rc=$?
+            if [ "$wait_rc" -eq 0 ]; then
+                ((success_count++))
+                log_info "Worker $worker connected"
+                rm -f "$log_file" 2>/dev/null || true
+            else
+                ((failed_count++))
+                failed_nodes+=("$worker")
+                log_error "Worker $worker failed (exit=$wait_rc)"
+                if [[ -f "$log_file" ]]; then
+                    log_error "--- Log for $worker ---"
+                    cat "$log_file" >&2 || true
+                    log_error "--- End log ---"
+                fi
             fi
-        ) &
-        worker_pids[$worker]=$!
+        done
     done
-    
-    # 等待所有子进程完成并收集结果
-    for worker in "${WORKERS[@]}"; do
-        pid=${worker_pids[$worker]}
-        if wait $pid; then
-            ((success_count++))
-            log_info "Worker $worker connected"
-        else
-            ((failed_count++))
-            failed_nodes+=("$worker")
-            log_error "Worker $worker failed"
-        fi
-    done
+fi
+
+trap - SIGINT SIGTERM
+
+# --- 8.5 最终验证 ---
+if [ $success_count -gt 1 ]; then
+    log_info "Running final cluster verification..."
+    sleep 2
+    cluster_nodes=$(ssh $SSH_OPTS "$MASTER_ADDR" "docker exec \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -c 'ray status'" 2>/dev/null | grep -c '^ 1 node_' || echo "0")
+    log_info "Cluster reports $cluster_nodes active nodes (expected $NUM_NODES)"
+    if [ "$cluster_nodes" -lt "$NUM_NODES" ]; then
+        log_warn "Some nodes may still be joining or missing"
+    fi
 fi
 
 cluster_end=$(date +%s.%N 2>/dev/null || date +%s)

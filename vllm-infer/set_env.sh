@@ -28,24 +28,15 @@ export VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${SCRIPT_DIR}/vllm_model_server.s
 # ------------------------------------------
 # 3. Ray 与 vLLM 配置
 # ------------------------------------------
-# 启用快速模式
-export RAY_FAST_MODE=1
-
-# 减少等待时间
-export RAY_WAIT_TIME=0
-
-# 并行任务数（根据节点数调整）
-export RAY_PARALLEL_JOBS=16
-
-# 端口搜索范围（减少可加速）
-export RAY_PORT_RANGE=20
-
-# 禁用 SSH 复用（如有问题）
-export RAY_SSH_MUX=0
+# 基本端口配置
 export RAY_PORT="${RAY_PORT:-6379}"
 export RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8266}"
 export VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
 export VLLM_PORT="${VLLM_PORT:-8000}"
+
+# Ray 启动超时配置
+export RAY_START_TIMEOUT="${RAY_START_TIMEOUT:-120}"
+export RAY_CONNECT_TIMEOUT="${RAY_CONNECT_TIMEOUT:-60}"
 
 # ------------------------------------------
 # 4. Ascend NPU 与底层环境配置
@@ -54,32 +45,56 @@ export VLLM_PORT="${VLLM_PORT:-8000}"
 # 由于第三方脚本（如 Ascend 的 set_env.sh）可能存在未绑定变量，临时关闭 set -u 检查
 set +u
 
+# 加载 Ascend Toolkit 环境
 if [ -f "/usr/local/Ascend/ascend-toolkit/set_env.sh" ]; then
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
 fi
 
-# if [ -f "/usr/local/Ascend/nnal/atb/set_env.sh" ]; then
-#     source /usr/local/Ascend/nnal/atb/set_env.sh
-# fi
+# 加载 ATB 环境（如果存在）
+# 尝试多个可能的路径
+_ATB_PATHS=(
+    "/llm_workspace_1P/expert_monitor/ATB/ascend-transformer-boost-master/output/atb/set_env.sh"
+    "/usr/local/Ascend/nnal/atb/set_env.sh"
+)
 
-source /llm_workspace_1P/expert_monitor/ATB/ascend-transformer-boost-master/output/atb/set_env.sh
+for _atb_path in "${_ATB_PATHS[@]}"; do
+    if [ -f "$_atb_path" ]; then
+        source "$_atb_path"
+        break
+    fi
+done
 
-# 恢复 set -u 检查 (如果原来是开启状态)
-# 但通常 set_env.sh 被 source 时，我们确保接下来的脚本继续保持严格模式
+# 恢复 set -u 检查
 set -u
 
+# Ray 与 Ascend 兼容性配置
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export GLOO_SOCKET_IFNAME=enp66s0f0
-export HCCL_SOCKET_IFNAME=enp66s0f0
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-enp66s0f0}"
+export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-enp66s0f0}"
 export HCCL_P2P_DISABLE=1
 export ACLNN_ALLOW_DTYPE_CONVERT=1
 
+# ------------------------------------------
+# 5. 网络配置 - 自动获取业务网卡 IP
+# ------------------------------------------
 # 自动获取业务网卡 IP 并统一绑定，确保 Ray 和 vLLM 互相识别的节点 IP 完全一致
-if command -v ip >/dev/null 2>&1; then
-    _NODE_IP=$(ip -4 addr show ${GLOO_SOCKET_IFNAME} 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
+_get_node_ip() {
+    local interface="${1:-$GLOO_SOCKET_IFNAME}"
+    local node_ip=""
+    
+    if command -v ip >/dev/null 2>&1; then
+        node_ip=$(ip -4 addr show "${interface}" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n 1)
+    elif command -v ifconfig >/dev/null 2>&1; then
+        node_ip=$(ifconfig "${interface}" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)
+    fi
+    
+    echo "$node_ip"
+}
+
+# 设置节点 IP
+_NODE_IP=$(_get_node_ip)
     if [ -n "$_NODE_IP" ]; then
         export RAY_NODE_IP_ADDRESS="$_NODE_IP"
         export VLLM_HOST_IP="$_NODE_IP"
     fi
-fi

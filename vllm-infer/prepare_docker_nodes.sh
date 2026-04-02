@@ -89,7 +89,6 @@ fi
 
 # 验证必要的环境变量
 : "${NODES_FILE:?环境变量 NODES_FILE 未设置}"
-: "${SSH_USER_HOST_PREFIX:?环境变量 SSH_USER_HOST_PREFIX 未设置}"
 : "${CONTAINER_NAME:?环境变量 CONTAINER_NAME 未设置}"
 : "${IMAGE_NAME:?环境变量 IMAGE_NAME 未设置}"
 : "${IMAGE_TAR:?环境变量 IMAGE_TAR 未设置}"
