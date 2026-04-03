@@ -26,10 +26,6 @@ class DeepseekV3Config(PretrainedConfig):
         n_routed_experts=128,
         ep_size=64,
         routed_scaling_factor=2.827,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        qk_nope_head_dim=128,
-        qk_layernorm=True,
         topk_method='noaux_tc',
         n_group=8,
         topk_group=2,
@@ -83,10 +79,6 @@ class DeepseekV3Config(PretrainedConfig):
         self.n_routed_experts = n_routed_experts
         self.ep_size = ep_size
         self.routed_scaling_factor = routed_scaling_factor
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_layernorm = qk_layernorm
         self.topk_method = topk_method
         self.n_group = n_group
         self.topk_group = topk_group

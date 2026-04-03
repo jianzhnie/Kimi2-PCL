@@ -20,8 +20,6 @@
   "hidden_size": 4096,
   "initializer_range": 0.02,
   "intermediate_size": 11264,
-  "kv_lora_rank": 512,
-  "mla_fa_without_pad": true,
   "max_position_embeddings": 131072,
   "model_type": "kimi_k2",
   "group_query_attention": true,
@@ -40,10 +38,6 @@
   "num_query_groups": 4,
   "num_nextn_predict_layers": 0,
   "pretraining_tp": 1,
-  "q_lora_rank": 1536,
-  "qk_layernorm": true,
-  "qk_nope_head_dim": 128,
-  "qk_rope_head_dim": 64,
   "rms_norm_eps": 1e-06,
   "rope_theta": 50000.0,
   "routed_scaling_factor": 2.827,
@@ -64,6 +58,5 @@
   "torch_dtype": "bfloat16",
   "transformers_version": "4.48.3",
   "use_cache": true,
-  "v_head_dim": 128,
   "vocab_size": 163840
 }

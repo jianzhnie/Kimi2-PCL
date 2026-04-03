@@ -26,12 +26,6 @@ class DeepseekV3Config(PretrainedConfig):
         n_routed_experts=128,
         ep_size=1,
         routed_scaling_factor=2.827,
-        kv_lora_rank=512,
-        q_lora_rank=1536,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        qk_nope_head_dim=128,
-        qk_layernorm=True,
         topk_method='noaux_tc',
         n_group=8,
         topk_group=2,
@@ -51,7 +45,7 @@ class DeepseekV3Config(PretrainedConfig):
         initializer_range=0.02,
         rms_norm_eps=1e-6,
         use_cache=True,
-        mla_fa_without_pad=False,
+        fa_without_pad=False,
         pad_token_id=None,
         bos_token_id=163584,
         eos_token_id=163585,
@@ -77,12 +71,6 @@ class DeepseekV3Config(PretrainedConfig):
         self.n_routed_experts = n_routed_experts
         self.ep_size = ep_size
         self.routed_scaling_factor = routed_scaling_factor
-        self.kv_lora_rank = kv_lora_rank
-        self.q_lora_rank = q_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_layernorm = qk_layernorm
         self.topk_method = topk_method
         self.n_group = n_group
         self.topk_group = topk_group
@@ -111,7 +99,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-        self.mla_fa_without_pad = mla_fa_without_pad
+        self.fa_without_pad = fa_without_pad
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
