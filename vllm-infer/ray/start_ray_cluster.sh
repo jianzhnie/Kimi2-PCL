@@ -9,27 +9,9 @@
 
 set -euo pipefail  # 严格模式：遇到错误退出，未定义变量报错，管道错误退出
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/set_env.sh"
-
-# ------------------------------------------
-# 引入环境变量
-# ------------------------------------------
-if [[ -f "${ENV_FILE}" ]]; then
-  source "${ENV_FILE}"
-else
-  echo "[ERROR] 环境配置文件未找到: ${ENV_FILE}" >&2
-  exit 1
-fi
-
-# --- 1. 默认配置与常量 ---
-# 覆盖或使用环境变量，如果未定义则使用默认值
-PROJECT_DIR="${SCRIPT_DIR}"
-MASTER_PORT="${RAY_PORT:-6379}"                 # Ray head node 端口
-DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8266}"    # Ray 仪表盘端口
-NPUS_PER_NODE=8                                 # 每个节点的 NPU 数量
-WAIT_TIME=1                                     # 等待头节点初始化的时间 (秒)
-NODE_LIST_FILE="${NODES_FILE:-${SCRIPT_DIR}/node_list.txt}"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${PROJECT_DIR}/set_env.sh"
+NODE_LIST_FILE="${NODES_FILE:-${PROJECT_DIR}/node_list.txt}"
 
 # 颜色输出定义
 RED='\033[0;31m'
@@ -37,6 +19,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
 
 # --- 2. 帮助信息与日志函数 ---
 usage() {
@@ -46,12 +29,7 @@ Usage: $0 [options]
 Starts a multi-node Ray cluster, assigning NPU resources.
 
 Options:
-  --project-dir DIR     Project directory containing 'set_env.sh' (default: $PROJECT_DIR)
   --node-list FILE      File containing list of nodes (default: $NODE_LIST_FILE)
-  --port PORT           Ray master port (default: $MASTER_PORT)
-  --dashboard-port PORT Dashboard port (default: $DASHBOARD_PORT)
-  --npus-per-node NUM   Number of NPUs per node (default: $NPUS_PER_NODE)
-  --wait-time SEC       Wait time for head node initialization (default: $WAIT_TIME)
   --help                Show this help message
 EOF
 }
@@ -69,19 +47,53 @@ log_warn()  { log_message "WARN" "$YELLOW" "$1" >&2; }
 log_error() { log_message "ERROR" "$RED" "$1" >&2; }
 log_fatal() { log_message "FATAL" "$RED" "$1" >&2; exit 1; }
 
-# --- 3. 参数解析 ---
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --project-dir) PROJECT_DIR="$2"; shift 2 ;;
-        --node-list) NODE_LIST_FILE="$2"; shift 2 ;;
-        --port) MASTER_PORT="$2"; shift 2 ;;
-        --dashboard-port) DASHBOARD_PORT="$2"; shift 2 ;;
-        --npus-per-node) NPUS_PER_NODE="$2"; shift 2 ;;
-        --wait-time) WAIT_TIME="$2"; shift 2 ;;
-        --help|-h) usage; exit 0 ;;
-        -*) log_fatal "Unknown option '$1'. Use --help for usage." ;;
-        *) log_fatal "Unexpected argument '$1'. Use --help for usage." ;;
-    esac
+
+# ------------------------------------------
+# 引入环境变量
+# ------------------------------------------
+if [[ -f "${ENV_FILE}" ]]; then
+  source "${ENV_FILE}"
+else
+  echo "[ERROR] 环境配置文件未找到: ${ENV_FILE}" >&2
+  exit 1
+fi
+
+# -------------------------------------------
+# --- 2. 预检与节点列表处理 ---
+
+if [[ -z "$NODE_LIST_FILE" ]]; then
+    log_fatal "Node list file is required."
+fi
+
+if [ ! -f "$NODE_LIST_FILE" ]; then
+    log_fatal "Node list file '$NODE_LIST_FILE' does not exist!"
+fi
+
+# 读取节点列表
+mapfile -t NODE_HOSTS < <(awk 'NF && !/^#/ {print $1}' "$NODE_LIST_FILE")
+
+if [ ${#NODE_HOSTS[@]} -eq 0 ]; then
+    log_fatal "Node list '$NODE_LIST_FILE' is empty or contains no valid hosts."
+fi
+
+# -----------------------------------------------
+
+# --- 1. 默认配置与常量 ---
+# 覆盖或使用环境变量，如果未定义则使用默认值
+PROJECT_DIR="${PROJECT_DIR}"
+NUM_NODES=${#NODE_HOSTS[@]}
+MASTER_ADDR="${MASTER_ADDR:-${NODE_HOSTS[0]}}"     # Ray Head node IP
+MASTER_PORT="${MASTER_PORT:-29500}"                 # Ray head node 端口
+DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8266}"       # Ray 仪表盘端口
+NPUS_PER_NODE=8                                 # 每个节点的 NPU 数量
+WAIT_TIME=1                                     # 等待头节点初始化的时间 (秒)
+
+# 收集 Worker 节点
+WORKERS=()
+for node in "${NODE_HOSTS[@]}"; do
+    if [[ "$node" != "$MASTER_ADDR" ]]; then
+        WORKERS+=("$node")
+    fi
 done
 
 # --- 4. 核心函数：远程执行命令 ---
@@ -93,53 +105,37 @@ _remote_stop_ray() {
 }
 
 _remote_start_ray_head() {
-    local port="$1"
-    local dashboard_port="$2"
-    local npus="$3"
-    local master_addr="$4"
+    local master_address="$1"
+    local master_port="$2"
+    local dashboard_port="$3"
+    local num_gpus="$4"
 
     set -euo pipefail
-    local resources_json="{\"NPU\": ${npus}}"
-
-    # 如果环境变量中设置了 RAY_NODE_IP_ADDRESS，优先使用它
-    local node_ip_flag=""
-    if [[ -n "${RAY_NODE_IP_ADDRESS:-}" ]]; then
-        node_ip_flag="--node-ip-address ${RAY_NODE_IP_ADDRESS}"
-    fi
+    local resources_json="{\"NPU\": ${num_gpus}}"
 
     ray start --head \
-        --port "${port}" \
-        ${node_ip_flag} \
+        --node-ip-address=${master_address} \
+        --port "${master_port}" \
         --dashboard-host=0.0.0.0 \
         --dashboard-port="${dashboard_port}" \
-        --num-gpus="${npus}" \
-        --resources="${resources_json}" \
-        --metrics-export-port=50000 \
-        --min-worker-port=40000 \
-        --max-worker-port=49999
+        --num-gpus="${num_gpus}" \
+        --resources="${resources_json}" 
 }
 
 _remote_start_ray_worker() {
-    local master_addr="$1"
-    local port="$2"
-    local npus="$3"
+    local master_address="$1"
+    local master_port="$2"
+    local node_ip_adress="$3"
+    local num_gpus="$4"
 
     set -euo pipefail
-    local resources_json="{\"NPU\": ${npus}}"
+    local resources_json="{\"NPU\": ${num_gpus}}"
 
-    # 同样优先使用明确指定的节点 IP
-    local node_ip_flag=""
-    if [[ -n "${RAY_NODE_IP_ADDRESS:-}" ]]; then
-        node_ip_flag="--node-ip-address ${RAY_NODE_IP_ADDRESS}"
-    fi
-
-    ray start --address "${master_addr}:${port}" \
-        ${node_ip_flag} \
-        --num-gpus="${npus}" \
-        --resources="${resources_json}" \
-        --metrics-export-port=50000 \
-        --min-worker-port=40000 \
-        --max-worker-port=49999
+    ray start \
+        --address "${master_address}:${master_port}" \
+        --node-ip-address="${node_ip_adress}" \
+        --num-gpus="${num_gpus}" \
+        --resources="${resources_json}" 
 }
 
 # 包装器：将本地函数发送到远端执行，并预先 source 环境配置
@@ -185,14 +181,14 @@ start_ray_node() {
     stop_ray_node "$node"
 
     if $is_head; then
-        log_info "[HEAD] Starting Ray head on $node (Master: $MASTER_ADDR:$MASTER_PORT)..."
-        if ! remote_exec_func "$node" _remote_start_ray_head "$MASTER_PORT" "$DASHBOARD_PORT" "$NPUS_PER_NODE" "$MASTER_ADDR"; then
+        log_info "[HEAD] Starting Ray head on $node (Master: $MASTER_ADDR$:$MASTER_PORT)..."
+        if ! remote_exec_func "$node" _remote_start_ray_head "$MASTER_ADDR" "$MASTER_PORT" "$DASHBOARD_PORT" "$NPUS_PER_NODE"; then
             log_error "Failed to start Ray head on node $node"
             return 1
         fi
     else
         log_info "[WORKER] Starting Ray worker on $node (Connecting to: $MASTER_ADDR:$MASTER_PORT)..."
-        if ! remote_exec_func "$node" _remote_start_ray_worker "$MASTER_ADDR" "$MASTER_PORT" "$NPUS_PER_NODE"; then
+        if ! remote_exec_func "$node" _remote_start_ray_worker "$MASTER_ADDR" "$MASTER_PORT" "$node" "$NPUS_PER_NODE"; then
             log_error "Failed to start Ray worker on node $node"
             return 1
         fi
@@ -200,34 +196,6 @@ start_ray_node() {
     return 0
 }
 
-# --- 5. 预检与节点列表处理 ---
-
-if [[ -z "$NODE_LIST_FILE" ]]; then
-    log_fatal "Node list file is required."
-fi
-
-if [ ! -f "$NODE_LIST_FILE" ]; then
-    log_fatal "Node list file '$NODE_LIST_FILE' does not exist!"
-fi
-
-# 读取节点列表
-mapfile -t NODE_HOSTS < <(awk 'NF && !/^#/ {print $1}' "$NODE_LIST_FILE")
-
-if [ ${#NODE_HOSTS[@]} -eq 0 ]; then
-    log_fatal "Node list '$NODE_LIST_FILE' is empty or contains no valid hosts."
-fi
-
-# 优先使用 set_env.sh 中的 MASTER_NODE，否则取列表第一个
-MASTER_ADDR="${MASTER_NODE:-${NODE_HOSTS[0]}}"
-NUM_NODES=${#NODE_HOSTS[@]}
-
-# 收集 Worker 节点
-WORKERS=()
-for node in "${NODE_HOSTS[@]}"; do
-    if [[ "$node" != "$MASTER_ADDR" ]]; then
-        WORKERS+=("$node")
-    fi
-done
 
 log_info "============================================="
 log_info "Ray Cluster Setup Configuration"
