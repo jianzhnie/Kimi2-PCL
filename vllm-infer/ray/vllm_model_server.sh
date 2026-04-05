@@ -141,10 +141,6 @@ MAX_TOKENS_PER_SEQUENCE="${MAX_TOKENS_PER_SEQUENCE:-32768}"
 # 前缀缓存开关 (Prefix Caching)
 # 对于多轮对话或大量重复 system prompt 极其有效，强烈建议启用
 PREFIX_CACHING="${PREFIX_CACHING:-1}"
-# 多步调度步数 (Multi-step Scheduling)
-# 减少框架在各个 NPU 之间的调度通信开销
-# 建议值: 4-8，较大的值提高吞吐但增加延迟
-NUM_SCHEDULER_STEPS="${NUM_SCHEDULER_STEPS:-8}"
 # 强制 Eager 模式
 # 1 = 禁用 CUDA Graph/编译图 (推荐 NPU 环境)
 # 0 = 启用 CUDA Graph (如果底层支持)
@@ -222,7 +218,6 @@ args=(
     --max-num-seqs "$MAX_NUM_SEQS"
     --max-model-len "$MAX_MODEL_LEN"
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS"
-    --num-scheduler-steps "$NUM_SCHEDULER_STEPS"
 )
 
 # 条件参数
@@ -302,7 +297,7 @@ cat << EOF
   Memory:       dtype=$DTYPE, quant=$QUANTIZATION, gpu_util=$GPU_MEMORY_UTILIZATION
 --------------------------------------------------------------------------------
   Scheduling:   max_seqs=$MAX_NUM_SEQS, max_len=$MAX_MODEL_LEN, batched=$MAX_NUM_BATCHED_TOKENS
-  Features:     chunked=$ENABLE_CHUNKED_PREFILL, prefix=$PREFIX_CACHING, steps=$NUM_SCHEDULER_STEPS
+  Features:     chunked=$ENABLE_CHUNKED_PREFILL, prefix=$PREFIX_CACHING
 --------------------------------------------------------------------------------
   Metrics:      enabled=$ENABLE_METRICS, port=$METRICS_PORT
 ================================================================================
