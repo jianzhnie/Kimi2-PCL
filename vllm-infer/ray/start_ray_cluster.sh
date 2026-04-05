@@ -52,14 +52,50 @@ ssh_cmd() {
 remote_exec() {
     local node=$1 cmd=$2
     ssh_cmd "$node" "cd '${PROJECT_DIR}' && source set_env.sh 2>/dev/null && \
-        docker exec -i '\${CONTAINER_NAME:-vllm-ascend-env-a3}' bash -c '${cmd}'"
+        docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -c '${cmd}'"
 }
 
 # -----------------------------------------------------------------
 # Ray 操作函数
 # -----------------------------------------------------------------
-stop_ray() {
-    remote_exec "$1" "ray stop -f 2>/dev/null || true" 2>/dev/null || true
+
+# 停止单个节点的 Ray 进程
+stop_ray_on_node() {
+    local node=$1
+    log_info "[STOP] Stopping Ray on $node"
+    remote_exec "$node" "ray stop -f 2>/dev/null || true" 2>/dev/null || true
+}
+
+# 停止所有节点的 Ray 进程（并行执行）
+stop_all_ray() {
+    local nodes=("$@")
+    log_info "Stopping Ray on all ${#nodes[@]} node(s)..."
+    
+    local tmpdir=$(mktemp -d)
+    trap "rm -rf $tmpdir" EXIT
+    
+    for i in "${!nodes[@]}"; do
+        local node=${nodes[$i]}
+        (
+            stop_ray_on_node "$node" && echo "OK" > "$tmpdir/$i" || echo "FAIL" > "$tmpdir/$i"
+        ) &
+    done
+    
+    wait
+    
+    local failed=0
+    for i in "${!nodes[@]}"; do
+        if [[ "$(cat "$tmpdir/$i" 2>/dev/null)" != "OK" ]]; then
+            log_warn "Failed to stop Ray on: ${nodes[$i]}"
+            ((failed++))
+        fi
+    done
+    
+    if [[ $failed -eq 0 ]]; then
+        log_info "All Ray processes stopped successfully"
+    else
+        log_warn "$failed node(s) failed to stop (may not be running)"
+    fi
 }
 
 start_head() {
@@ -144,8 +180,14 @@ main() {
     [[ $failed -eq 0 ]] || log_fatal "Pre-checks failed with $failed error(s)"
     log_info "All checks passed"
     
-    # 启动 Head 节点
-    stop_ray "$master_addr"
+    # Step 1: 先停止所有节点的 Ray 进程
+    log_info "============================================="
+    stop_all_ray "${NODES[@]}"
+    sleep 1
+    stop_all_ray "${NODES[@]}"
+
+    # Step 2: 启动 Head 节点
+    log_info "============================================="
     start_head "$master_addr" "$master_addr" || log_fatal "Failed to start head node"
     sleep "$WAIT_TIME"
     
@@ -161,7 +203,6 @@ main() {
         
         for i in "${!workers[@]}"; do
             local node=${workers[$i]}
-            stop_ray "$node"
             (
                 start_worker "$node" "$master_addr" && echo "OK" > "$tmpdir/$i" || echo "FAIL" > "$tmpdir/$i"
             ) &
@@ -197,7 +238,7 @@ main() {
     # 显示状态
     log_info "Ray cluster status:"
     ssh_cmd "$master_addr" "cd '${PROJECT_DIR}' && source set_env.sh 2>/dev/null && \
-        docker exec -i '\${CONTAINER_NAME:-vllm-ascend-env-a3}' \
+        docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" \
         bash -c 'ray status'" 2>/dev/null || log_warn "Could not retrieve Ray status"
 }
 
