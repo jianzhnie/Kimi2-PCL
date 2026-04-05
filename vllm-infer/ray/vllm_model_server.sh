@@ -111,7 +111,8 @@ LOAD_FORMAT="${LOAD_FORMAT:-safetensors}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 # CPU 交换空间大小 (GiB)
 # 用于 KV Cache 驱逐时的缓冲，MoE 模型建议设置较大值
-SWAP_SPACE="${SWAP_SPACE:-128}"
+# 注意：当 TP*PP 较大时，总交换空间 = SWAP_SPACE * TP，需要确保不超过系统内存
+SWAP_SPACE="${SWAP_SPACE:-16}"
 
 # ------------------------------------------------------------------------------
 # 4. 吞吐量与序列调度优化
