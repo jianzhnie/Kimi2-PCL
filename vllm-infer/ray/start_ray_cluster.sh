@@ -65,14 +65,12 @@ start_head() {
     local node=$1 master_addr=$2
     log_info "[HEAD] Starting Ray head on $node"
     
-    local resources="{\"NPU\": ${NPUS_PER_NODE}}"
     local cmd="ray start --head \
         --node-ip-address=${master_addr} \
         --port ${MASTER_PORT} \
         --dashboard-host=0.0.0.0 \
         --dashboard-port=${DASHBOARD_PORT} \
-        --num-gpus=${NPUS_PER_NODE} \
-        --resources='${resources}'"
+        --num-gpus=${NPUS_PER_NODE}"
     
     remote_exec "$node" "$cmd"
 }
@@ -81,12 +79,10 @@ start_worker() {
     local node=$1 master_addr=$2
     log_info "[WORKER] Starting Ray worker on $node"
     
-    local resources="{\"NPU\": ${NPUS_PER_NODE}}"
     local cmd="ray start \
         --address ${master_addr}:${MASTER_PORT} \
         --node-ip-address=${node} \
-        --num-gpus=${NPUS_PER_NODE} \
-        --resources='${resources}'"
+        --num-gpus=${NPUS_PER_NODE}"
     
     remote_exec "$node" "$cmd"
 }
