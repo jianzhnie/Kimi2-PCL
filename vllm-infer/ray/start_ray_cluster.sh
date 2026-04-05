@@ -32,33 +32,34 @@ NC='\033[0m'
 # 日志函数
 # -----------------------------------------------------------------
 log() {
-    local level=$1 color=$2 msg=$3
-    echo -e "${color}[${level}]${NC} $(date '+%Y-%m-%d %H:%M:%S') - ${msg}"
+    local level=$1 color=$2
+    shift 2
+    echo -e "${color}[${level}]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $*"
 }
 
-log_info()  { log "INFO"  "$GREEN"  "$1"; }
-log_warn()  { log "WARN"  "$YELLOW" "$1" >&2; }
-log_error() { log "ERROR" "$RED"    "$1" >&2; }
-log_fatal() { log "FATAL" "$RED"    "$1" >&2; exit 1; }
+log_info()  { log "INFO"  "$GREEN"  "$@"; }
+log_warn()  { log "WARN"  "$YELLOW" "$@" >&2; }
+log_error() { log "ERROR" "$RED"    "$@" >&2; }
+log_fatal() { log "FATAL" "$RED"    "$@" >&2; exit 1; }
 
 # -----------------------------------------------------------------
 # 远程执行辅助函数
 # -----------------------------------------------------------------
 ssh_cmd() {
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$@"
+    ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "$@"
 }
 
 remote_exec() {
     local node=$1 cmd=$2
-    ssh_cmd "$node" "cd '${PROJECT_DIR}' && source set_env.sh && \
-        docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -c '${cmd}'"
+    ssh_cmd "$node" "cd '${PROJECT_DIR}' && source set_env.sh 2>/dev/null && \
+        docker exec -i '\${CONTAINER_NAME:-vllm-ascend-env-a3}' bash -c '${cmd}'"
 }
 
 # -----------------------------------------------------------------
 # Ray 操作函数
 # -----------------------------------------------------------------
 stop_ray() {
-    remote_exec "$1" "ray stop -f 2>/dev/null || true"
+    remote_exec "$1" "ray stop -f 2>/dev/null || true" 2>/dev/null || true
 }
 
 start_head() {
@@ -97,10 +98,10 @@ check_env() {
 
 check_node() {
     local node=$1
-    ssh_cmd -q "$node" "exit" 2>/dev/null || { log_error "SSH failed: $node"; return 1; }
-    ssh_cmd "$node" "[ -d '$PROJECT_DIR' ]" 2>/dev/null || { log_error "Directory not found on $node: $PROJECT_DIR"; return 1; }
-    ssh_cmd "$node" "[ -f '$PROJECT_DIR/set_env.sh' ]" 2>/dev/null || { log_error "set_env.sh not found on $node"; return 1; }
-    return 0
+    ssh_cmd -q "$node" "test -d '$PROJECT_DIR' -a -f '$PROJECT_DIR/set_env.sh'" 2>/dev/null || {
+        log_error "SSH failed or missing files on: $node"
+        return 1
+    }
 }
 
 # -----------------------------------------------------------------
@@ -136,11 +137,11 @@ main() {
     
     # 节点检查
     log_info "Checking all nodes..."
-    local errors=0
+    local failed=0
     for node in "${NODES[@]}"; do
-        check_node "$node" || ((errors++))
+        check_node "$node" || ((failed++))
     done
-    [[ $errors -eq 0 ]] || log_fatal "Pre-checks failed with $errors error(s)"
+    [[ $failed -eq 0 ]] || log_fatal "Pre-checks failed with $failed error(s)"
     log_info "All checks passed"
     
     # 启动 Head 节点
@@ -149,25 +150,33 @@ main() {
     sleep "$WAIT_TIME"
     
     # 启动 Worker 节点（并行）
-    local success=1 failed=0
-    local failed_nodes=()
+    local failed_nodes=() success=$((num_nodes))
     
     if [[ ${#workers[@]} -gt 0 ]]; then
         log_info "Starting ${#workers[@]} worker(s) in parallel..."
-        local pids=()
-        for node in "${workers[@]}"; do
+        
+        # 并行启动 workers，将结果写入临时文件
+        local tmpdir=$(mktemp -d)
+        trap "rm -rf $tmpdir" EXIT
+        
+        for i in "${!workers[@]}"; do
+            local node=${workers[$i]}
             stop_ray "$node"
             (
-                start_worker "$node" "$master_addr" && \
-                    log_info "Worker connected: $node"
-            ) || { failed_nodes+=("$node"); ((failed++)); }
-            pids+=($!)
+                start_worker "$node" "$master_addr" && echo "OK" > "$tmpdir/$i" || echo "FAIL" > "$tmpdir/$i"
+            ) &
         done
         
-        for pid in "${pids[@]}"; do
-            wait "$pid" 2>/dev/null || true
+        # 等待所有后台任务完成
+        wait
+        
+        # 收集结果
+        for i in "${!workers[@]}"; do
+            if [[ "$(cat "$tmpdir/$i" 2>/dev/null)" != "OK" ]]; then
+                failed_nodes+=("${workers[$i]}")
+                ((success--))
+            fi
         done
-        success=$((num_nodes - failed))
     else
         log_info "Single-node cluster mode"
     fi
@@ -175,10 +184,10 @@ main() {
     # 结果报告
     echo ""
     echo -e "${BLUE}=============================================${NC}"
-    if [[ $failed -eq 0 ]]; then
+    if [[ ${#failed_nodes[@]} -eq 0 ]]; then
         log "SUCCESS" "$GREEN" "Ray cluster started successfully!"
     else
-        log_warn "Cluster started with $failed failed worker(s)"
+        log_warn "Cluster started with ${#failed_nodes[@]} failed worker(s)"
         log_info "Failed nodes: ${failed_nodes[*]}"
     fi
     log_info "Dashboard: http://${master_addr}:${DASHBOARD_PORT}"
@@ -187,8 +196,8 @@ main() {
     
     # 显示状态
     log_info "Ray cluster status:"
-    ssh_cmd "$master_addr" "cd '${PROJECT_DIR}' && source set_env.sh && \
-        docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" \
+    ssh_cmd "$master_addr" "cd '${PROJECT_DIR}' && source set_env.sh 2>/dev/null && \
+        docker exec -i '\${CONTAINER_NAME:-vllm-ascend-env-a3}' \
         bash -c 'ray status'" 2>/dev/null || log_warn "Could not retrieve Ray status"
 }
 

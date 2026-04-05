@@ -10,6 +10,7 @@
 #   1. 默认启动: ./vllm_model_server.sh
 #   2. 环境变量覆盖: MODEL_PATH=/path/to/model ./vllm_model_server.sh
 #   3. 外部配置: VLLM_ENV_FILE=/path/to/env.sh ./vllm_model_server.sh
+#   4. 命令行参数: ./vllm_model_server.sh --port 8080 --tensor-parallel-size 4
 # =============================================================================
 
 set -euo pipefail
@@ -39,6 +40,28 @@ PORT="${PORT:-8000}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 
 # ------------------------------------------------------------------------------
+# 命令行参数解析 (支持 --key=value 或 --key value 格式)
+# ------------------------------------------------------------------------------
+EXTRA_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model-path) MODEL_PATH="$2"; shift 2 ;;
+        --served-model-name) SERVED_MODEL_NAME="$2"; shift 2 ;;
+        --host) HOST="$2"; shift 2 ;;
+        --port) PORT="$2"; shift 2 ;;
+        --tensor-parallel-size) TENSOR_PARALLEL_SIZE="$2"; shift 2 ;;
+        --pipeline-parallel-size) PIPELINE_PARALLEL_SIZE="$2"; shift 2 ;;
+        --dtype) DTYPE="$2"; shift 2 ;;
+        --quantization) QUANTIZATION="$2"; shift 2 ;;
+        --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
+        --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
+        --api-key) API_KEY="$2"; shift 2 ;;
+        --*) EXTRA_ARGS+=("$1"); shift ;;
+        *) EXTRA_ARGS+=("$1"); shift ;;
+    esac
+done
+
+# ------------------------------------------------------------------------------
 # 2. 分布式并行配置 (核心调整)
 # ------------------------------------------------------------------------------
 # Kimi-K2 采用 MoE 架构，参数量巨大，需要合理配置并行策略
@@ -66,7 +89,8 @@ ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-1}"
 # 专家并行大小
 # 默认自动计算为 TP * PP，确保专家均匀分布
 # Kimi-K2 有 384 个专家，建议 EP 能整除 384
-EXPERT_PARALLEL_SIZE="${EXPERT_PARALLEL_SIZE:-$((TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE))}"
+# 延迟计算：在 TP/PP 可能被外部配置覆盖后再计算
+: "${EXPERT_PARALLEL_SIZE:=$((TENSOR_PARALLEL_SIZE * PIPELINE_PARALLEL_SIZE))}"
 
 # ------------------------------------------------------------------------------
 # 3. 内存与量化配置
@@ -141,7 +165,7 @@ AUTO_DETECT_FLAGS="${AUTO_DETECT_FLAGS:-1}"
 API_KEY="${API_KEY:-}"
 # Prometheus 指标导出开关
 # 1 = 启用，0 = 禁用
-ENABLE_METRICS="${ENABLE_METRICS:-1}"
+ENABLE_METRICS="${ENABLE_METRICS:-0}"
 # Prometheus 指标导出端口
 METRICS_PORT="${METRICS_PORT:-8001}"
 # 禁用请求日志开关
@@ -157,58 +181,32 @@ ALLOWED_ORIGINS="${ALLOWED_ORIGINS:-*}"
 # 最大重试次数
 # 服务崩溃后自动重启的次数
 export MAX_RETRIES="${MAX_RETRIES:-1}"
-
 # 重试间隔 (秒)
 export RETRY_DELAY="${RETRY_DELAY:-10}"
-
 
 # -----------------------------------------------------------------------------
 # 辅助函数
 # -----------------------------------------------------------------------------
-
-# 检测 vLLM 支持的参数
-HELP_TEXT=""
-get_help() {
-    [[ -z "$HELP_TEXT" ]] && HELP_TEXT="$(vllm serve --help 2>/dev/null || true)"
-    echo "$HELP_TEXT"
-}
-
-# 检查参数是否存在
 has_flag() {
-    [[ "$(get_help)" == *"$1"* ]]
-}
-
-# 选择支持的参数名 (处理版本差异)
-choose_flag() {
-    local preferred="$1" fallback="$2"
-    has_flag "$preferred" && echo "$preferred" || echo "$fallback"
-}
-
-# 添加条件参数
-add_flag() {
-    local cond="$1" flag="$2"
-    shift 2
-    [[ "$cond" == "1" ]] && args+=("$flag" "$@")
-}
-
-# 添加可选参数
-add_opt() {
-    local val="$1" flag="$2"
-    [[ -n "$val" ]] && args+=("$flag" "$val")
+    [[ "${HELP_TEXT:-}" == *"$1"* ]]
 }
 
 # -----------------------------------------------------------------------------
 # 前置检查
 # -----------------------------------------------------------------------------
-
 command -v vllm >/dev/null 2>&1 || { echo "[ERROR] vllm not found" >&2; exit 127; }
 [[ -e "$MODEL_PATH" ]] || { echo "[ERROR] MODEL_PATH not found: $MODEL_PATH" >&2; exit 2; }
 [[ -f "$MODEL_PATH/config.json" ]] || { echo "[ERROR] config.json not found" >&2; exit 2; }
 
 # -----------------------------------------------------------------------------
+# 动态检测 vLLM 支持的参数
+# -----------------------------------------------------------------------------
+HELP_TEXT=""
+[[ "$AUTO_DETECT_FLAGS" == "1" ]] && HELP_TEXT="$(vllm serve --help 2>/dev/null || true)"
+
+# -----------------------------------------------------------------------------
 # 构建启动参数
 # -----------------------------------------------------------------------------
-
 args=(
     serve "$MODEL_PATH"
     --trust-remote-code
@@ -230,52 +228,66 @@ args=(
 # 条件参数
 [[ -n "$QUANTIZATION" && "$QUANTIZATION" != "none" ]] && args+=(--quantization "$QUANTIZATION")
 [[ -n "$LOAD_FORMAT" ]] && args+=(--load-format "$LOAD_FORMAT")
+# Chunked Prefill
+[[ "$ENABLE_CHUNKED_PREFILL" == "1" ]] && args+=(--enable-chunked-prefill)
+# API Key
+[[ -n "$API_KEY" ]] && args+=(--api-key "$API_KEY")
+# max_tokens_per_sequence (如果定义且 vLLM 支持)
+[[ -n "${MAX_TOKENS_PER_SEQUENCE:-}" ]] && has_flag "--max-tokens-per-sequence" && \
+    args+=(--max-tokens-per-sequence "$MAX_TOKENS_PER_SEQUENCE")
 
 # 动态特性检测
 if [[ "$AUTO_DETECT_FLAGS" == "1" ]]; then
     # Expert Parallel
-    [[ "$ENABLE_EXPERT_PARALLEL" == "1" ]] && has_flag "--enable-expert-parallel" && \
+    if [[ "$ENABLE_EXPERT_PARALLEL" == "1" ]] && has_flag "--enable-expert-parallel"; then
         args+=("--enable-expert-parallel")
+    fi
     
-    # Prefix Caching
-    [[ "$PREFIX_CACHING" == "1" ]] && has_flag "--enable-prefix-caching" && \
-        args+=("--enable-prefix-caching") || args+=("--disable-prefix-caching")
+    # Prefix Caching - 修正逻辑：只有明确禁用时才添加 disable 参数
+    if [[ "$PREFIX_CACHING" == "1" ]] && has_flag "--enable-prefix-caching"; then
+        args+=("--enable-prefix-caching")
+    elif [[ "$PREFIX_CACHING" == "0" ]] && has_flag "--disable-prefix-caching"; then
+        args+=("--disable-prefix-caching")
+    fi
     
     # CUDA Graph
-    [[ "$ENFORCE_EAGER" == "1" ]] && args+=(--enforce-eager) || \
-        { has_flag "--max-seq-len-to-capture" && args+=(--max-seq-len-to-capture "$MAX_SEQ_LEN_TO_CAPTURE"); }
+    if [[ "$ENFORCE_EAGER" == "1" ]]; then
+        args+=(--enforce-eager)
+    elif has_flag "--max-seq-len-to-capture"; then
+        args+=(--max-seq-len-to-capture "$MAX_SEQ_LEN_TO_CAPTURE")
+    fi
     
     # 日志级别
     has_flag "--log-level" && args+=(--log-level "$LOG_LEVEL")
     
     # Metrics
-    [[ "$ENABLE_METRICS" == "1" ]] && has_flag "--enable-metrics" && \
+    if [[ "$ENABLE_METRICS" == "1" ]] && has_flag "--enable-metrics"; then
         args+=(--enable-metrics --metrics-port "$METRICS_PORT")
+    fi
     
     # 其他
     has_flag "--allowed-origins" && args+=(--allowed-origins "$ALLOWED_ORIGINS")
     [[ "$DISABLE_LOG_REQUESTS" == "1" ]] && has_flag "--disable-log-requests" && args+=(--disable-log-requests)
-else
-    # 不检测，直接添加 (假设参数存在)
-    [[ "$ENABLE_EXPERT_PARALLEL" == "1" ]] && args+=(--enable-expert-parallel)
-    [[ "$PREFIX_CACHING" == "1" ]] && args+=(--enable-prefix-caching) || args+=(--disable-prefix-caching)
-    [[ "$ENFORCE_EAGER" == "1" ]] && args+=(--enforce-eager) || args+=(--max-seq-len-to-capture "$MAX_SEQ_LEN_TO_CAPTURE")
-    args+=(--log-level "$LOG_LEVEL")
-    [[ "$ENABLE_METRICS" == "1" ]] && args+=(--enable-metrics --metrics-port "$METRICS_PORT")
-    args+=(--allowed-origins "$ALLOWED_ORIGINS")
-    [[ "$DISABLE_LOG_REQUESTS" == "1" ]] && args+=(--disable-log-requests)
 fi
 
-# Chunked Prefill
-[[ "$ENABLE_CHUNKED_PREFILL" == "1" ]] && args+=(--enable-chunked-prefill)
-
-# API Key
-[[ -n "$API_KEY" ]] && args+=(--api-key "$API_KEY")
+# 添加用户传入的额外参数 (去重：如果已存在则跳过)
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    for extra_arg in "${EXTRA_ARGS[@]}"; do
+        # 简单去重：检查是否已包含该参数名
+        skip=false
+        for existing in "${args[@]}"; do
+            if [[ "$existing" == "$extra_arg" ]]; then
+                skip=true
+                break
+            fi
+        done
+        [[ "$skip" == false ]] && args+=("$extra_arg")
+    done
+fi
 
 # -----------------------------------------------------------------------------
 # 配置摘要
 # -----------------------------------------------------------------------------
-
 cat << EOF
 ================================================================================
 [INFO] vLLM Server Configuration
@@ -301,10 +313,9 @@ EOF
 # -----------------------------------------------------------------------------
 # 启动 (带重试)
 # -----------------------------------------------------------------------------
-
 RETRY_COUNT=0
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    vllm "${args[@]}" "$@"
+    vllm "${args[@]}"
     EXIT_CODE=$?
     
     if [ $EXIT_CODE -eq 0 ]; then
