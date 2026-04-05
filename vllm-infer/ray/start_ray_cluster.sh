@@ -192,6 +192,7 @@ main() {
     sleep "$WAIT_TIME"
     
     # 启动 Worker 节点（并行）
+    log_info "============================================="
     local failed_nodes=() success=$((num_nodes))
     
     if [[ ${#workers[@]} -gt 0 ]]; then
