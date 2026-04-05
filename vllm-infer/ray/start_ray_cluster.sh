@@ -16,10 +16,6 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/set_env.sh"
 NODE_LIST_FILE="${NODES_FILE:-${PROJECT_DIR}/node_list.txt}"
 
-DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8266}"
-MASTER_PORT="${MASTER_PORT:-29500}"
-NPUS_PER_NODE=8
-WAIT_TIME=1
 
 # 颜色输出
 RED='\033[0;31m'
@@ -52,7 +48,7 @@ ssh_cmd() {
 remote_exec() {
     local node=$1 cmd=$2
     ssh_cmd "$node" "cd '${PROJECT_DIR}' && source set_env.sh 2>/dev/null && \
-        docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" bash -c '${cmd}'"
+        docker exec -i '${CONTAINER_NAME}' bash -c '${cmd}'"
 }
 
 # -----------------------------------------------------------------
@@ -239,7 +235,7 @@ main() {
     # 显示状态
     log_info "Ray cluster status:"
     ssh_cmd "$master_addr" "cd '${PROJECT_DIR}' && source set_env.sh 2>/dev/null && \
-        docker exec -i \"\${CONTAINER_NAME:-vllm-ascend-env-a3}\" \
+        docker exec -i '${CONTAINER_NAME}' \
         bash -c 'ray status'" 2>/dev/null || log_warn "Could not retrieve Ray status"
 }
 
