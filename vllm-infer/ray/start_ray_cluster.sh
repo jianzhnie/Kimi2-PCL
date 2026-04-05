@@ -103,7 +103,7 @@ start_head() {
         --port ${MASTER_PORT} \
         --dashboard-host=0.0.0.0 \
         --dashboard-port=${DASHBOARD_PORT} \
-        --num-gpus=${NPUS_PER_NODE}"
+        --resources='{\"NPU\": ${NPUS_PER_NODE}}'"
     
     remote_exec "$node" "$cmd"
 }
@@ -115,7 +115,7 @@ start_worker() {
     local cmd="ray start \
         --address ${master_addr}:${MASTER_PORT} \
         --node-ip-address=${node} \
-        --num-gpus=${NPUS_PER_NODE}"
+        --resources='{\"NPU\": ${NPUS_PER_NODE}}'"
     
     remote_exec "$node" "$cmd"
 }

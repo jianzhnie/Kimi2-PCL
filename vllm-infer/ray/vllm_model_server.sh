@@ -19,6 +19,12 @@ set -euo pipefail
 # 配置加载 (外部配置文件可选，用于向后兼容)
 # -----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 首先加载 set_env.sh (包含 VLLM_HOST_IP 等关键环境变量)
+SET_ENV_FILE="${SCRIPT_DIR}/set_env.sh"
+[[ -f "$SET_ENV_FILE" ]] && source "$SET_ENV_FILE" 2>/dev/null || true
+
+# 然后加载用户自定义配置 (如果有)
 VLLM_ENV_FILE="${VLLM_ENV_FILE:-${SCRIPT_DIR}/vllm_server_env.sh}"
 [[ -f "$VLLM_ENV_FILE" ]] && source "$VLLM_ENV_FILE" 2>/dev/null || true
 
