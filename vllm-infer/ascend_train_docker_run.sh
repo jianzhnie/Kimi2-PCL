@@ -22,6 +22,7 @@ docker run -d \
     --name ${CONTAINER_NAME} \
     --ipc=host \
     --net=host \
+    --privileged \
     --ulimit memlock=-1 \
     --ulimit stack=67108864 \
     --device=/dev/davinci0 \
