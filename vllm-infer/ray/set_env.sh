@@ -34,23 +34,9 @@ export RAY_CONNECT_TIMEOUT="${RAY_CONNECT_TIMEOUT:-60}"
 # Ray 配置
 # ------------------------------------------
 export NPUS_PER_NODE="${NPUS_PER_NODE:-8}"
-export DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8266}"
 export MASTER_PORT="${MASTER_PORT:-29500}"
+export DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8266}"
 export WAIT_TIME="${WAIT_TIME:-1}"
-
-# ------------------------------------------
-# vLLM 多节点网络配置
-# ------------------------------------------
-# VLLM_HOST_IP 必须与 Ray 集群节点 IP 一致，否则 placement group 创建会失败
-# 默认使用当前主机 IP，多节点环境下需显式设置
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NODE_LIST_FILE="${SCRIPT_DIR}/node_list.txt"
-if [[ -f "$NODE_LIST_FILE" ]]; then
-    # 使用 node_list.txt 的第一个节点作为 VLLM_HOST_IP
-    VLLM_HOST_IP_DEFAULT=$(head -1 "$NODE_LIST_FILE" | awk '{print $1}')
-fi
-export VLLM_HOST_IP="${VLLM_HOST_IP:-VLLM_HOST_IP_DEFAULT}"
-export VLLM_PORT="${VLLM_PORT:-29501}"
 
 # ------------------------------------------
 # Ascend NPU 与底层环境配置
