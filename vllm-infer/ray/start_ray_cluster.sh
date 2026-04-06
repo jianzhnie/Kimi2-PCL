@@ -15,7 +15,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/set_env.sh"
 NODE_LIST_FILE="${NODES_FILE:-${PROJECT_DIR}/node_list.txt}"
-
+PARALLELISM="${PARALLELISM:-16}"
 
 # 颜色输出
 RED='\033[0;31m'
@@ -51,6 +51,13 @@ remote_exec() {
         docker exec -i '${CONTAINER_NAME}' bash -c '${cmd}'"
 }
 
+# 并发控制
+limit_jobs() {
+    while [[ "$(jobs -rp | wc -l)" -ge "$1" ]]; do
+        wait -n 2>/dev/null || sleep 0.1
+    done
+}
+
 # -----------------------------------------------------------------
 # Ray 操作函数
 # -----------------------------------------------------------------
@@ -65,15 +72,14 @@ stop_ray_on_node() {
 # 停止所有节点的 Ray 进程（并行执行）
 stop_all_ray() {
     local nodes=("$@")
-    log_info "Stopping Ray on all ${#nodes[@]} node(s)..."
+    log_info "Stopping Ray on ${#nodes[@]} node(s)..."
     
     local tmpdir=$(mktemp -d)
-    trap "rm -rf $tmpdir" EXIT
     
     for i in "${!nodes[@]}"; do
-        local node=${nodes[$i]}
+        limit_jobs "$PARALLELISM"
         (
-            stop_ray_on_node "$node" && echo "OK" > "$tmpdir/$i" || echo "FAIL" > "$tmpdir/$i"
+            stop_ray_on_node "${nodes[$i]}" && echo "OK" > "$tmpdir/$i" || echo "FAIL" > "$tmpdir/$i"
         ) &
     done
     
@@ -81,42 +87,38 @@ stop_all_ray() {
     
     local failed=0
     for i in "${!nodes[@]}"; do
-        if [[ "$(cat "$tmpdir/$i" 2>/dev/null)" != "OK" ]]; then
-            log_warn "Failed to stop Ray on: ${nodes[$i]}"
-            ((failed++))
-        fi
+        [[ "$(cat "$tmpdir/$i" 2>/dev/null)" == "OK" ]] || ((failed++))
     done
+    rm -rf "$tmpdir"
     
-    if [[ $failed -eq 0 ]]; then
-        log_info "All Ray processes stopped successfully"
-    else
-        log_warn "$failed node(s) failed to stop (may not be running)"
-    fi
+    [[ $failed -eq 0 ]] && log_info "All Ray processes stopped" || log_warn "$failed node(s) failed to stop"
 }
 
 start_head() {
-    local node=$1 master_addr=$2
+    local node=$1
     log_info "[HEAD] Starting Ray head on $node"
     
-    local resources_json='{\"NPU\": $NPUS_PER_NODE}'
-    local cmd="ray start --head \
-        --node-ip-address=${master_addr} \
-        --port ${MASTER_PORT} \
-        --dashboard-host=0.0.0.0 \
-        --dashboard-port=${DASHBOARD_PORT} \
-        --num-gpus=${NPUS_PER_NODE}"
+    # 构造 cmd，使用单引号包裹避免复杂的引号转义
+    local cmd='ray start --head'
+    cmd+=' --node-ip-address='${node}
+    cmd+=' --port '${MASTER_PORT}
+    cmd+=' --dashboard-host=0.0.0.0'
+    cmd+=' --dashboard-port '${DASHBOARD_PORT}
+    cmd+=' --num-gpus='${NPUS_PER_NODE}
+    cmd+=' --resources={\"NPU\":'${NPUS_PER_NODE}'}'
 
     remote_exec "$node" "$cmd"
 }
 
 start_worker() {
-    local node=$1 master_addr=$2
+    local node=$1 master=$2
     log_info "[WORKER] Starting Ray worker on $node"
-    local resources_json='{\"NPU\": $NPUS_PER_NODE}'
-
-    local cmd="ray start \
-        --address ${master_addr}:${MASTER_PORT} \
-        --num-gpus=${NPUS_PER_NODE}"
+    
+    # 构造 cmd，使用单引号包裹避免复杂的引号转义
+    local cmd='ray start'
+    cmd+=' --address '${master}':'${MASTER_PORT}
+    cmd+=' --num-gpus='${NPUS_PER_NODE}
+    cmd+=' --resources={\"NPU\":'${NPUS_PER_NODE}'}'
     
     remote_exec "$node" "$cmd"
 }
@@ -148,27 +150,24 @@ main() {
     mapfile -t NODES < <(awk 'NF && !/^#/ {print $1}' "$NODE_LIST_FILE")
     [[ ${#NODES[@]} -gt 0 ]] || log_fatal "No valid hosts in: $NODE_LIST_FILE"
     
-    local master_addr="${MASTER_ADDR:-${NODES[0]}}"
+    local master="${MASTER_ADDR:-${NODES[0]}}"
     local num_nodes=${#NODES[@]}
     
-    # 分离 worker 节点
     local workers=()
     for node in "${NODES[@]}"; do
-        [[ "$node" != "$master_addr" ]] && workers+=("$node")
+        [[ "$node" != "$master" ]] && workers+=("$node")
     done
     
-    # 打印配置
     log_info "============================================="
     log_info "Ray Cluster Configuration"
     log_info "============================================="
     log_info "Total nodes: $num_nodes"
     log_info "NPUs per node: $NPUS_PER_NODE"
-    log_info "Master: ${BLUE}${master_addr}${NC}:${MASTER_PORT}"
-    log_info "Dashboard: http://${master_addr}:${DASHBOARD_PORT}"
+    log_info "Master: ${BLUE}${master}${NC}:${MASTER_PORT}"
+    log_info "Dashboard: http://${master}:${DASHBOARD_PORT}"
     log_info "Workers (${#workers[@]}): ${workers[*]:-None}"
     log_info "============================================="
     
-    # 节点检查
     log_info "Checking all nodes..."
     local failed=0
     for node in "${NODES[@]}"; do
@@ -177,7 +176,7 @@ main() {
     [[ $failed -eq 0 ]] || log_fatal "Pre-checks failed with $failed error(s)"
     log_info "All checks passed"
     
-    # Step 1: 先停止所有节点的 Ray 进程
+    # Step 1: 停止所有节点的 Ray 进程（执行两次确保干净清理）
     log_info "============================================="
     stop_all_ray "${NODES[@]}"
     sleep 2
@@ -186,37 +185,35 @@ main() {
 
     # Step 2: 启动 Head 节点
     log_info "============================================="
-    start_head "$master_addr" "$master_addr" || log_fatal "Failed to start head node"
-    sleep "$WAIT_TIME"
+    start_head "$master" || log_fatal "Failed to start head node"
+    sleep "${WAIT_TIME:-2}"
     
-    # 启动 Worker 节点（并行）
+    # Step 3: 启动 Worker 节点（并行）
     log_info "============================================="
-    local failed_nodes=() success=$((num_nodes))
+    local failed_nodes=() success_count=1  # head 已启动成功
     
     if [[ ${#workers[@]} -gt 0 ]]; then
         log_info "Starting ${#workers[@]} worker(s) in parallel..."
         
-        # 并行启动 workers，将结果写入临时文件
         local tmpdir=$(mktemp -d)
-        trap "rm -rf $tmpdir" EXIT
         
         for i in "${!workers[@]}"; do
-            local node=${workers[$i]}
+            limit_jobs "$PARALLELISM"
             (
-                start_worker "$node" "$master_addr" && echo "OK" > "$tmpdir/$i" || echo "FAIL" > "$tmpdir/$i"
+                start_worker "${workers[$i]}" "$master" && echo "OK" > "$tmpdir/$i" || echo "FAIL" > "$tmpdir/$i"
             ) &
         done
         
-        # 等待所有后台任务完成
         wait
         
-        # 收集结果
         for i in "${!workers[@]}"; do
-            if [[ "$(cat "$tmpdir/$i" 2>/dev/null)" != "OK" ]]; then
+            if [[ "$(cat "$tmpdir/$i" 2>/dev/null)" == "OK" ]]; then
+                ((success_count++))
+            else
                 failed_nodes+=("${workers[$i]}")
-                ((success--))
             fi
         done
+        rm -rf "$tmpdir"
     else
         log_info "Single-node cluster mode"
     fi
@@ -230,13 +227,13 @@ main() {
         log_warn "Cluster started with ${#failed_nodes[@]} failed worker(s)"
         log_info "Failed nodes: ${failed_nodes[*]}"
     fi
-    log_info "Dashboard: http://${master_addr}:${DASHBOARD_PORT}"
-    log_info "Running: $success / $num_nodes nodes"
+    log_info "Dashboard: http://${master}:${DASHBOARD_PORT}"
+    log_info "Running: $success_count / $num_nodes nodes"
     echo -e "${BLUE}=============================================${NC}"
     
     # 显示状态
     log_info "Ray cluster status:"
-    ssh_cmd "$master_addr" "cd '${PROJECT_DIR}' && source set_env.sh 2>/dev/null && \
+    ssh_cmd "$master" "cd '${PROJECT_DIR}' && source set_env.sh 2>/dev/null && \
         docker exec -i '${CONTAINER_NAME}' \
         bash -c 'ray status'" 2>/dev/null || log_warn "Could not retrieve Ray status"
 }
