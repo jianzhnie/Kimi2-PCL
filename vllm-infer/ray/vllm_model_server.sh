@@ -33,7 +33,7 @@ VLLM_ENV_FILE="${VLLM_ENV_FILE:-${SCRIPT_DIR}/vllm_server_env.sh}"
 # ------------------------------------------------------------------------------
 # 模型路径: 指向 Hugging Face 模型目录
 # 必须包含 config.json, tokenizer 文件和模型权重
-MODEL_PATH="${MODEL_PATH:-$HOME/hfhub/models/moonshotai/Kimi-K2-Base}"
+MODEL_PATH="${MODEL_PATH:-/llm_workspace_1P/robin/hfhub/models/moonshotai/Kimi-K2-Base}"
 # 服务对外暴露的模型名称
 # 客户端调用 API 时使用此名称
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-kimi-k2-base}"
@@ -84,7 +84,7 @@ done
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-8}"
 # 流水线并行大小 (Pipeline Parallel)
 # 建议: 根据节点数设置，跨节点并行
-PIPELINE_PARALLEL_SIZE="${PIPELINE_PARALLEL_SIZE:-8}"
+PIPELINE_PARALLEL_SIZE="${PIPELINE_PARALLEL_SIZE:-16}"
 # 分布式执行后端
 # 可选: ray, mp (多进程)
 # Ray 推荐用于多节点部署
