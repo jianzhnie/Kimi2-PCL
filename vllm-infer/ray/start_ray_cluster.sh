@@ -98,24 +98,25 @@ start_head() {
     local node=$1 master_addr=$2
     log_info "[HEAD] Starting Ray head on $node"
     
+    local resources_json='{\"NPU\": $NPUS_PER_NODE}'
     local cmd="ray start --head \
         --node-ip-address=${master_addr} \
         --port ${MASTER_PORT} \
         --dashboard-host=0.0.0.0 \
         --dashboard-port=${DASHBOARD_PORT} \
-        --resources='{\"NPU\": ${NPUS_PER_NODE}}'"
-    
+        --num-gpus=${NPUS_PER_NODE}"
+
     remote_exec "$node" "$cmd"
 }
 
 start_worker() {
     local node=$1 master_addr=$2
     log_info "[WORKER] Starting Ray worker on $node"
-    
+    local resources_json='{\"NPU\": $NPUS_PER_NODE}'
+
     local cmd="ray start \
         --address ${master_addr}:${MASTER_PORT} \
-        --node-ip-address=${node} \
-        --resources='{\"NPU\": ${NPUS_PER_NODE}}'"
+        --num-gpus=${NPUS_PER_NODE}"
     
     remote_exec "$node" "$cmd"
 }
@@ -179,8 +180,9 @@ main() {
     # Step 1: 先停止所有节点的 Ray 进程
     log_info "============================================="
     stop_all_ray "${NODES[@]}"
-    sleep 1
+    sleep 2
     stop_all_ray "${NODES[@]}"
+    sleep 2
 
     # Step 2: 启动 Head 节点
     log_info "============================================="
