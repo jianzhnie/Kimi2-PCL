@@ -21,6 +21,7 @@ class DeepseekV3Config(PretrainedConfig):
         num_attention_heads=64,
         num_key_value_heads=None,
         num_query_groups=2,
+        kv_channels=128,
         group_query_attention=True,
         n_shared_experts=1,
         n_routed_experts=128,
@@ -63,6 +64,7 @@ class DeepseekV3Config(PretrainedConfig):
         },
         attention_bias=False,
         attention_dropout=0.0,
+        qk_layernorm=True,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -74,6 +76,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.num_attention_heads = num_attention_heads
         self.num_query_groups = num_query_groups
+        self.kv_channels = kv_channels
         self.group_query_attention = group_query_attention
         self.n_shared_experts = n_shared_experts
         self.n_routed_experts = n_routed_experts
@@ -108,6 +111,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.fa_without_pad = fa_without_pad
+        self.qk_layernorm = qk_layernorm
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
