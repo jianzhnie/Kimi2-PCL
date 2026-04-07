@@ -21,6 +21,9 @@ HIDDEN_SIZE = 7168
 NUM_EXPERTS = 128
 FIRST_K_DENSE_REPLACE = 2
 NUM_ATTENTION_HEADS = 64
+QK_HEAD_DIM = 128
+QK_POS_EMB_HEAD_DIM = 64
+V_HEAD_DIM = 128
 # NUM_QUERY_GROUPS 表示 KV head 总数（num_key_value_heads），
 # 对于 Kimi2-1T 为 32（64 Q heads / 2 GQA groups = 32 KV heads）。
 # 注意：不要将 GQA 分组比（2）赋值给此常量。
@@ -192,6 +195,9 @@ class MgCkptConvert:
         hidden_size: int,
         num_experts: int,
         num_attention_heads: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+        qk_pos_emb_head_dim: int,
         moe_grouped_gemm: bool,
         moe_tp_extend_ep: bool,
         schedules_method: str | None,
@@ -210,6 +216,7 @@ class MgCkptConvert:
         io_threads: int = 4,
         disable_mmap: bool = False,
         extra_config_kwargs: dict | None = None,
+        qk_layernorm: bool = False,
     ):
         self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
         self.log_rank_load = os.environ.get('CKPT_CONVERT_LOG_RANK',
@@ -228,6 +235,9 @@ class MgCkptConvert:
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_attention_heads = num_attention_heads
+        self.qk_head_dim = qk_head_dim
+        self.v_head_dim = v_head_dim
+        self.qk_pos_emb_head_dim = qk_pos_emb_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
         self.moe_tp_extend_ep = moe_tp_extend_ep
         if self.moe_tp_extend_ep:
@@ -249,10 +259,13 @@ class MgCkptConvert:
         self.moe_ffn_hidden_size = moe_ffn_hidden_size
         self.hf_config_template = hf_config_template
         self.detected_num_kv_heads = None
+        self._resolved_q_head_dim = None
+        self._resolved_kv_heads_per_tp = None
         self.cast_dtype = cast_dtype
         self.io_threads = max(1, int(io_threads))
         self.disable_mmap = bool(disable_mmap)
         self.extra_config_kwargs = extra_config_kwargs or {}
+        self.qk_layernorm = qk_layernorm
         self._target_dtype = _dtype_from_str(
             cast_dtype) if cast_dtype else None
         self._sparse_cache: dict[tuple[int, int, int, int | None],
@@ -286,7 +299,8 @@ class MgCkptConvert:
             self.layer2loc_vpp: dict[int, tuple[int, int, int]] = {}
             self._build_vpprank_layer_map()
 
-
+        # 修正：使用 qk_pos_emb_head_dim 计算 inv_dim
+        self._reset_inv_freq()
 
         self.weight_map: dict[str, str] = {}
         self.total_size_bytes = 0
@@ -307,6 +321,58 @@ class MgCkptConvert:
                         missing.append((tp, pp))
             if missing:
                 logger.info('Missing (tp,pp) in rank dirs: %s', missing[:20])
+
+    def _reset_inv_freq(self) -> None:
+        inv_dim = int(self.qk_pos_emb_head_dim)
+        if inv_dim <= 0:
+            self.inv_freq = torch.empty((0, ), dtype=torch.float32)
+            return
+        inv_freq = 1.0 / (self.rotary_base**(
+            torch.arange(0, inv_dim, 2, dtype=torch.float32) / inv_dim))
+        self.inv_freq = inv_freq
+
+    def _infer_qkv_layout(self, shard_rows: int) -> tuple[int, int] | None:
+        if self.num_attention_heads % self.tp_size != 0:
+            return None
+        heads_per_tp = self.num_attention_heads // self.tp_size
+        if heads_per_tp <= 0:
+            return None
+        max_q_head_dim = shard_rows // heads_per_tp
+        if max_q_head_dim <= 0:
+            return None
+
+        preferred: list[int] = []
+        preferred.append(self.qk_head_dim + self.qk_pos_emb_head_dim)
+        preferred.append(self.qk_head_dim)
+        preferred.append(self.qk_pos_emb_head_dim)
+        preferred = [d for d in preferred if isinstance(d, int) and d > 0]
+
+        seen: set[int] = set()
+        candidates: list[int] = []
+        for d in preferred:
+            if d not in seen:
+                candidates.append(d)
+                seen.add(d)
+
+        for d in range(8, max_q_head_dim + 1, 8):
+            if d not in seen:
+                candidates.append(d)
+                seen.add(d)
+
+        for q_head_dim in candidates:
+            q_per_tp = heads_per_tp * q_head_dim
+            rem = shard_rows - q_per_tp
+            if rem < 0:
+                continue
+            denom = q_head_dim + self.v_head_dim
+            if denom <= 0 or rem % denom != 0:
+                continue
+            kv_heads_per_tp = rem // denom
+            if kv_heads_per_tp <= 0:
+                continue
+            return q_head_dim, kv_heads_per_tp
+
+        return None
 
     def _repo_models_dir(self) -> str:
         return os.path.abspath(
@@ -348,6 +414,10 @@ class MgCkptConvert:
         cfg['hidden_size'] = self.hidden_size
         cfg['num_hidden_layers'] = self.num_real_layers
         cfg['num_attention_heads'] = self.num_attention_heads
+        cfg['qk_nope_head_dim'] = self.qk_head_dim
+        cfg['qk_rope_head_dim'] = self.qk_pos_emb_head_dim
+        cfg['v_head_dim'] = self.v_head_dim
+        cfg['qk_layernorm'] = self.qk_layernorm
         cfg['rope_theta'] = float(self.rotary_base)
         cfg['ep_size'] = self.ep_size
         cfg['first_k_dense_replace'] = self.first_k_dense_replace
@@ -827,6 +897,8 @@ class MgCkptConvert:
         prefix = f'decoder.layers.{local_idx}.self_attention'
         qkv_key = f'{prefix}.linear_qkv.weight'
         proj_key = f'{prefix}.linear_proj.weight'
+        q_norm_key = f'{prefix}.q_layernorm.weight'
+        k_norm_key = f'{prefix}.k_layernorm.weight'
 
         linear_proj_list: list[torch.Tensor] = []
         q_parts: list[torch.Tensor] = []
@@ -837,28 +909,61 @@ class MgCkptConvert:
             raise ValueError(
                 f'num_attention_heads={self.num_attention_heads} 不能整除 tp_size={self.tp_size}'
             )
-
-        # 标准 GQA 计算
-        head_dim = self.hidden_size // self.num_attention_heads
-        num_kv_heads = self.num_key_value_heads or self.num_attention_heads
-        kv_heads_per_tp = num_kv_heads // self.tp_size
-        heads_per_tp = self.num_attention_heads // self.tp_size
+        q_head_dim = self._resolved_q_head_dim or (self.qk_head_dim +
+                                                   self.qk_pos_emb_head_dim)
+        kv_heads_per_tp_fixed = self._resolved_kv_heads_per_tp
 
         for tp_rank in range(self.tp_size):
             linear_proj_list.append(models[(tp_rank, 0)].pop(proj_key))
             qkv_shard = models[(tp_rank, 0)].pop(qkv_key)
+            heads_per_tp = self.num_attention_heads // self.tp_size
 
-            q_per_tp = heads_per_tp * head_dim
-            k_per_tp = kv_heads_per_tp * head_dim
-            v_per_tp = kv_heads_per_tp * head_dim
+            if self._resolved_q_head_dim is None:
+                q_per_tp_try = heads_per_tp * q_head_dim
+                rem_try = qkv_shard.shape[0] - q_per_tp_try
+                denom_try = q_head_dim + self.v_head_dim
+                bad = rem_try < 0 or denom_try <= 0 or rem_try % denom_try != 0
+                if bad:
+                    inferred = self._infer_qkv_layout(int(qkv_shard.shape[0]))
+                    if inferred is None:
+                        raise ValueError(
+                            f'{qkv_key} 分片形状异常: {qkv_shard.shape}, q_per_tp={q_per_tp_try}'
+                        )
+                    inferred_q_head_dim, inferred_kv_heads_per_tp = inferred
+                    if (inferred_q_head_dim !=
+                            self.qk_head_dim + self.qk_pos_emb_head_dim):
+                        self.qk_head_dim = 0
+                        self.qk_pos_emb_head_dim = int(inferred_q_head_dim)
+                        self._reset_inv_freq()
+                    self._resolved_q_head_dim = int(inferred_q_head_dim)
+                    self._resolved_kv_heads_per_tp = int(
+                        inferred_kv_heads_per_tp)
+                    q_head_dim = self._resolved_q_head_dim
+                    kv_heads_per_tp_fixed = self._resolved_kv_heads_per_tp
+                    if self.verbose:
+                        logger.info(
+                            'Auto-detected qkv layout: q_head_dim=%d kv_heads_per_tp=%d (from shard_rows=%d)',
+                            q_head_dim,
+                            kv_heads_per_tp_fixed,
+                            int(qkv_shard.shape[0]),
+                        )
 
-            expected_size = q_per_tp + k_per_tp + v_per_tp
-            if qkv_shard.shape[0] != expected_size:
+            q_per_tp = heads_per_tp * q_head_dim
+            rem = qkv_shard.shape[0] - q_per_tp
+            if rem < 0:
                 raise ValueError(
-                    f'{qkv_key} 分片形状异常: {qkv_shard.shape}, expected={expected_size} '
-                    f'(q_per_tp={q_per_tp}, k_per_tp={k_per_tp}, v_per_tp={v_per_tp})'
+                    f'{qkv_key} 分片形状异常: {qkv_shard.shape}, q_per_tp={q_per_tp}'
                 )
-
+            denom = q_head_dim + self.v_head_dim
+            if denom <= 0 or rem % denom != 0:
+                raise ValueError(
+                    f'{qkv_key} 分片剩余维度异常: rem={rem}, q_head_dim={q_head_dim}, v_head_dim={self.v_head_dim}'
+                )
+            kv_heads_per_tp = kv_heads_per_tp_fixed or (rem // denom)
+            if self.detected_num_kv_heads is None:
+                self.detected_num_kv_heads = kv_heads_per_tp * self.tp_size
+            k_per_tp = kv_heads_per_tp * q_head_dim
+            v_per_tp = kv_heads_per_tp * self.v_head_dim
             q_r, k_r, v_r = torch.split(qkv_shard,
                                         [q_per_tp, k_per_tp, v_per_tp],
                                         dim=0)
@@ -874,6 +979,14 @@ class MgCkptConvert:
         hf[f'model.layers.{hf_layer}.self_attn.v_proj.weight'] = torch.cat(
             v_parts, dim=0)
         hf[f'model.layers.{hf_layer}.self_attn.o_proj.weight'] = o_proj
+        q_ln = models[(0, 0)].pop(q_norm_key, None)
+        if q_ln is not None:
+            hf[f'model.layers.{hf_layer}.self_attn.q_layernorm.weight'] = q_ln
+        k_ln = models[(0, 0)].pop(k_norm_key, None)
+        if k_ln is not None:
+            hf[f'model.layers.{hf_layer}.self_attn.k_layernorm.weight'] = k_ln
+        hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone(
+        )
         return
 
     def _reconstruct_router(self, models: dict[tuple[int, int],
@@ -1167,6 +1280,9 @@ class MgCkptConvert:
                 hidden_size=self.hidden_size,
                 num_experts=self.num_experts,
                 num_attention_heads=self.num_attention_heads,
+                qk_head_dim=self.qk_head_dim,
+                v_head_dim=self.v_head_dim,
+                qk_pos_emb_head_dim=self.qk_pos_emb_head_dim,
                 moe_grouped_gemm=self.moe_grouped_gemm,
                 moe_tp_extend_ep=self.moe_tp_extend_ep,
                 schedules_method=self.schedules_method,
@@ -1315,6 +1431,18 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override attention heads.')
+    parser.add_argument('--qk-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override qk head dim.')
+    parser.add_argument('--v-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override v head dim.')
+    parser.add_argument('--qk-pos-emb-head-dim',
+                        type=int,
+                        default=None,
+                        help='Override qk pos emb head dim.')
     parser.add_argument('--max-position-embeddings',
                         type=int,
                         default=None,
@@ -1326,6 +1454,9 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override num key value heads (GQA).')
+    parser.add_argument('--qk-layernorm',
+                        action='store_true',
+                        help='Enable QK LayerNorm (must match training config)')
     parser.add_argument('--vocab-size',
                         type=int,
                         default=None,
@@ -1360,6 +1491,9 @@ def main() -> None:
     hidden_size = args.hidden_size or HIDDEN_SIZE
     num_experts = args.num_experts or NUM_EXPERTS
     num_attention_heads = args.num_attention_heads or NUM_ATTENTION_HEADS
+    qk_head_dim = args.qk_head_dim or QK_HEAD_DIM
+    v_head_dim = args.v_head_dim or V_HEAD_DIM
+    qk_pos_emb_head_dim = args.qk_pos_emb_head_dim or QK_POS_EMB_HEAD_DIM
 
     tie_word_embeddings = bool(getattr(args, 'tie_word_embeddings', False))
 
@@ -1374,6 +1508,9 @@ def main() -> None:
         hidden_size=hidden_size,
         num_experts=num_experts,
         num_attention_heads=num_attention_heads,
+        qk_head_dim=qk_head_dim,
+        v_head_dim=v_head_dim,
+        qk_pos_emb_head_dim=qk_pos_emb_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
         moe_tp_extend_ep=args.moe_tp_extend_ep,
         schedules_method=args.schedules_method,
@@ -1392,6 +1529,7 @@ def main() -> None:
         io_threads=args.io_threads,
         disable_mmap=args.disable_mmap,
         extra_config_kwargs=extra_config_kwargs,
+        qk_layernorm=args.qk_layernorm,
     )
     converter.run()
     _write_sha256_manifest(args.save_dir, args.sha256_manifest)
