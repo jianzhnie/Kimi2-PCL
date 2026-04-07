@@ -72,3 +72,19 @@ bash copy_to_docker.sh -p 16 -r /remote/file.py /container/file.py
 # 运行 vllm 推理
 bash /llm_workspace_1P/robin/Kimi2-PCL/vllm-infer/run_vllm_test.sh
 
+
+model_path=/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2_L32_exp_4096_dies/b834d725-34df-47ca-ab07-4b93a36b9e87 
+python get_mcore_weights.py $model_path \
+  --tp 2 \
+  --pp 8 \
+  --ep 64 \
+  --schedules-method dualpipev \
+  --vpp-stage 2 \
+  --num-layers 32 \
+  --first-k-dense-replace 2 \
+  --num-attention-heads 64 \
+  --num-key-value-heads 32 \
+  --hidden-size 7168 \
+  --vocab-size 163840 \
+  --num-experts 128 \
+  --output mcore_weights_info.json
