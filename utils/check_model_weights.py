@@ -310,14 +310,17 @@ def verify_config_consistency(repo_root: Path) -> bool:
         ('num_hidden_layers', 'num_hidden_layers'),
         ('num_attention_heads', 'num_attention_heads'),
         ('num_key_value_heads', 'num_key_value_heads'),
-        ('qk_nope_head_dim', 'qk_nope_head_dim'),
-        ('qk_rope_head_dim', 'qk_rope_head_dim'),
-        ('v_head_dim', 'v_head_dim'),
         ('n_routed_experts', 'n_routed_experts'),
         ('n_shared_experts', 'n_shared_experts'),
         ('first_k_dense_replace', 'first_k_dense_replace'),
         ('max_position_embeddings', 'max_position_embeddings'),
         ('rope_theta', 'rope_theta'),
+    ]
+    # Optional mappings - only check if both exist
+    optional_mappings = [
+        ('qk_nope_head_dim', 'qk_nope_head_dim'),
+        ('qk_rope_head_dim', 'qk_rope_head_dim'),
+        ('v_head_dim', 'v_head_dim'),
     ]
 
     for py_attr, json_key in key_mappings:
@@ -326,6 +329,14 @@ def verify_config_consistency(repo_root: Path) -> bool:
 
         if py_val != json_val:
             mismatches.append((py_attr, py_val, json_val))
+    
+    # Check optional mappings only if they exist in both
+    for py_attr, json_key in optional_mappings:
+        if hasattr(cfg, py_attr) and json_key in json_cfg:
+            py_val = getattr(cfg, py_attr)
+            json_val = json_cfg.get(json_key)
+            if py_val != json_val:
+                mismatches.append((py_attr, py_val, json_val))
 
     if mismatches:
         print("❌ 发现配置不匹配:")
@@ -573,14 +584,17 @@ def _main_check_checkpoint(args):
         print('\n' + '=' * 60)
         print('HEAD DIM DIAGNOSTICS')
         print('=' * 60)
-        exp_q_out = config.num_attention_heads * (config.qk_nope_head_dim +
-                                                  config.qk_rope_head_dim)
+        # Safely get head dimension attributes with defaults
+        qk_nope_head_dim = getattr(config, 'qk_nope_head_dim', 128)
+        qk_rope_head_dim = getattr(config, 'qk_rope_head_dim', 64)
+        v_head_dim = getattr(config, 'v_head_dim', 128)
+        exp_q_out = config.num_attention_heads * (qk_nope_head_dim + qk_rope_head_dim)
         exp_k_out = getattr(
             config, 'num_key_value_heads', config.num_attention_heads) * (
-                config.qk_nope_head_dim + config.qk_rope_head_dim)
+                qk_nope_head_dim + qk_rope_head_dim)
         exp_v_out = getattr(config, 'num_key_value_heads',
-                            config.num_attention_heads) * config.v_head_dim
-        exp_o_in = config.num_attention_heads * config.v_head_dim
+                            config.num_attention_heads) * v_head_dim
+        exp_o_in = config.num_attention_heads * v_head_dim
         print(
             f"  Expected q_proj out: {exp_q_out}  | Observed: {sorted(observed_dims['q_proj_out'])}"
         )
@@ -594,10 +608,10 @@ def _main_check_checkpoint(args):
             f"  Expected o_proj in : {exp_o_in}   | Observed: {sorted(observed_dims['o_proj_in'])}"
         )
         print(
-            f"  Expected q_ln dim  : {config.qk_nope_head_dim + config.qk_rope_head_dim} | Observed: {sorted(observed_dims['q_layernorm_dim'])}"
+            f"  Expected q_ln dim  : {qk_nope_head_dim + qk_rope_head_dim} | Observed: {sorted(observed_dims['q_layernorm_dim'])}"
         )
         print(
-            f"  Expected k_ln dim  : {config.qk_nope_head_dim + config.qk_rope_head_dim} | Observed: {sorted(observed_dims['k_layernorm_dim'])}"
+            f"  Expected k_ln dim  : {qk_nope_head_dim + qk_rope_head_dim} | Observed: {sorted(observed_dims['k_layernorm_dim'])}"
         )
 
     ok = not missing_in_ckpt and not extra_in_ckpt

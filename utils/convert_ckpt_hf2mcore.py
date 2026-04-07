@@ -22,9 +22,6 @@ DEFAULT_MODEL_CONFIG = {
     'num_experts': 128,
     'first_k_dense_replace': 2,
     'num_attention_heads': 64,
-    'qk_head_dim': 128,
-    'qk_pos_emb_head_dim': 64,
-    'v_head_dim': 128,
 }
 
 # Keep for backward compatibility
@@ -32,9 +29,6 @@ HIDDEN_SIZE = DEFAULT_MODEL_CONFIG['hidden_size']
 NUM_EXPERTS = DEFAULT_MODEL_CONFIG['num_experts']
 FIRST_K_DENSE_REPLACE = DEFAULT_MODEL_CONFIG['first_k_dense_replace']
 NUM_ATTENTION_HEADS = DEFAULT_MODEL_CONFIG['num_attention_heads']
-QK_HEAD_DIM = DEFAULT_MODEL_CONFIG['qk_head_dim']
-QK_POS_EMB_HEAD_DIM = DEFAULT_MODEL_CONFIG['qk_pos_emb_head_dim']
-V_HEAD_DIM = DEFAULT_MODEL_CONFIG['v_head_dim']
 
 
 def _parse_int_list(value: Optional[str]) -> Optional[list[int]]:
@@ -130,9 +124,6 @@ class CkptConvert:
         num_key_value_heads: int | None,
         num_experts: int,
         num_attention_heads: int,
-        qk_head_dim: int,
-        qk_pos_emb_head_dim: int,
-        v_head_dim: int,
         moe_grouped_gemm: bool,
         moe_tp_extend_ep: bool,
         schedules_method: str | None,
@@ -147,7 +138,6 @@ class CkptConvert:
         cast_dtype: str | None = None,
         tie_word_embeddings: bool | None = None,
         hf_io_threads: int = 1,
-        qk_layernorm: bool = False,
     ):
         self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
         self.log_file_load = os.environ.get('CKPT_CONVERT_LOG_FILE',
@@ -178,9 +168,6 @@ class CkptConvert:
         self.num_key_value_heads = num_key_value_heads
         self.num_experts = num_experts
         self.num_attention_heads = num_attention_heads
-        self.qk_head_dim = qk_head_dim
-        self.qk_pos_emb_head_dim = qk_pos_emb_head_dim
-        self.v_head_dim = v_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
         self.moe_tp_extend_ep = moe_tp_extend_ep
         self.schedules_method = schedules_method
@@ -190,7 +177,6 @@ class CkptConvert:
         self.noop_layers = noop_layers
         self.qlora_nf4 = qlora_nf4
         self.rotary_base = rotary_base
-        self.qk_layernorm = qk_layernorm
 
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
         if self.dualpipe:
@@ -240,11 +226,10 @@ class CkptConvert:
                 str(self.dualpipe),
             )
             logger.info(
-                'HF->Megatron: hidden=%d heads=%d qk=%d v=%d rotary_base=%s first_k_dense=%d',
+                'HF->Megatron: hidden=%d heads=%d kv_heads=%d rotary_base=%s first_k_dense=%d',
                 int(self.hidden_size),
                 int(self.num_attention_heads),
-                int(self.qk_head_dim),
-                int(self.v_head_dim),
+                int(self.num_key_value_heads or self.num_attention_heads),
                 str(self.rotary_base),
                 int(self.first_k_dense_replace),
             )
@@ -789,23 +774,15 @@ class CkptConvert:
             f'model.layers.{hf_layer}.self_attn.v_proj.weight')
         o_proj = weights.pop(
             f'model.layers.{hf_layer}.self_attn.o_proj.weight')
-        q_ln = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.q_layernorm.weight', None)
-        k_ln = weights.pop(
-            f'model.layers.{hf_layer}.self_attn.k_layernorm.weight', None)
         weights.pop(f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq',
                     None)
 
-        q_norm_key = f'{prefix}.q_layernorm.weight'
-        k_norm_key = f'{prefix}.k_layernorm.weight'
-
-        self._validate_attention_config()
-
-        expected_q_head_dim = self.qk_head_dim + self.qk_pos_emb_head_dim
-        expected_q_rows = self.num_attention_heads * expected_q_head_dim
+        # Standard GQA: use uniform head_dim
+        head_dim = self.hidden_size // self.num_attention_heads
+        expected_q_rows = self.num_attention_heads * head_dim
         expected_kv_heads = self.num_key_value_heads
-        expected_k_rows = expected_kv_heads * expected_q_head_dim
-        expected_v_rows = expected_kv_heads * self.v_head_dim
+        expected_k_rows = expected_kv_heads * head_dim
+        expected_v_rows = expected_kv_heads * head_dim
         if q_weight.shape[0] != expected_q_rows:
             raise ValueError(
                 f'Q projection row mismatch: expected {expected_q_rows}, got {q_weight.shape[0]}'
@@ -835,10 +812,6 @@ class CkptConvert:
             for tp_rank in range(self.tp_size):
                 mg_model[ep_rank][tp_rank][qkv_key] = qkv_shards[tp_rank]
                 mg_model[ep_rank][tp_rank][proj_key] = o_proj_shards[tp_rank]
-                if q_ln is not None:
-                    mg_model[ep_rank][tp_rank][q_norm_key] = q_ln
-                if k_ln is not None:
-                    mg_model[ep_rank][tp_rank][k_norm_key] = k_ln
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank], proj_key,
                                       o_proj_shards[tp_rank])
 
@@ -1283,9 +1256,6 @@ class CkptConvert:
             num_key_value_heads=self.num_key_value_heads,
             num_experts=self.num_experts,
             num_attention_heads=self.num_attention_heads,
-            qk_head_dim=self.qk_head_dim,
-            qk_pos_emb_head_dim=self.qk_pos_emb_head_dim,
-            v_head_dim=self.v_head_dim,
             moe_grouped_gemm=self.moe_grouped_gemm,
             moe_tp_extend_ep=self.moe_tp_extend_ep,
             schedules_method=self.schedules_method,
@@ -1300,7 +1270,6 @@ class CkptConvert:
             cast_dtype=self.cast_dtype,
             tie_word_embeddings=self.tie_word_embeddings,
             hf_io_threads=self.hf_io_threads,
-            qk_layernorm=self.qk_layernorm,
         )
 
         t0 = time.time()
@@ -1410,22 +1379,6 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override num key value heads.')
-    parser.add_argument('--qk-head-dim',
-                        type=int,
-                        default=None,
-                        help='Override qk head dim.')
-    parser.add_argument('--v-head-dim',
-                        type=int,
-                        default=None,
-                        help='Override v head dim.')
-    parser.add_argument('--qk-pos-emb-head-dim',
-                        type=int,
-                        default=None,
-                        help='Override qk pos emb head dim.')
-    parser.add_argument(
-        '--qk-layernorm',
-        action='store_true',
-        help='Enable QK LayerNorm (must match pretrain config)')
     parser.add_argument('--max-position-embeddings',
                         type=int,
                         default=None,
@@ -1497,14 +1450,8 @@ def main() -> None:
         'n_experts') or hf_cfg.get('n_routed_experts') or NUM_EXPERTS
     num_attention_heads = args.num_attention_heads or hf_cfg.get(
         'num_attention_heads') or NUM_ATTENTION_HEADS
-    qk_head_dim = args.qk_head_dim or hf_cfg.get(
-        'qk_nope_head_dim') or hf_cfg.get('qk_head_dim') or QK_HEAD_DIM
-    v_head_dim = args.v_head_dim or hf_cfg.get('v_head_dim') or V_HEAD_DIM
     rotary_base = args.rotary_base or hf_cfg.get('rope_theta') or 50000.0
 
-    qk_rope_head_dim = args.qk_pos_emb_head_dim or hf_cfg.get(
-        'qk_rope_head_dim') or hf_cfg.get(
-            'qk_pos_emb_head_dim') or QK_POS_EMB_HEAD_DIM
     # num_key_value_heads 语义：KV head 总数（即 num_key_value_heads）。
     # 优先从 HF config 读取 num_key_value_heads，其次 num_kv_heads，
     num_key_value_heads = hf_cfg.get(
@@ -1513,15 +1460,17 @@ def main() -> None:
     tie_word_embeddings = bool(hf_cfg.get('tie_word_embeddings'))
     if getattr(args, 'tie_word_embeddings', False):
         tie_word_embeddings = True
+    
+    # Calculate head_dim for standard GQA
+    head_dim = hidden_size // num_attention_heads
+    
     logger.info(
-        'HF config summary: layers=%s hidden=%s heads=%s kv_heads=%s qk_nope=%s qk_rope=%s v=%s rope_theta=%s',
+        'HF config summary: layers=%s hidden=%s heads=%s kv_heads=%s head_dim=%s rope_theta=%s',
         str(num_layers),
         str(hf_cfg.get('hidden_size')),
         str(hf_cfg.get('num_attention_heads')),
         str(num_key_value_heads),
-        str(hf_cfg.get('qk_nope_head_dim') or hf_cfg.get('qk_head_dim')),
-        str(qk_rope_head_dim),
-        str(hf_cfg.get('v_head_dim')),
+        str(head_dim),
         str(hf_cfg.get('rope_theta')),
     )
 
@@ -1540,9 +1489,6 @@ def main() -> None:
         num_key_value_heads=num_key_value_heads,
         num_experts=num_experts,
         num_attention_heads=num_attention_heads,
-        qk_head_dim=qk_head_dim,
-        qk_pos_emb_head_dim=qk_rope_head_dim,
-        v_head_dim=v_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
         moe_tp_extend_ep=args.moe_tp_extend_ep,
         schedules_method=args.schedules_method,
@@ -1555,7 +1501,6 @@ def main() -> None:
         save_workers=args.save_workers,
         cast_dtype=args.cast_dtype,
         tie_word_embeddings=tie_word_embeddings,
-        qk_layernorm=args.qk_layernorm,
     )
     converter.run()
     _write_sha256_manifest(args.save_dir, args.sha256_manifest)
