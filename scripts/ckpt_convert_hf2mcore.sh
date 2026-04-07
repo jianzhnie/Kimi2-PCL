@@ -61,9 +61,6 @@ VOCAB_SIZE="${VOCAB_SIZE:-163840}"
 NUM_EXPERTS="${NUM_EXPERTS:-128}"
 NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-64}"
 NUM_KEY_VALUE_HEADS="${NUM_KEY_VALUE_HEADS:-32}"
-QK_HEAD_DIM="${QK_HEAD_DIM:-128}"
-V_HEAD_DIM="${V_HEAD_DIM:-128}"
-QK_POS_EMB_HEAD_DIM="${QK_POS_EMB_HEAD_DIM:-64}"
 MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"
 
 if [[ ! -d "${LOAD_DIR}" ]]; then
@@ -154,8 +151,5 @@ python "${CONVERT_SCRIPT}" \
   --num-attention-heads "${NUM_ATTENTION_HEADS}" \
   --num-key-value-heads "${NUM_KEY_VALUE_HEADS}" \
   --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}" \
-  --qk-head-dim "${QK_HEAD_DIM}" \
-  --v-head-dim "${V_HEAD_DIM}" \
-  --qk-pos-emb-head-dim "${QK_POS_EMB_HEAD_DIM}" \
   --sha256-manifest "${SAVE_DIR}/sha256_manifest.json" \
   "${EXTRA_ARGS[@]}"
