@@ -46,7 +46,7 @@ from transformers.utils import (add_start_docstrings,
                                 replace_return_docstrings)
 from transformers.utils.import_utils import is_torch_fx_available
 
-from .configuration_deepseek_1t import DeepseekV3Config
+from .configuration_deepseek import DeepseekV3Config
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -710,18 +710,14 @@ class DeepseekV3Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = getattr(config, 'num_key_value_heads',
-                                           self.num_heads)
-        if self.num_heads % self.num_key_value_heads != 0:
-            raise ValueError(
-                f'num_attention_heads ({self.num_heads}) must be divisible by num_key_value_heads ({self.num_key_value_heads})'
-            )
+        self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        
+        # Standard GQA: use uniform head_dim for all Q, K, V
+        self.head_dim = self.hidden_size // self.num_heads
 
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
-        # Standard GQA: use uniform head_dim for all Q, K, V
-        self.head_dim = self.hidden_size // self.num_heads
         self.is_causal = True
 
         self.q_proj = nn.Linear(self.hidden_size,
@@ -738,6 +734,14 @@ class DeepseekV3Attention(nn.Module):
             self.hidden_size,
             bias=config.attention_bias,
         )
+        if getattr(config, 'qk_layernorm', False):
+            self.q_layernorm = DeepseekV3RMSNorm(self.head_dim,
+                                                 eps=config.rms_norm_eps)
+            self.k_layernorm = DeepseekV3RMSNorm(self.head_dim,
+                                                 eps=config.rms_norm_eps)
+        else:
+            self.q_layernorm = None
+            self.k_layernorm = None
 
         self._init_rope()
 
@@ -821,6 +825,10 @@ class DeepseekV3Attention(nn.Module):
         value_states = self.v_proj(hidden_states).view(
             bsz, q_len, self.num_key_value_heads,
             self.head_dim).transpose(1, 2)
+
+        if self.q_layernorm is not None:
+            query_states = self.q_layernorm(query_states)
+            key_states = self.k_layernorm(key_states)
 
         kv_seq_len = value_states.shape[-2]
         if past_key_value is not None:
@@ -916,6 +924,9 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                                                      self.head_dim)
         value_states = self.v_proj(hidden_states).view(
             bsz, q_len, self.num_key_value_heads, self.head_dim)
+        if self.q_layernorm is not None:
+            query_states = self.q_layernorm(query_states)
+            key_states = self.k_layernorm(key_states)
 
         kv_seq_len = value_states.shape[1]
         if past_key_value is not None:
@@ -942,6 +953,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             cache_kwargs = {'sin': sin, 'cos': cos}
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs)
+            query_states = query_states.transpose(1, 2)
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
 
