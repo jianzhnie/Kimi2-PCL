@@ -4,6 +4,10 @@
     ],
     "attention_bias": false,
     "attention_dropout": 0.0,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "qk_layernorm": true,
     "auto_map": {
         "AutoConfig": "configuration_deepseek.DeepseekV3Config",
         "AutoModel": "modeling_deepseek.DeepseekV3Model",
