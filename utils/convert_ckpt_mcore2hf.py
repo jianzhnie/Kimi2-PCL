@@ -382,20 +382,18 @@ class MgCkptConvert:
         if self.hf_config_template:
             return self.hf_config_template
         models_dir = self._repo_models_dir()
-        cfg_1t = os.path.join(models_dir, 'config_1t.json')
-        if os.path.isfile(cfg_1t):
+        cfg_file = os.path.join(models_dir, 'config.json')
+        if os.path.isfile(cfg_file):
             try:
-                with open(cfg_1t) as f:
+                with open(cfg_file) as f:
                     d = json.load(f)
                 if int(d.get('hidden_size', -1)) == self.hidden_size and int(
                         d.get('num_hidden_layers',
                               -1)) == self.num_real_layers:
-                    return cfg_1t
+                    return cfg_file
             except Exception:
                 pass
         candidates = [
-            os.path.join(models_dir, 'config_1t.json'),
-            os.path.join(models_dir, 'config_100b.json'),
             os.path.join(models_dir, 'config.json'),
         ]
         for p in candidates:
@@ -712,7 +710,7 @@ class MgCkptConvert:
             logger.info('Loading models for stage: pp_rank=%d vpp_rank=%s',
                         pp_rank, vpp_rank)
 
-        def one(
+        def load_one(
             tp_rank: int
         ) -> tuple[int, int | None, dict[str, torch.Tensor]
                    | None]:
@@ -726,14 +724,14 @@ class MgCkptConvert:
         max_workers = min(self.io_threads, self.tp_size)
         if max_workers <= 1:
             for tp_rank in range(self.tp_size):
-                tp, base_ep, st = one(tp_rank)
+                tp, base_ep, st = load_one(tp_rank)
                 if st is None or base_ep is None:
                     continue
                 models[(tp, base_ep)] = st
                 models[(tp, 0)] = st
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = [ex.submit(one, tp) for tp in range(self.tp_size)]
+                futures = [ex.submit(load_one, tp) for tp in range(self.tp_size)]
                 for fut in as_completed(futures):
                     tp, base_ep, st = fut.result()
                     if st is None or base_ep is None:
@@ -804,8 +802,6 @@ class MgCkptConvert:
         out = torch.empty((self.num_experts, ) + sample.shape[1:],
                           dtype=sample.dtype)
         num_local = self.num_experts // self.ep_size
-
-        import gc
 
         for ep in range(self.ep_size):
             owners = self._tp_ranks_for_ep(pp_rank, ep)
@@ -1070,8 +1066,6 @@ class MgCkptConvert:
         hf[f'model.layers.{hf_layer}.mlp.shared_experts.gate_proj.weight'] = shared_gate
         hf[f'model.layers.{hf_layer}.mlp.shared_experts.up_proj.weight'] = shared_up
         hf[f'model.layers.{hf_layer}.mlp.shared_experts.down_proj.weight'] = shared_fc2
-
-        import gc
 
         if self.moe_grouped_gemm:
             w1_key = f'{prefix}.experts.weight1'
