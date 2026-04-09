@@ -1,4 +1,24 @@
 #!/usr/bin/env -S env -u BASH_ENV bash
+# =============================================================================
+# Huggingface (HF) 到 Megatron-Core (MCore) 模型权重转换脚本
+# 
+# 基于 Kimi2-1T 模型架构配置
+# 参考: scripts/pretrain_kimi2_1t_4k.sh
+#
+# 模型配置:
+#   - 32 层 Transformer
+#   - Hidden size: 7168
+#   - Attention heads: 64 (Q) / 32 (KV) - GQA
+#   - MoE: 128 experts, 前 2 层为 Dense
+#   - Vocab size: 163840
+#
+# 默认并行配置 (与训练脚本一致):
+#   - TP (Tensor Parallel): 2
+#   - PP (Pipeline Parallel): 8  
+#   - EP (Expert Parallel): 64
+#   - 调度: DualPipeV
+# =============================================================================
+
 set -euo pipefail
 if [[ -f "${HOME}/.bashrc" ]]; then
   set +u
@@ -12,9 +32,9 @@ if [[ -f "/usr/local/Ascend/ascend-toolkit/set_env.sh" ]]; then
 fi
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-# 默认启用 MOE_TP_EXTEND_EP（用于昇腾等硬件优化）
-# 可通过 MOE_TP_EXTEND_EP=0 禁用
-export MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-1}"
+# MOE_TP_EXTEND_EP: 使用 TP 组扩展 EP 并行 (用于昇腾等硬件优化)
+# 默认禁用 (0)，可通过 MOE_TP_EXTEND_EP=1 启用
+export MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-0}"
 
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 
@@ -40,31 +60,39 @@ if [[ -z "${SAVE_DIR}" ]]; then
 fi
 
 
-TP="${TP:-2}"
-PP="${PP:-8}"
-EP="${EP:-8}"
-PP_WORKERS="${PP_WORKERS:-2}"
-IO_THREADS="${IO_THREADS:-2}"
-SAVE_WORKERS="${SAVE_WORKERS:-0}"
-CAST_DTYPE="${CAST_DTYPE:-bf16}"
-NUM_LAYERS="${NUM_LAYERS:-32}"
-FIRST_K_DENSE_REPLACE="${FIRST_K_DENSE_REPLACE:-2}"
-ROTARY_BASE="${ROTARY_BASE:-50000}"
-NOOP_LAYERS="${NOOP_LAYERS:-}"
-NUM_LAYER_LIST="${NUM_LAYER_LIST:-}"
-SCHEDULES_METHOD="${SCHEDULES_METHOD:-dualpipev}"
+# =============================================================================
+# 并行配置 (与训练脚本 pretrain_kimi2_1t_4k.sh 保持一致)
+# =============================================================================
+TP="${TP:-2}"                          # Tensor Parallel size
+PP="${PP:-8}"                          # Pipeline Parallel size
+EP="${EP:-64}"                         # Expert Parallel size
+PP_WORKERS="${PP_WORKERS:-2}"          # PP 并行工作进程数
+IO_THREADS="${IO_THREADS:-2}"          # HF 权重加载线程数
+SAVE_WORKERS="${SAVE_WORKERS:-0}"      # 保存权重线程数 (0=自动)
+CAST_DTYPE="${CAST_DTYPE:-bf16}"       # 输出数据类型
+SCHEDULES_METHOD="${SCHEDULES_METHOD:-dualpipev}"  # 调度算法
 
-HIDDEN_SIZE="${HIDDEN_SIZE:-7168}"
-FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-18432}"
-MOE_FFN_HIDDEN_SIZE="${MOE_FFN_HIDDEN_SIZE:-12288}"
-VOCAB_SIZE="${VOCAB_SIZE:-163840}"
-NUM_EXPERTS="${NUM_EXPERTS:-128}"
-NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-64}"
-NUM_KEY_VALUE_HEADS="${NUM_KEY_VALUE_HEADS:-32}"
-QK_HEAD_DIM="${QK_HEAD_DIM:-128}"
-V_HEAD_DIM="${V_HEAD_DIM:-128}"
-QK_POS_EMB_HEAD_DIM="${QK_POS_EMB_HEAD_DIM:-64}"
-MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"
+# =============================================================================
+# 模型架构配置 (与 models/config.json 保持一致)
+# =============================================================================
+NUM_LAYERS="${NUM_LAYERS:-32}"                    # 总层数
+FIRST_K_DENSE_REPLACE="${FIRST_K_DENSE_REPLACE:-2}"  # 前 N 层使用 Dense MLP
+HIDDEN_SIZE="${HIDDEN_SIZE:-7168}"                # 隐藏层维度
+FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-18432}"       # Dense FFN 中间维度
+MOE_FFN_HIDDEN_SIZE="${MOE_FFN_HIDDEN_SIZE:-12288}"  # MoE FFN 中间维度
+VOCAB_SIZE="${VOCAB_SIZE:-163840}"                # 词汇表大小
+NUM_EXPERTS="${NUM_EXPERTS:-128}"                 # 专家数量
+NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-64}"  # Q attention heads
+NUM_KEY_VALUE_HEADS="${NUM_KEY_VALUE_HEADS:-32}"  # KV attention heads (GQA)
+QK_HEAD_DIM="${QK_HEAD_DIM:-128}"                 # QK 无位置编码维度
+QK_POS_EMB_HEAD_DIM="${QK_POS_EMB_HEAD_DIM:-64}"  # QK 位置编码维度
+V_HEAD_DIM="${V_HEAD_DIM:-128}"                   # V head 维度
+ROTARY_BASE="${ROTARY_BASE:-50000}"               # RoPE 基数
+MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"  # 最大位置编码
+
+# 可选配置
+NOOP_LAYERS="${NOOP_LAYERS:-}"           # 空层列表 (逗号分隔)
+NUM_LAYER_LIST="${NUM_LAYER_LIST:-}"     # 自定义每层分配列表
 
 if [[ ! -d "${LOAD_DIR}" ]]; then
   echo "ERROR: LOAD_DIR does not exist: ${LOAD_DIR}" >&2
