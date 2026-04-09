@@ -1,3 +1,20 @@
+"""
+Huggingface (HF) 到 Megatron-Core (MCore) 模型权重转换
+
+基于 Kimi2-1T 模型架构，支持：
+- GQA (Grouped Query Attention)
+- MoE (Mixture of Experts)  with 128 experts
+- TP (Tensor Parallel) / PP (Pipeline Parallel) / EP (Expert Parallel)
+- DualPipeV 调度算法
+- QK LayerNorm
+
+参考：
+- scripts/pretrain_kimi2_1t_4k.sh (训练配置)
+- megatron_model.py (MCore 模型结构)
+- model_param_mapping.json (参数映射)
+- models/config.json (HF 模型配置)
+"""
+
 import argparse
 import hashlib
 import json
@@ -13,28 +30,20 @@ from typing import Optional, Union
 import torch
 from safetensors import safe_open
 
+# 导入权重映射定义
+from utils.hf2mcore_mapping import ModelConfig, WeightMapping, DimensionCalculator
+
 logger.basicConfig(format='')
 logger.getLogger().setLevel(logger.INFO)
 
-# Default model configuration - can be overridden via HF config or CLI args
-DEFAULT_MODEL_CONFIG = {
-    'hidden_size': 7168,
-    'num_experts': 128,
-    'first_k_dense_replace': 2,
-    'num_attention_heads': 64,
-    'qk_head_dim': 128,
-    'qk_pos_emb_head_dim': 64,
-    'v_head_dim': 128,
-}
-
-# Keep for backward compatibility
-HIDDEN_SIZE = DEFAULT_MODEL_CONFIG['hidden_size']
-NUM_EXPERTS = DEFAULT_MODEL_CONFIG['num_experts']
-FIRST_K_DENSE_REPLACE = DEFAULT_MODEL_CONFIG['first_k_dense_replace']
-NUM_ATTENTION_HEADS = DEFAULT_MODEL_CONFIG['num_attention_heads']
-QK_HEAD_DIM = DEFAULT_MODEL_CONFIG['qk_head_dim']
-QK_POS_EMB_HEAD_DIM = DEFAULT_MODEL_CONFIG['qk_pos_emb_head_dim']
-V_HEAD_DIM = DEFAULT_MODEL_CONFIG['v_head_dim']
+# 默认模型配置 (与 ModelConfig 保持一致，用于向后兼容)
+HIDDEN_SIZE = ModelConfig.HIDDEN_SIZE
+NUM_EXPERTS = ModelConfig.NUM_EXPERTS
+FIRST_K_DENSE_REPLACE = ModelConfig.FIRST_K_DENSE_REPLACE
+NUM_ATTENTION_HEADS = ModelConfig.NUM_ATTENTION_HEADS
+QK_HEAD_DIM = ModelConfig.QK_HEAD_DIM
+QK_POS_EMB_HEAD_DIM = ModelConfig.QK_POS_EMB_HEAD_DIM
+V_HEAD_DIM = ModelConfig.V_HEAD_DIM
 
 
 def _parse_int_list(value: Optional[str]) -> Optional[list[int]]:
@@ -690,6 +699,15 @@ class CkptConvert:
     def _set_preprocess(
             self, weights: dict[str, torch.Tensor],
             mg_model: dict[int, dict[int, dict[str, torch.Tensor]]]) -> None:
+        """
+        转换输入嵌入层权重。
+        
+        权重映射:
+            HF: model.embed_tokens.weight -> MCore: embedding.word_embeddings.weight
+        
+        TP 切分策略:
+            - dim=0 (在 vocab_size 维度切分)
+        """
         if self.tie_word_embeddings and self.pp_size == 1 and self.vpp_stage is None:
             emb = weights['model.embed_tokens.weight']
         else:
@@ -706,6 +724,17 @@ class CkptConvert:
     def _set_postprocess(
             self, weights: dict[str, torch.Tensor],
             mg_model: dict[int, dict[int, dict[str, torch.Tensor]]]) -> None:
+        """
+        转换输出层权重 (Final LayerNorm 和 LM Head)。
+        
+        权重映射:
+            HF: model.norm.weight -> MCore: decoder.final_layernorm.weight
+            HF: lm_head.weight -> MCore: output_layer.weight
+            
+        注意:
+            - 如果 tie_word_embeddings=True，lm_head 可能与 embed_tokens 共享权重
+            - LM Head TP 切分策略: dim=0 (在 vocab_size 维度切分)
+        """
         final_norm = weights.pop('model.norm.weight')
         lm_head = weights.pop('lm_head.weight', None)
         if lm_head is None:
@@ -734,6 +763,16 @@ class CkptConvert:
         weights: dict[str, torch.Tensor],
         mg_model: dict[int, dict[int, dict[str, torch.Tensor]]],
     ) -> None:
+        """
+        转换层的 LayerNorm 权重。
+        
+        权重映射:
+            HF: input_layernorm.weight -> MCore: input_layernorm.weight
+            HF: post_attention_layernorm.weight -> MCore: pre_mlp_layernorm.weight
+            
+        注意:
+            - LayerNorm 权重不参与 TP 切分 (所有 rank 相同)
+        """
         in_norm = weights.pop(
             f'model.layers.{hf_layer}.input_layernorm.weight')
         post_norm = weights.pop(
@@ -773,10 +812,30 @@ class CkptConvert:
         weights: dict[str, torch.Tensor],
         mg_model: dict[int, dict[int, dict[str, torch.Tensor]]],
     ) -> None:
+        """
+        转换 Attention 层权重从 HF 格式到 MCore 格式。
+        
+        权重映射:
+            HF: q_proj, k_proj, v_proj (分离) -> MCore: linear_qkv (融合)
+            HF: o_proj -> MCore: linear_proj
+            HF: q_layernorm, k_layernorm -> MCore: q_layernorm, k_layernorm (可选)
+        
+        维度计算 (基于 Kimi2-1T 配置):
+            - q_head_dim = qk_head_dim + qk_pos_emb_head_dim = 128 + 64 = 192
+            - Q projection rows = num_attention_heads * q_head_dim = 64 * 192 = 12288
+            - K projection rows = num_key_value_heads * q_head_dim = 32 * 192 = 6144
+            - V projection rows = num_key_value_heads * v_head_dim = 32 * 128 = 4096
+            - 融合 QKV rows = 12288 + 6144 + 4096 = 22528
+        
+        TP 切分策略:
+            - QKV: dim=0 (在 heads 维度切分)
+            - O_proj: dim=1 (在 hidden_size 维度切分)
+        """
         prefix = f'decoder.layers.{local_layer_idx}.self_attention'
         qkv_key = f'{prefix}.linear_qkv.weight'
         proj_key = f'{prefix}.linear_proj.weight'
 
+        # 检查是否使用了 MLA (Multi-head Latent Attention)，当前只支持 GQA
         if 'model.layers.0.self_attn.q_proj.weight' not in self.weight_map and 'model.layers.0.self_attn.q_a_proj.weight' in self.weight_map:
             raise ValueError(
                 '检测到 MLA 权重(如 q_a_proj)，但当前代码已移除 MLA 支持，只支持 GQA。请检查输入的 HF 权重。')
@@ -849,6 +908,25 @@ class CkptConvert:
         weights: dict[str, torch.Tensor],
         mg_model: dict[int, dict[int, dict[str, torch.Tensor]]],
     ) -> None:
+        """
+        转换 MLP 层权重从 HF 格式到 MCore 格式。
+        
+        支持两种模式:
+        1. Dense MLP (前 first_k_dense_replace 层):
+            - HF: gate_proj, up_proj (分离) -> MCore: linear_fc1 (融合)
+            - HF: down_proj -> MCore: linear_fc2
+            
+        2. MoE (剩余层):
+            - HF: gate.weight -> MCore: router.weight
+            - HF: gate.e_score_correction_bias -> MCore: router.expert_bias (可选)
+            - HF: shared_experts.gate_proj/up_proj -> MCore: shared_experts.linear_fc1
+            - HF: shared_experts.down_proj -> MCore: shared_experts.linear_fc2
+            - HF: experts.{i}.{gate,up,down}_proj -> MCore: experts.local_experts.{i}.linear_fc{1,2}
+        
+        TP 切分策略:
+            - linear_fc1: dim=0 (在 intermediate_size 维度切分)
+            - linear_fc2: dim=1 (在 hidden_size 维度切分)
+        """
         prefix = f'decoder.layers.{local_layer_idx}.mlp'
 
         if hf_layer < self.first_k_dense_replace:
@@ -1563,4 +1641,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-    
