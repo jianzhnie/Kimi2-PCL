@@ -100,6 +100,31 @@ class DeepseekV3RMSNorm(nn.Module):
         return (self.weight.to(input_dtype) * hidden_states).to(input_dtype)
 
 
+class DeepseekV3LayerNorm(nn.Module):
+    """
+    LayerNorm with weight and bias.
+    Used for q_layernorm and k_layernorm to align with Megatron implementation.
+    """
+
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        # Standard LayerNorm: normalize then apply weight and bias
+        mean = hidden_states.mean(-1, keepdim=True)
+        variance = (hidden_states - mean).pow(2).mean(-1, keepdim=True)
+        hidden_states = (hidden_states - mean) * torch.rsqrt(variance +
+                                                              self.variance_epsilon)
+        # Apply weight and bias
+        hidden_states = hidden_states * self.weight + self.bias
+        return hidden_states.to(input_dtype)
+
+
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
 
 
@@ -713,39 +738,44 @@ class DeepseekV3Attention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         
-        # Standard GQA: use uniform head_dim for all Q, K, V
-        self.head_dim = self.hidden_size // self.num_heads
+        # Kimi2-1T uses Decoupled Head Dimensions
+        self.qk_nope_head_dim = getattr(config, 'qk_nope_head_dim', 128)
+        self.qk_rope_head_dim = getattr(config, 'qk_rope_head_dim', 64)
+        self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.k_head_dim = self.q_head_dim
+        self.v_head_dim = getattr(config, 'v_head_dim', 128)
 
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
         self.q_proj = nn.Linear(self.hidden_size,
-                                self.num_heads * self.head_dim,
+                                self.num_heads * self.q_head_dim,
                                 bias=config.attention_bias)
         self.k_proj = nn.Linear(self.hidden_size,
-                                self.num_key_value_heads * self.head_dim,
+                                self.num_key_value_heads * self.k_head_dim,
                                 bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size,
-                                self.num_key_value_heads * self.head_dim,
+                                self.num_key_value_heads * self.v_head_dim,
                                 bias=config.attention_bias)
         self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim,
+            self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=config.attention_bias,
         )
         if getattr(config, 'qk_layernorm', False):
-            self.q_layernorm = DeepseekV3RMSNorm(self.head_dim,
-                                                 eps=config.rms_norm_eps)
-            self.k_layernorm = DeepseekV3RMSNorm(self.head_dim,
-                                                 eps=config.rms_norm_eps)
+            # Use LayerNorm with bias for q/k layernorm to align with Megatron
+            self.q_layernorm = DeepseekV3LayerNorm(self.q_head_dim,
+                                                   eps=config.rms_norm_eps)
+            self.k_layernorm = DeepseekV3LayerNorm(self.k_head_dim,
+                                                   eps=config.rms_norm_eps)
         else:
             self.q_layernorm = None
             self.k_layernorm = None
 
         self._init_rope()
 
-        self.softmax_scale = self.head_dim**(-0.5)
+        self.softmax_scale = self.q_head_dim**(-0.5)
         if self.config.rope_scaling is not None:
             mscale_all_dim = self.config.rope_scaling.get('mscale_all_dim', 0)
             scaling_factor = self.config.rope_scaling['factor']
@@ -756,7 +786,7 @@ class DeepseekV3Attention(nn.Module):
     def _init_rope(self):
         if self.config.rope_scaling is None:
             self.rotary_emb = DeepseekV3RotaryEmbedding(
-                self.head_dim,
+                self.qk_rope_head_dim,
                 max_position_embeddings=self.max_position_embeddings,
                 base=self.rope_theta,
             )
@@ -765,14 +795,14 @@ class DeepseekV3Attention(nn.Module):
             scaling_factor = self.config.rope_scaling['factor']
             if scaling_type == 'linear':
                 self.rotary_emb = DeepseekV3LinearScalingRotaryEmbedding(
-                    self.head_dim,
+                    self.qk_rope_head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
                     base=self.rope_theta,
                 )
             elif scaling_type == 'dynamic':
                 self.rotary_emb = DeepseekV3DynamicNTKScalingRotaryEmbedding(
-                    self.head_dim,
+                    self.qk_rope_head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
                     base=self.rope_theta,
@@ -789,7 +819,7 @@ class DeepseekV3Attention(nn.Module):
                     ] if key in self.config.rope_scaling
                 }
                 self.rotary_emb = DeepseekV3YarnRotaryEmbedding(
-                    self.head_dim,
+                    self.qk_rope_head_dim,
                     max_position_embeddings=self.max_position_embeddings,
                     scaling_factor=scaling_factor,
                     base=self.rope_theta,
@@ -815,16 +845,16 @@ class DeepseekV3Attention(nn.Module):
             )
         bsz, q_len, _ = hidden_states.size()
 
-        # Standard GQA: uniform head_dim for Q, K, V
+        # Decoupled Head Dimensions
         query_states = self.q_proj(hidden_states).view(
-            bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len,
                                                      self.num_key_value_heads,
-                                                     self.head_dim).transpose(
+                                                     self.k_head_dim).transpose(
                                                          1, 2)
         value_states = self.v_proj(hidden_states).view(
             bsz, q_len, self.num_key_value_heads,
-            self.head_dim).transpose(1, 2)
+            self.v_head_dim).transpose(1, 2)
 
         if self.q_layernorm is not None:
             query_states = self.q_layernorm(query_states)
@@ -844,9 +874,19 @@ class DeepseekV3Attention(nn.Module):
                 kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
         # Apply RoPE to Q and K
+        q_nope, q_pe = torch.split(
+            query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        k_nope, k_pe = torch.split(
+            key_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin, position_ids)
+        q_pe, k_pe = apply_rotary_pos_emb(
+            q_pe, k_pe, cos, sin, position_ids)
+            
+        query_states = torch.cat([q_nope, q_pe], dim=-1)
+        key_states = torch.cat([k_nope, k_pe], dim=-1)
 
         if past_key_value is not None:
             cache_kwargs = {'sin': sin, 'cos': cos}
@@ -874,7 +914,7 @@ class DeepseekV3Attention(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len,
-                                          self.num_heads * self.head_dim)
+                                          self.num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -915,15 +955,15 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
 
         bsz, q_len, _ = hidden_states.size()
 
-        # Standard GQA: uniform head_dim for Q, K, V
+        # Decoupled Head Dimensions
         query_states = self.q_proj(hidden_states).view(bsz, q_len,
                                                        self.num_heads,
-                                                       self.head_dim)
+                                                       self.q_head_dim)
         key_states = self.k_proj(hidden_states).view(bsz, q_len,
                                                      self.num_key_value_heads,
-                                                     self.head_dim)
+                                                     self.k_head_dim)
         value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim)
+            bsz, q_len, self.num_key_value_heads, self.v_head_dim)
         if self.q_layernorm is not None:
             query_states = self.q_layernorm(query_states)
             key_states = self.k_layernorm(key_states)
@@ -937,13 +977,23 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                 kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
         # Apply RoPE to Q and K
+        q_nope, q_pe = torch.split(
+            query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+        k_nope, k_pe = torch.split(
+            key_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+        )
+
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states,
-                                                        key_states,
-                                                        cos,
-                                                        sin,
-                                                        position_ids,
-                                                        unsqueeze_dim=2)
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe,
+                                          k_pe,
+                                          cos,
+                                          sin,
+                                          position_ids,
+                                          unsqueeze_dim=2)
+
+        query_states = torch.cat([q_nope, q_pe], dim=-1)
+        key_states = torch.cat([k_nope, k_pe], dim=-1)
 
         if past_key_value is not None:
             # past_key_value expects (bsz, num_heads, seq_len, head_dim) or similar
@@ -988,7 +1038,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         )
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads *
-                                          self.head_dim).contiguous()
+                                          self.v_head_dim).contiguous()
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:

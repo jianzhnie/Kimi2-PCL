@@ -65,6 +65,9 @@ class DeepseekV3Config(PretrainedConfig):
         attention_bias=False,
         attention_dropout=0.0,
         qk_layernorm=True,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -112,6 +115,9 @@ class DeepseekV3Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.fa_without_pad = fa_without_pad
         self.qk_layernorm = qk_layernorm
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.v_head_dim = v_head_dim
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -119,3 +125,6 @@ class DeepseekV3Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+        # Set default attention implementation after super().__init__
+        if self._attn_implementation is None:
+            self._attn_implementation = 'eager'
