@@ -1042,12 +1042,39 @@ class MCoreCheckpointReader:
         global_idx = self._get_global_layer_id(local_idx, pp_rank, vpp_rank)
         return f'{prefix}{global_idx}{suffix}'
 
+    def _sort_key(self, name: str) -> tuple:
+        """
+        生成排序 key，确保按 layer 顺序排列。
+        
+        顺序：embedding -> layers 0,1,2... -> final_layernorm -> output_layer
+        """
+        # 提取 layer 编号
+        layer_match = re.search(r'layers\.(\d+)', name)
+        if layer_match:
+            layer_num = int(layer_match.group(1))
+            # 返回 (category_order, layer_num, rest_of_name)
+            # 对于 layers，使用 layer_num 作为主要排序依据
+            prefix = name.split('layers.')[0] + 'layers.'
+            suffix = name.split('layers.')[1].split('.', 1)[1] if '.' in name.split('layers.')[1] else ''
+            return (1, layer_num, suffix)
+        elif 'embedding' in name:
+            return (0, 0, name)
+        elif 'final_layernorm' in name:
+            return (2, 0, name)
+        elif 'output_layer' in name:
+            return (3, 0, name)
+        else:
+            return (4, 0, name)
+
     def get_json_output(self) -> dict:
-        """生成 JSON 格式的输出。"""
+        """生成 JSON 格式的输出，按 layer 顺序排序。"""
         result = self.extract_weights()
         
+        # 对 megatron_params 按 layer 顺序排序
+        sorted_params = dict(sorted(result.megatron_params.items(), key=lambda x: self._sort_key(x[0])))
+        
         return {
-            'megatron_params': result.megatron_params,
+            'megatron_params': sorted_params,
             'metadata': result.metadata,
         }
 
