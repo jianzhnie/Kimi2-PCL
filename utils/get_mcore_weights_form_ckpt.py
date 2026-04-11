@@ -5,6 +5,12 @@ MCore 格式权重读取与保存工具
 从 MCore checkpoint 中提取权重信息（名称、形状、数据类型、requires_grad），
 输出格式与 model_param_mapping_tp1.json 的 megatron_params 部分对齐。
 
+修复内容：
+1. 修复 TP 合并逻辑 - 对于非 EP 切分权重，正确合并所有 TP rank 的 shape
+2. 添加 kv_channels 参数支持 - 正确计算 attention 维度
+3. 修复 expert 权重的 TP 维度判断 - expert 不参与 TP 切分
+4. 添加 shape 验证 - 自动检测合并是否正确
+
 用法：
   python get_mcore_weights_form_ckpt.py /path/to/mcore/checkpoint \
     --tp 2 --pp 8 --ep 64 \
@@ -26,7 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 import torch
 
-logging.basicConfig(format='%(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -143,17 +149,18 @@ def _get_tensor_size(shape: Tuple[int, ...], dtype: str) -> int:
         numel *= dim
     
     elem_size = 2  # 默认 bf16/fp16
-    if 'float32' in dtype or 'fp32' in dtype:
+    dtype_lower = dtype.lower()
+    if 'float32' in dtype_lower or 'fp32' in dtype_lower:
         elem_size = 4
-    elif 'float64' in dtype or 'fp64' in dtype:
+    elif 'float64' in dtype_lower or 'fp64' in dtype_lower:
         elem_size = 8
-    elif 'int8' in dtype or 'uint8' in dtype:
+    elif 'int8' in dtype_lower or 'uint8' in dtype_lower:
         elem_size = 1
-    elif 'int16' in dtype:
+    elif 'int16' in dtype_lower:
         elem_size = 2
-    elif 'int32' in dtype:
+    elif 'int32' in dtype_lower:
         elem_size = 4
-    elif 'int64' in dtype:
+    elif 'int64' in dtype_lower:
         elem_size = 8
     
     return numel * elem_size
@@ -167,7 +174,7 @@ class WeightInfo:
     dtype: str
     requires_grad: bool
     size_bytes: int
-    source: str = ""  # 来源信息，如 "pp=0,vpp=0"
+    source: str = ""  # 来源信息，如 "pp=0,vpp=0,tp=0,ep=0"
 
 
 @dataclass
@@ -221,6 +228,8 @@ class MCoreCheckpointReader:
     
     读取权重信息并保存为 JSON（输出格式与 model_param_mapping_tp1.json 对齐）
     保留 MCore 原始权重名称。
+    
+    修复：正确合并 TP 和 EP 维度的权重
     """
 
     def __init__(
@@ -234,13 +243,17 @@ class MCoreCheckpointReader:
         num_attention_heads: Optional[int] = None,
         num_key_value_heads: Optional[int] = None,
         hidden_size: Optional[int] = None,
+        kv_channels: Optional[int] = None,
+        ffn_hidden_size: Optional[int] = None,
+        moe_ffn_hidden_size: Optional[int] = None,
         first_k_dense_replace: int = 2,
         vocab_size: Optional[int] = None,
         schedules_method: Optional[str] = None,
         vpp_stage: Optional[int] = None,
-        io_threads: int = 4,
+        io_threads: int = 16,
         disable_mmap: bool = False,
         verbose: bool = True,
+        validate_shapes: bool = True,
     ):
         self.verbose = verbose
         self.mcore_dir = mcore_dir
@@ -262,11 +275,12 @@ class MCoreCheckpointReader:
         self.num_attention_heads = num_attention_heads or 64
         self.num_key_value_heads = num_key_value_heads or 2
         self.hidden_size = hidden_size or 7168
+        self.kv_channels = kv_channels or 128  # 重要：从训练脚本获取
+        self.ffn_hidden_size = ffn_hidden_size or 18432
+        self.moe_ffn_hidden_size = moe_ffn_hidden_size or 12288
         self.first_k_dense_replace = first_k_dense_replace
         self.vocab_size = vocab_size or 163840
-
-        # 计算 head_dim
-        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.validate_shapes = validate_shapes
 
         # 其他配置
         self.io_threads = max(1, int(io_threads))
@@ -382,6 +396,9 @@ class MCoreCheckpointReader:
 
         if self.verbose:
             logger.info('Rank dir map size=%d', len(self._rank_dir_map))
+            # 显示前几个映射
+            for i, (k, v) in enumerate(list(self._rank_dir_map.items())[:5]):
+                logger.info('  (tp=%d, pp=%d) -> ep_ranks=%s', k[0], k[1], v)
 
     def _detect_vpp(self) -> Tuple[Optional[int], Optional[List[str]]]:
         """检测 VPP 配置。"""
@@ -566,11 +583,27 @@ class MCoreCheckpointReader:
         """
         确定权重在哪个维度上进行张量并行切分。
         
+        重要：专家权重不参与 TP 切分（expert-tensor-parallel-size=1）
+        
         返回:
             0: 在第0维切分 (row-wise)
             1: 在第1维切分 (column-wise)
             None: 不切分
         """
+        # 专家权重不参与 TP 切分
+        if 'experts.local_experts' in mcore_name:
+            return None
+        if '.experts.weight1' in mcore_name or '.experts.weight2' in mcore_name:
+            return None
+        
+        # Shared experts 参与 TP 切分
+        if 'shared_experts.linear_fc1.weight' in mcore_name:
+            return 0
+        if 'shared_experts.linear_fc1.bias' in mcore_name:
+            return 0
+        if 'shared_experts.linear_fc2.weight' in mcore_name:
+            return 1
+
         # Row-wise (dim=0): 输出维度被切分
         if 'embedding.word_embeddings.weight' in mcore_name:
             return 0
@@ -584,36 +617,12 @@ class MCoreCheckpointReader:
             return 0
         if 'mlp.linear_fc1.bias' in mcore_name:
             return 0
-        if 'shared_experts.linear_fc1.weight' in mcore_name:
-            return 0
-        if 'shared_experts.linear_fc1.bias' in mcore_name:
-            return 0
-        # MoE experts (local_experts 格式)
-        if 'experts.local_experts' in mcore_name and 'linear_fc1.weight' in mcore_name:
-            return 0
-        if 'experts.local_experts' in mcore_name and 'linear_fc1.bias' in mcore_name:
-            return 0
-        # MoE experts (grouped_gemm 格式: experts.weight1/weight2)
-        if '.experts.weight1' in mcore_name:
-            # weight1 shape: [hidden, num_local_experts*intermediate_size*2]
-            # 在第1维切分 (column-wise)
-            return 1
 
         # Column-wise (dim=1): 输入维度被切分
         if 'self_attention.linear_proj.weight' in mcore_name:
             return 1
         if 'mlp.linear_fc2.weight' in mcore_name:
             return 1
-        if 'shared_experts.linear_fc2.weight' in mcore_name:
-            return 1
-        # MoE experts (local_experts 格式)
-        if 'experts.local_experts' in mcore_name and 'linear_fc2.weight' in mcore_name:
-            return 1
-        # MoE experts (grouped_gemm 格式)
-        if '.experts.weight2' in mcore_name:
-            # weight2 shape: [num_local_experts*intermediate_size, hidden]
-            # 在第0维切分 (row-wise)
-            return 0
 
         # 不切分
         if 'layernorm' in mcore_name.lower():
@@ -624,6 +633,9 @@ class MCoreCheckpointReader:
             return None
         if 'router.score_bias' in mcore_name:
             return None
+        if '.bias' in mcore_name and 'fc' in mcore_name:
+            # 某些 bias 可能被切分，需要进一步检查
+            pass
 
         return None
 
@@ -683,26 +695,97 @@ class MCoreCheckpointReader:
             base_shape[0] = total_experts_dim
             return tuple(base_shape)
 
-        # 对于 local_experts 格式，每个专家是独立的，不需要合并 shape
-        # 但需要确保所有 EP rank 的专家都被记录
+        # 对于 local_experts 格式，每个专家是独立的
         return ep_shapes[0]
+
+    def _get_expected_shape(self, name: str) -> Optional[Tuple[int, ...]]:
+        """
+        获取权重的期望形状（用于验证）。
+        
+        根据模型配置计算期望的 shape。
+        """
+        # Embedding
+        if 'embedding.word_embeddings.weight' in name:
+            return (self.vocab_size, self.hidden_size)
+        
+        # Output layer
+        if 'output_layer.weight' in name:
+            return (self.vocab_size, self.hidden_size)
+        
+        # LayerNorm
+        if 'layernorm.weight' in name.lower():
+            return (self.hidden_size,)
+        
+        # Q/K Layernorm (for MLA)
+        if 'q_layernorm.weight' in name or 'k_layernorm.weight' in name:
+            return (self.kv_channels,)
+        
+        # Attention QKV
+        if 'self_attention.linear_qkv.weight' in name:
+            # QKV dim = num_heads * kv_channels + 2 * kv_heads * kv_channels
+            qkv_dim = (self.num_attention_heads + 2 * self.num_key_value_heads) * self.kv_channels
+            return (qkv_dim, self.hidden_size)
+        
+        if 'self_attention.linear_qkv.bias' in name:
+            qkv_dim = (self.num_attention_heads + 2 * self.num_key_value_heads) * self.kv_channels
+            return (qkv_dim,)
+        
+        # Attention projection
+        if 'self_attention.linear_proj.weight' in name:
+            return (self.hidden_size, self.num_attention_heads * self.kv_channels)
+        
+        # Dense MLP (first_k_dense_replace layers)
+        if '.mlp.linear_fc1.weight' in name and 'shared_experts' not in name and 'experts' not in name:
+            return (self.ffn_hidden_size, self.hidden_size)
+        if '.mlp.linear_fc2.weight' in name and 'shared_experts' not in name and 'experts' not in name:
+            return (self.hidden_size, self.ffn_hidden_size)
+        
+        # Shared experts
+        if 'shared_experts.linear_fc1.weight' in name:
+            return (self.moe_ffn_hidden_size, self.hidden_size)
+        if 'shared_experts.linear_fc2.weight' in name:
+            return (self.hidden_size, self.moe_ffn_hidden_size)
+        
+        # Router
+        if 'router.weight' in name:
+            return (self.num_experts, self.hidden_size)
+        if 'router.expert_bias' in name:
+            return (self.num_experts,)
+        
+        # Experts
+        if '.experts.weight1' in name:
+            # [hidden, num_experts * intermediate_size * 2]
+            return (self.hidden_size, self.num_experts * self.moe_ffn_hidden_size * 2)
+        if '.experts.weight2' in name:
+            # [num_experts * intermediate_size, hidden]
+            return (self.num_experts * self.moe_ffn_hidden_size, self.hidden_size)
+        
+        return None
+
+    def _validate_merged_shape(self, name: str, merged_shape: Tuple[int, ...]) -> List[str]:
+        """验证合并后的 shape 是否正确。"""
+        warnings = []
+        expected = self._get_expected_shape(name)
+        
+        if expected is None:
+            return warnings
+        
+        if len(merged_shape) != len(expected):
+            warnings.append(f'{name}: 维度不匹配，期望 {len(expected)}D，实际 {len(merged_shape)}D')
+            return warnings
+        
+        for i, (actual, exp) in enumerate(zip(merged_shape, expected)):
+            if actual != exp:
+                warnings.append(f'{name}: 维度 {i} 不匹配，期望 {exp}，实际 {actual}')
+        
+        return warnings
 
     def extract_weights(self) -> ExtractResult:
         """
         提取所有权重信息。
         
-        输出格式与 model_param_mapping_tp1.json 对齐：
-        {
-          "megatron_params": {
-            "module.embedding.word_embeddings.weight": {
-              "shape": [163840, 7168],
-              "dtype": "torch.bfloat16",
-              "requires_grad": true
-            },
-            ...
-          },
-          "metadata": {...}
-        }
+        修复：正确合并 TP 维度的权重
+        对于非 EP 切分权重，跨所有 EP rank 收集 TP shapes 并正确合并
         """
         self._validate()
         self._build_rank_dir_map()
@@ -736,8 +819,8 @@ class MCoreCheckpointReader:
             logger.info("迭代目录: %s", self.iter_dir)
             logger.info("并行配置: TP=%d, PP=%d, EP=%d, VPP=%s",
                        self.tp_size, self.pp_size, self.ep_size, self.vpp_size)
-            logger.info("模型配置: layers=%d, hidden=%d, experts=%d",
-                       self.num_layers, self.hidden_size, self.num_experts)
+            logger.info("模型配置: layers=%d, hidden=%d, experts=%d, kv_channels=%d",
+                       self.num_layers, self.hidden_size, self.num_experts, self.kv_channels)
 
         # 确定所有 stages
         if self.vpp_size is None:
@@ -776,60 +859,90 @@ class MCoreCheckpointReader:
 
             # 处理每个权重
             for name, tp_ep_tensors in weight_tensors.items():
-                # 按 EP rank 分组，在每个 EP 组内合并 TP
-                ep_merged_shapes: Dict[int, Tuple[int, ...]] = {}
-                ep_dtypes: Dict[int, str] = {}
-                ep_requires_grad: Dict[int, bool] = {}
+                # 转换 layer index
+                final_name = self._convert_layer_index(name, pp_rank, vpp_rank)
+                mcore_full_name = f'module.{final_name}'
+                
+                # 如果已经处理过，跳过
+                if mcore_full_name in megatron_params:
+                    continue
+                
+                # 判断是否是 EP 切分权重
+                is_ep_sharded = self._is_ep_sharded(name)
+                tp_parallel_dim = self._get_tp_parallel_dim(name)
+                
+                # 收集所有 (tp_rank, ep_rank) 的 shapes
+                all_shapes: Dict[Tuple[int, int], Tuple[int, ...]] = {}
+                all_dtypes: Dict[Tuple[int, int], str] = {}
+                all_requires_grad: Dict[Tuple[int, int], bool] = {}
+                
+                for (tp_rank, ep_rank), tensor in tp_ep_tensors.items():
+                    all_shapes[(tp_rank, ep_rank)] = tuple(tensor.shape)
+                    all_dtypes[(tp_rank, ep_rank)] = _get_torch_dtype_name(tensor.dtype)
+                    all_requires_grad[(tp_rank, ep_rank)] = getattr(tensor, 'requires_grad', True)
                 
                 # 按 EP rank 分组
                 ep_groups: Dict[int, List[Tuple[int, Tuple[int, ...]]]] = defaultdict(list)
-                for (tp_rank, ep_rank), tensor in tp_ep_tensors.items():
-                    ep_groups[ep_rank].append((tp_rank, tuple(tensor.shape)))
-                    if ep_rank not in ep_dtypes:
-                        ep_dtypes[ep_rank] = _get_torch_dtype_name(tensor.dtype)
-                        ep_requires_grad[ep_rank] = getattr(tensor, 'requires_grad', True)
+                for (tp_rank, ep_rank), shape in all_shapes.items():
+                    ep_groups[ep_rank].append((tp_rank, shape))
                 
                 # 在每个 EP 组内合并 TP shapes
+                ep_merged_shapes: Dict[int, Tuple[int, ...]] = {}
                 for ep_rank, tp_shapes_list in ep_groups.items():
-                    tp_shapes = [s for _, s in sorted(tp_shapes_list)]
+                    # 按 TP rank 排序
+                    tp_shapes_list_sorted = sorted(tp_shapes_list, key=lambda x: x[0])
+                    tp_shapes = [s for _, s in tp_shapes_list_sorted]
                     ep_merged_shapes[ep_rank] = self._merge_tp_shapes(name, tp_shapes)
                 
                 # 合并所有 EP rank 的 shapes
-                if len(ep_merged_shapes) > 1 and self._is_ep_sharded(name):
-                    # EP 切分的权重需要合并
+                if is_ep_sharded and len(ep_merged_shapes) > 1:
+                    # EP 切分权重：在 EP 维度合并
                     sorted_ep_ranks = sorted(ep_merged_shapes.keys())
                     sorted_shapes = [ep_merged_shapes[ep] for ep in sorted_ep_ranks]
                     merged_shape = self._merge_ep_shapes(name, sorted_shapes, sorted_ep_ranks)
                 else:
-                    # 非 EP 切分权重，取第一个
-                    merged_shape = list(ep_merged_shapes.values())[0]
+                    # 非 EP 切分权重：所有 EP 组的 shape 应该相同
+                    # 但由于 TP 合并，我们需要重新检查
+                    if tp_parallel_dim is not None and len(ep_merged_shapes) > 1:
+                        # 这是一个 TP 切分权重，但在多个 EP rank 上都有相同的数据
+                        # 我们需要确保 TP 合并在所有 EP rank 上进行
+                        # 收集所有 EP rank 的所有 TP shapes
+                        all_tp_shapes = []
+                        for ep_rank in sorted(ep_groups.keys()):
+                            tp_shapes_list = sorted(ep_groups[ep_rank], key=lambda x: x[0])
+                            for tp_rank, shape in tp_shapes_list:
+                                all_tp_shapes.append(shape)
+                        # 重新合并所有 TP shapes
+                        merged_shape = self._merge_tp_shapes(name, all_tp_shapes)
+                    else:
+                        # 不切分的权重，取第一个
+                        merged_shape = list(ep_merged_shapes.values())[0]
                 
-                # 获取 dtype 和 requires_grad
-                dtype = list(ep_dtypes.values())[0]
-                requires_grad = list(ep_requires_grad.values())[0]
+                # 验证合并后的 shape
+                if self.validate_shapes:
+                    shape_warnings = self._validate_merged_shape(mcore_full_name, merged_shape)
+                    warnings.extend(shape_warnings)
                 
-                # 转换 layer index (如果需要)
-                final_name = self._convert_layer_index(name, pp_rank, vpp_rank)
+                # 获取 dtype 和 requires_grad（从第一个可用的）
+                first_key = list(all_dtypes.keys())[0]
+                dtype = all_dtypes[first_key]
+                requires_grad = all_requires_grad[first_key]
                 
-                # 生成 MCore 完整名称 (添加 module. 前缀)
-                mcore_full_name = f'module.{final_name}'
+                # 添加到 megatron_params
+                size_bytes = _get_tensor_size(merged_shape, dtype)
                 
-                # 添加到 megatron_params (避免重复)
-                if mcore_full_name not in megatron_params:
-                    size_bytes = _get_tensor_size(merged_shape, dtype)
-                    
-                    megatron_params[mcore_full_name] = {
-                        'shape': list(merged_shape),
-                        'dtype': dtype,
-                        'requires_grad': requires_grad,
-                    }
+                megatron_params[mcore_full_name] = {
+                    'shape': list(merged_shape),
+                    'dtype': dtype,
+                    'requires_grad': requires_grad,
+                }
 
-                    # 统计
-                    numel = 1
-                    for dim in merged_shape:
-                        numel *= dim
-                    total_params += numel
-                    total_size += size_bytes
+                # 统计
+                numel = 1
+                for dim in merged_shape:
+                    numel *= dim
+                total_params += numel
+                total_size += size_bytes
 
         if self.verbose:
             logger.info("=" * 80)
@@ -837,7 +950,7 @@ class MCoreCheckpointReader:
             logger.info("=" * 80)
             logger.info("统计信息:")
             logger.info("  总权重数量: %d", len(megatron_params))
-            logger.info("  总参数量: %d", total_params)
+            logger.info("  总参数量: %d (%.2f B)", total_params, total_params / 1e9)
             logger.info("  总大小: %.2f GB", total_size / 1e9)
             
             # 按类型统计
@@ -845,22 +958,26 @@ class MCoreCheckpointReader:
             embed_count = sum(1 for n in megatron_params if 'embedding' in n)
             norm_count = sum(1 for n in megatron_params if 'layernorm' in n.lower())
             output_count = sum(1 for n in megatron_params if 'output_layer' in n)
+            expert_count = sum(1 for n in megatron_params if 'experts' in n)
             
             logger.info("权重分布:")
             logger.info("  Embedding: %d", embed_count)
             logger.info("  Layers: %d", layer_count)
             logger.info("  LayerNorm: %d", norm_count)
             logger.info("  Output Layer: %d", output_count)
-            
-            if errors:
-                logger.warning("错误: %d 个", len(errors))
-                for e in errors[:5]:
-                    logger.warning("  - %s", e)
+            logger.info("  Experts: %d", expert_count)
             
             if warnings:
-                logger.warning("警告: %d 个", len(warnings))
-                for w in warnings[:5]:
+                logger.warning("Shape 警告: %d 个", len(warnings))
+                for w in warnings[:10]:
                     logger.warning("  - %s", w)
+                if len(warnings) > 10:
+                    logger.warning("  ... 还有 %d 个警告", len(warnings) - 10)
+            
+            if errors:
+                logger.error("错误: %d 个", len(errors))
+                for e in errors[:5]:
+                    logger.error("  - %s", e)
 
         # 构建输出
         metadata = {
@@ -874,7 +991,10 @@ class MCoreCheckpointReader:
                 'vocab_size': self.vocab_size,
                 'num_attention_heads': self.num_attention_heads,
                 'num_key_value_heads': self.num_key_value_heads,
+                'kv_channels': self.kv_channels,
                 'num_experts': self.num_experts,
+                'ffn_hidden_size': self.ffn_hidden_size,
+                'moe_ffn_hidden_size': self.moe_ffn_hidden_size,
                 'first_k_dense_replace': self.first_k_dense_replace,
             },
             'parallel_config': {
@@ -911,7 +1031,7 @@ class MCoreCheckpointReader:
         
         例如: decoder.layers.0.xxx -> decoder.layers.8.xxx (当 pp_rank=1, num_layers=32, pp_size=4)
         """
-        layer_match = re.match(r'(decoder\.layers\.|model\.layers\.)(\d+)(\..*)', name)
+        layer_match = re.match(r'(decoder\.layers\.|model\.layers\.)(\d+)(.*)', name)
         if not layer_match:
             return name
         
@@ -957,6 +1077,7 @@ def main():
     --num-layers 32 \\
     --num-attention-heads 64 --num-key-value-heads 2 \\
     --hidden-size 7168 --num-experts 128 \\
+    --kv-channels 128 --ffn-hidden-size 18432 --moe-ffn-hidden-size 12288 \\
     --vocab-size 163840 \\
     --output model_param_mapping.json
 
@@ -1002,6 +1123,18 @@ def main():
                         type=int,
                         default=7168,
                         help='隐藏层维度 (默认: 7168)')
+    parser.add_argument('--kv-channels',
+                        type=int,
+                        default=128,
+                        help='每个注意力头的 key/value 维度 (默认: 128)')
+    parser.add_argument('--ffn-hidden-size',
+                        type=int,
+                        default=18432,
+                        help='Dense FFN 隐藏层维度 (默认: 18432)')
+    parser.add_argument('--moe-ffn-hidden-size',
+                        type=int,
+                        default=12288,
+                        help='MoE FFN 隐藏层维度 (默认: 12288)')
     parser.add_argument('--num-experts',
                         type=int,
                         default=128,
@@ -1029,6 +1162,9 @@ def main():
     parser.add_argument('--disable-mmap',
                         action='store_true',
                         help='禁用 torch.load 的 mmap')
+    parser.add_argument('--no-validate',
+                        action='store_true',
+                        help='禁用 shape 验证')
     parser.add_argument('--output',
                         '-o',
                         type=str,
@@ -1048,6 +1184,9 @@ def main():
         num_attention_heads=args.num_attention_heads,
         num_key_value_heads=args.num_key_value_heads,
         hidden_size=args.hidden_size,
+        kv_channels=args.kv_channels,
+        ffn_hidden_size=args.ffn_hidden_size,
+        moe_ffn_hidden_size=args.moe_ffn_hidden_size,
         first_k_dense_replace=args.first_k_dense_replace,
         vocab_size=args.vocab_size,
         schedules_method=args.schedules_method,
@@ -1055,6 +1194,7 @@ def main():
         io_threads=args.io_threads,
         disable_mmap=args.disable_mmap,
         verbose=not args.quiet,
+        validate_shapes=not args.no_validate,
     )
 
     reader.save_json(args.output)
