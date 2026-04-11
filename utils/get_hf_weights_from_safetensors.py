@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import sys
 from pathlib import Path
 from typing import Any
@@ -116,23 +117,29 @@ def find_safetensors_files(model_path: Path) -> tuple[list[Path], Path | None]:
 
 def extract_weight_info_from_shard(shard_path: Path) -> dict[str, dict[str, Any]]:
     """
-    Extract weight information from a single safetensors shard.
+    Extract weight information from a single safetensors shard by reading its header.
     
     Returns:
         dict: Mapping from weight name to weight info dict with shape and dtype.
     """
     weight_info = {}
     
-    with safe_open(shard_path, framework="pt", device="cpu") as f:
-        for key in f.keys():
-            tensor_slice = f.get_slice(key)
-            shape = list(tensor_slice.get_shape())
-            dtype = tensor_slice.get_dtype()
+    with open(shard_path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header_bytes = f.read(int(header_len))
+        header = json.loads(header_bytes.decode("utf-8"))
+        
+    for key, value in header.items():
+        if key == "__metadata__":
+            continue
             
-            weight_info[key] = {
-                "shape": shape,
-                "dtype": get_dtype_str(dtype),
-            }
+        shape = value.get("shape", [])
+        dtype_str = value.get("dtype", "F32")
+        
+        weight_info[key] = {
+            "shape": shape,
+            "dtype": get_dtype_str(dtype_str),
+        }
     
     return weight_info
 
@@ -225,7 +232,7 @@ def main():
     # Print summary
     total_weights = len(result["weight_map"])
     total_size_gb = result["metadata"]["total_size"] / (1024**3)
-    print(f"\nSummary:")
+    print("\nSummary:")
     print(f"  Total weights: {total_weights}")
     print(f"  Total size: {total_size_gb:.2f} GB ({result['metadata']['total_size']:,} bytes)")
     

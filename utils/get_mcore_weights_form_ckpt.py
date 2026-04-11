@@ -2,39 +2,27 @@
 """
 MCore 格式权重读取与保存工具
 
-从 MCore checkpoint 中提取权重信息（名称、形状、数据类型），并保存为 JSON 格式。
-输出 keys 与 hf_weights_info.json 对齐。
+从 MCore checkpoint 中提取权重信息（名称、形状、数据类型、requires_grad），
+输出格式与 model_param_mapping_tp1.json 的 megatron_params 部分对齐。
 
 用法：
   python get_mcore_weights_form_ckpt.py /path/to/mcore/checkpoint \
     --tp 2 --pp 8 --ep 64 \
     --num-layers 32 \
-    --output weights_info.json
-
-输出格式（与 hf_weights_info.json 对齐）：
-{
-  "metadata": {
-    "total_size": 2059316667904
-  },
-  "weight_map": {
-    "model.embed_tokens.weight": {
-      "shape": [163840, 7168],
-      "dtype": "bfloat16"
-    },
-    ...
-  }
-}
+    --output model_param_mapping.json
 """
 
 import argparse
 import inspect
 import json
 import logging
-import math
 import os
 import re
+import sys
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import torch
 
@@ -148,8 +136,92 @@ def _get_torch_dtype_name(dtype: torch.dtype) -> str:
     return dtype_map.get(dtype, str(dtype).replace('torch.', ''))
 
 
+def _get_tensor_size(shape: Tuple[int, ...], dtype: str) -> int:
+    """计算张量的字节大小。"""
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    
+    elem_size = 2  # 默认 bf16/fp16
+    if 'float32' in dtype or 'fp32' in dtype:
+        elem_size = 4
+    elif 'float64' in dtype or 'fp64' in dtype:
+        elem_size = 8
+    elif 'int8' in dtype or 'uint8' in dtype:
+        elem_size = 1
+    elif 'int16' in dtype:
+        elem_size = 2
+    elif 'int32' in dtype:
+        elem_size = 4
+    elif 'int64' in dtype:
+        elem_size = 8
+    
+    return numel * elem_size
+
+
+@dataclass
+class WeightInfo:
+    """权重信息数据结构。"""
+    name: str
+    shape: Tuple[int, ...]
+    dtype: str
+    requires_grad: bool
+    size_bytes: int
+    source: str = ""  # 来源信息，如 "pp=0,vpp=0"
+
+
+@dataclass
+class ExtractResult:
+    """提取结果数据结构。"""
+    megatron_params: Dict[str, Dict[str, Any]]
+    metadata: Dict[str, Any]
+    total_params: int = 0
+    total_size: int = 0
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+
+class CheckpointCache:
+    """Checkpoint 文件缓存，避免重复加载。"""
+    
+    def __init__(self, max_size: int = 8):
+        self._cache: Dict[str, dict] = {}
+        self._access_order: List[str] = []
+        self._max_size = max_size
+    
+    def get(self, path: str) -> Optional[dict]:
+        """获取缓存的 checkpoint。"""
+        if path in self._cache:
+            self._access_order.remove(path)
+            self._access_order.append(path)
+            return self._cache[path]
+        return None
+    
+    def put(self, path: str, state: dict) -> None:
+        """添加 checkpoint 到缓存。"""
+        if path in self._cache:
+            return
+        
+        while len(self._cache) >= self._max_size:
+            oldest = self._access_order.pop(0)
+            del self._cache[oldest]
+        
+        self._cache[path] = state
+        self._access_order.append(path)
+    
+    def clear(self) -> None:
+        """清空缓存。"""
+        self._cache.clear()
+        self._access_order.clear()
+
+
 class MCoreCheckpointReader:
-    """MCore Checkpoint 读取器 - 读取权重信息并保存为 JSON（与 hf_weights_info.json 对齐）"""
+    """
+    MCore Checkpoint 读取器
+    
+    读取权重信息并保存为 JSON（输出格式与 model_param_mapping_tp1.json 对齐）
+    保留 MCore 原始权重名称。
+    """
 
     def __init__(
         self,
@@ -162,9 +234,11 @@ class MCoreCheckpointReader:
         num_attention_heads: Optional[int] = None,
         num_key_value_heads: Optional[int] = None,
         hidden_size: Optional[int] = None,
-        ffn_hidden_size: Optional[int] = None,
-        moe_ffn_hidden_size: Optional[int] = None,
         first_k_dense_replace: int = 2,
+        vocab_size: Optional[int] = None,
+        schedules_method: Optional[str] = None,
+        vpp_stage: Optional[int] = None,
+        io_threads: int = 4,
         disable_mmap: bool = False,
         verbose: bool = True,
     ):
@@ -177,26 +251,47 @@ class MCoreCheckpointReader:
         self.pp_size = pp_size
         self.ep_size = ep_size
 
-        # 模型配置（默认值与 hf_weights_info.json 一致）
+        # VPP/DualPipe 配置
+        self.schedules_method = schedules_method
+        self.dualpipe = schedules_method == 'dualpipev'
+        self.vpp_stage = vpp_stage
+
+        # 模型配置
         self.num_layers = num_layers or 32
         self.num_experts = num_experts or 128
         self.num_attention_heads = num_attention_heads or 64
-        self.num_key_value_heads = num_key_value_heads or 2  # GQA: 2 KV heads
+        self.num_key_value_heads = num_key_value_heads or 2
         self.hidden_size = hidden_size or 7168
-        self.ffn_hidden_size = ffn_hidden_size or 18432
-        self.moe_ffn_hidden_size = moe_ffn_hidden_size or 12288
         self.first_k_dense_replace = first_k_dense_replace
+        self.vocab_size = vocab_size or 163840
 
         # 计算 head_dim
         self.head_dim = self.hidden_size // self.num_attention_heads
 
+        # 其他配置
+        self.io_threads = max(1, int(io_threads))
         self.disable_mmap = disable_mmap
+
+        # Checkpoint 缓存
+        self._cache = CheckpointCache(max_size=max(4, tp_size * 2))
 
         # 内部状态
         self._rank_dir_map: Dict[Tuple[int, int], List[int]] = {}
+        self.vpp_size: Optional[int] = None
+        self._vpp_model_keys: Optional[List[str]] = None
+        self.vpprank_layer_idxs: Dict[int, Dict[int, List[int]]] = defaultdict(dict)
+        self.layer2loc_vpp: Dict[int, Tuple[int, int, int]] = {}
+        self._stage_local_to_global: Dict[Tuple[int, Optional[int]], Dict[int, int]] = {}
 
         if self.verbose:
             logger.info('Resolved iter_dir: %s', self.iter_dir)
+
+    def _validate(self) -> None:
+        """验证参数合法性。"""
+        if not os.path.isdir(self.mcore_dir):
+            raise FileNotFoundError(f'加载目录不存在: {self.mcore_dir}')
+        if self.tp_size <= 0 or self.pp_size <= 0 or self.ep_size <= 0:
+            raise ValueError('并行度必须 > 0')
 
     def _resolve_rank_ckpt_path(self, tp_rank: int, pp_rank: int,
                                 ep_rank: Optional[int]) -> str:
@@ -222,8 +317,19 @@ class MCoreCheckpointReader:
 
         raise FileNotFoundError(
             f'无法定位 rank 文件: tp={tp_rank}, pp={pp_rank}, ep={ep_rank}, '
-            f'iter_dir={self.iter_dir}'
+            f'iter_dir={self.iter_dir}\n'
+            f'尝试的路径: {[os.path.join(self.iter_dir, p, "model_optim_rng.pt") for p in candidates]}'
         )
+
+    def _load_checkpoint(self, path: str) -> dict:
+        """加载 checkpoint，带缓存。"""
+        cached = self._cache.get(path)
+        if cached is not None:
+            return cached
+        
+        state = _torch_load_compat(path, disable_mmap=self.disable_mmap)
+        self._cache.put(path, state)
+        return state
 
     def _build_rank_dir_map(self) -> None:
         """构建 rank 目录映射。"""
@@ -277,76 +383,258 @@ class MCoreCheckpointReader:
         if self.verbose:
             logger.info('Rank dir map size=%d', len(self._rank_dir_map))
 
+    def _detect_vpp(self) -> Tuple[Optional[int], Optional[List[str]]]:
+        """检测 VPP 配置。"""
+        try:
+            ckpt_path = self._resolve_rank_ckpt_path(0, 0, None)
+        except FileNotFoundError:
+            for tp in range(self.tp_size):
+                for pp in range(self.pp_size):
+                    try:
+                        ckpt_path = self._resolve_rank_ckpt_path(tp, pp, 0 if self.ep_size > 1 else None)
+                        break
+                    except FileNotFoundError:
+                        continue
+                else:
+                    continue
+                break
+            else:
+                return None, None
+
+        if self.verbose:
+            logger.info('Detecting vpp from: %s', ckpt_path)
+
+        state = self._load_checkpoint(ckpt_path)
+        model_keys = sorted([
+            k for k in state.keys() if k.startswith('model') and k != 'model'
+        ])
+
+        if 'model0' in state and 'model1' in state:
+            if self.verbose:
+                logger.info('Detected VPP: vpp_size=%d', len(model_keys))
+            return len(model_keys), model_keys
+        return None, None
+
+    def _build_vpprank_layer_map_dualpipe(self) -> None:
+        """构建 DualPipe 的 VPP layer 映射。"""
+        layers_each_pp = self.num_layers // self.pp_size
+        layer_pop_num = layers_each_pp // 2
+        all_layers = list(range(self.num_layers))
+        dualpipe_layers: list[int] = []
+
+        while all_layers:
+            dualpipe_layers.extend(all_layers[:layer_pop_num])
+            dualpipe_layers.extend(all_layers[-layer_pop_num:])
+            all_layers = all_layers[layer_pop_num:-layer_pop_num]
+
+        pp_rank = 0
+        vpp_rank = 0
+        each_pp_layer = self.num_layers // self.pp_size
+
+        if self.vpp_stage is None:
+            self.vpp_stage = layers_each_pp // 2
+
+        for idx, layer in enumerate(dualpipe_layers):
+            if vpp_rank not in self.vpprank_layer_idxs[pp_rank]:
+                self.vpprank_layer_idxs[pp_rank][vpp_rank] = []
+
+            self.vpprank_layer_idxs[pp_rank][vpp_rank].append(layer)
+
+            if (idx + 1) % self.vpp_stage == 0:
+                vpp_rank += 1
+            if (idx + 1) % each_pp_layer == 0:
+                pp_rank += 1
+                vpp_rank = 0
+
+        for pp_rank in range(self.pp_size):
+            for vpp_rank in self.vpprank_layer_idxs[pp_rank]:
+                stage_key = (pp_rank, vpp_rank)
+                self._stage_local_to_global[stage_key] = {}
+                for local_idx, hf_layer in enumerate(self.vpprank_layer_idxs[pp_rank][vpp_rank]):
+                    self.layer2loc_vpp[hf_layer] = (pp_rank, vpp_rank, local_idx)
+                    self._stage_local_to_global[stage_key][local_idx] = hf_layer
+
+    def _build_vpprank_layer_map_standard(self) -> None:
+        """构建标准 VPP layer 映射。"""
+        if self.vpp_size is None:
+            raise ValueError("标准 VPP 模式需要 vpp_size")
+
+        vpp_stage = self.vpp_stage or (self.num_layers // (self.pp_size * self.vpp_size))
+        layers_each_vpp = [[vpp_stage] * self.vpp_size for _ in range(self.pp_size)]
+        real_layers = list(range(self.num_layers))
+
+        for vpp_rank in range(self.vpp_size):
+            for pp_rank in range(self.pp_size):
+                count = layers_each_vpp[pp_rank][vpp_rank]
+                self.vpprank_layer_idxs[pp_rank][vpp_rank] = [
+                    real_layers.pop(0) for _ in range(count)
+                ]
+
+        for pp_rank in range(self.pp_size):
+            for vpp_rank in range(self.vpp_size):
+                stage_key = (pp_rank, vpp_rank)
+                self._stage_local_to_global[stage_key] = {}
+                for local_idx, hf_layer in enumerate(self.vpprank_layer_idxs[pp_rank][vpp_rank]):
+                    self.layer2loc_vpp[hf_layer] = (pp_rank, vpp_rank, local_idx)
+                    self._stage_local_to_global[stage_key][local_idx] = hf_layer
+
+    def _build_vpprank_layer_map(self) -> None:
+        """构建 VPP rank 到 layer 的映射。"""
+        if self.dualpipe:
+            self._build_vpprank_layer_map_dualpipe()
+        else:
+            self._build_vpprank_layer_map_standard()
+
+    def _get_global_layer_id(self, local_idx: int, pp_rank: Optional[int],
+                             vpp_rank: Optional[int]) -> int:
+        """根据 local_idx 和 stage 信息获取全局 layer id。"""
+        if self.vpp_size is not None and pp_rank is not None and vpp_rank is not None:
+            stage_key = (pp_rank, vpp_rank)
+            layer_id = self._stage_local_to_global.get(stage_key, {}).get(local_idx)
+            if layer_id is not None:
+                return layer_id
+            for global_id, (pr, vr, li) in self.layer2loc_vpp.items():
+                if pr == pp_rank and vr == vpp_rank and li == local_idx:
+                    return global_id
+            return local_idx
+        else:
+            if self.pp_size > 1 and pp_rank is not None:
+                layers_per_pp = self.num_layers // self.pp_size
+                return pp_rank * layers_per_pp + local_idx
+            return local_idx
+
     def _load_rank_state(self, tp_rank: int, pp_rank: int,
-                         ep_rank: Optional[int]) -> Dict[str, torch.Tensor]:
+                         ep_rank: Optional[int], vpp_rank: Optional[int] = None) -> Dict[str, torch.Tensor]:
         """加载单个 rank 的 state。"""
         ckpt_path = self._resolve_rank_ckpt_path(tp_rank, pp_rank, ep_rank)
-        state = _torch_load_compat(ckpt_path, disable_mmap=self.disable_mmap)
-        return state.get('model', state)
+        state = self._load_checkpoint(ckpt_path)
+        
+        # 处理可能的嵌套结构
+        if vpp_rank is not None and f'model{vpp_rank}' in state:
+            state = state[f'model{vpp_rank}']
+        elif 'model' in state:
+            state = state['model']
+        elif 'state_dict' in state:
+            state = state['state_dict']
+            
+        return state
 
-    def _is_moe_layer(self, layer_id: int) -> bool:
-        """判断指定层是否是 MoE 层。"""
-        return layer_id >= self.first_k_dense_replace
+    def _load_models_for_stage(self, pp_rank: int, vpp_rank: Optional[int]) -> Dict[Tuple[int, int], Dict[str, torch.Tensor]]:
+        """加载指定 stage 的所有 TP 和 EP rank。"""
+        models: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+
+        if self.verbose:
+            logger.info('Loading models for stage: pp_rank=%d vpp_rank=%s', pp_rank, vpp_rank)
+
+        ranks_to_load: List[Tuple[int, int]] = []
+        for tp_rank in range(self.tp_size):
+            eps = self._rank_dir_map.get((tp_rank, pp_rank), [])
+            if not eps:
+                ranks_to_load.append((tp_rank, 0))
+            else:
+                for ep_rank in eps:
+                    ranks_to_load.append((tp_rank, ep_rank))
+
+        def load_one(tp_rank: int, ep_rank: int) -> Tuple[int, int, Optional[Dict[str, torch.Tensor]]]:
+            try:
+                st = self._load_rank_state(tp_rank, pp_rank, ep_rank, vpp_rank)
+                return tp_rank, ep_rank, st
+            except FileNotFoundError:
+                return tp_rank, ep_rank, None
+
+        max_workers = min(self.io_threads, len(ranks_to_load))
+        if max_workers <= 1:
+            for tp_rank, ep_rank in ranks_to_load:
+                tp, ep, st = load_one(tp_rank, ep_rank)
+                if st is not None:
+                    models[(tp, ep)] = st
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = [ex.submit(load_one, tp, ep) for tp, ep in ranks_to_load]
+                for fut in as_completed(futures):
+                    tp, ep, st = fut.result()
+                    if st is not None:
+                        models[(tp, ep)] = st
+
+        if self.verbose:
+            logger.info('Loaded models for stage: pp_rank=%d vpp_rank=%s models=%d',
+                       pp_rank, vpp_rank, len(models))
+
+        return models
 
     def _get_tp_parallel_dim(self, mcore_name: str) -> Optional[int]:
-        """确定权重在哪个维度上进行张量并行切分。"""
-        # Embedding: 在第0维切分 (vocab_size)
+        """
+        确定权重在哪个维度上进行张量并行切分。
+        
+        返回:
+            0: 在第0维切分 (row-wise)
+            1: 在第1维切分 (column-wise)
+            None: 不切分
+        """
+        # Row-wise (dim=0): 输出维度被切分
         if 'embedding.word_embeddings.weight' in mcore_name:
             return 0
-
-        # Output layer: 在第0维切分 (vocab_size)
         if 'output_layer.weight' in mcore_name:
             return 0
-
-        # QKV projection: 在第0维切分
         if 'self_attention.linear_qkv.weight' in mcore_name:
             return 0
         if 'self_attention.linear_qkv.bias' in mcore_name:
             return 0
-
-        # Output projection: 在第1维切分 (input dim)
-        if 'self_attention.linear_proj.weight' in mcore_name:
-            return 1
-
-        # MLP fc1 (gate_up 融合): 在第0维切分
         if 'mlp.linear_fc1.weight' in mcore_name:
             return 0
         if 'mlp.linear_fc1.bias' in mcore_name:
             return 0
-
-        # MLP fc2 (down): 在第1维切分
-        if 'mlp.linear_fc2.weight' in mcore_name:
-            return 1
-
-        # Shared experts
         if 'shared_experts.linear_fc1.weight' in mcore_name:
             return 0
-        if 'shared_experts.linear_fc2.weight' in mcore_name:
-            return 1
-
+        if 'shared_experts.linear_fc1.bias' in mcore_name:
+            return 0
         # MoE experts (local_experts 格式)
         if 'experts.local_experts' in mcore_name and 'linear_fc1.weight' in mcore_name:
             return 0
-        if 'experts.local_experts' in mcore_name and 'linear_fc2.weight' in mcore_name:
+        if 'experts.local_experts' in mcore_name and 'linear_fc1.bias' in mcore_name:
+            return 0
+        # MoE experts (grouped_gemm 格式: experts.weight1/weight2)
+        if '.experts.weight1' in mcore_name:
+            # weight1 shape: [hidden, num_local_experts*intermediate_size*2]
+            # 在第1维切分 (column-wise)
             return 1
 
+        # Column-wise (dim=1): 输入维度被切分
+        if 'self_attention.linear_proj.weight' in mcore_name:
+            return 1
+        if 'mlp.linear_fc2.weight' in mcore_name:
+            return 1
+        if 'shared_experts.linear_fc2.weight' in mcore_name:
+            return 1
+        # MoE experts (local_experts 格式)
+        if 'experts.local_experts' in mcore_name and 'linear_fc2.weight' in mcore_name:
+            return 1
         # MoE experts (grouped_gemm 格式)
-        if 'experts.weight1' in mcore_name:
-            return 1  # [hidden, num_local*intermed*2] -> 在第1维切分
-        if 'experts.weight2' in mcore_name:
-            return 0  # [num_local*intermed, hidden] -> 在第0维切分
+        if '.experts.weight2' in mcore_name:
+            # weight2 shape: [num_local_experts*intermediate_size, hidden]
+            # 在第0维切分 (row-wise)
+            return 0
 
-        # Router: 不切分
+        # 不切分
+        if 'layernorm' in mcore_name.lower():
+            return None
         if 'router.weight' in mcore_name:
             return None
         if 'router.expert_bias' in mcore_name:
             return None
-
-        # LayerNorm: 不切分
-        if 'layernorm' in mcore_name.lower():
+        if 'router.score_bias' in mcore_name:
             return None
 
         return None
+
+    def _is_ep_sharded(self, mcore_name: str) -> bool:
+        """判断权重是否在 EP 维度上切分。"""
+        # 专家权重在 EP 维度上切分
+        if 'experts.local_experts' in mcore_name:
+            return True
+        if '.experts.weight1' in mcore_name or '.experts.weight2' in mcore_name:
+            return True
+        return False
 
     def _merge_tp_shapes(self, name: str,
                          tp_shapes: List[Tuple[int, ...]]) -> Tuple[int, ...]:
@@ -368,506 +656,284 @@ class MCoreCheckpointReader:
         base_shape[parallel_dim] = total_dim
         return tuple(base_shape)
 
-    def _compute_rotary_emb_shape(self) -> List[int]:
-        """计算 rotary_emb.inv_freq 的形状。
-        
-        在 HF 模型中，rotary_emb.inv_freq 通常是 head_dim // 2
+    def _merge_ep_shapes(self, name: str, ep_shapes: List[Tuple[int, ...]], 
+                         ep_ranks: List[int]) -> Tuple[int, ...]:
         """
-        return [self.head_dim // 2]
+        合并所有 EP rank 的形状，恢复原始形状。
+        
+        对于 MoE 专家权重，需要合并不同 EP rank 的专家。
+        """
+        if not ep_shapes or len(ep_shapes) == 1:
+            return ep_shapes[0] if ep_shapes else ()
 
-    def _add_rotary_emb_weights(self, weight_map: Dict[str, Dict[str, Any]], 
-                                 layer_id: int, dtype: str, total_size: int) -> int:
-        """添加 rotary_emb.inv_freq 权重。"""
-        shape = self._compute_rotary_emb_shape()
-        name = f'model.layers.{layer_id}.self_attn.rotary_emb.inv_freq'
+        # 对于 grouped_gemm 格式的 experts.weight1/weight2
+        if '.experts.weight1' in name:
+            # shape: [hidden, num_local_experts*intermediate_size*2]
+            # 在第1维按专家数合并
+            base_shape = list(ep_shapes[0])
+            total_experts_dim = sum(s[1] for s in ep_shapes)
+            base_shape[1] = total_experts_dim
+            return tuple(base_shape)
         
-        # 计算大小（float32 是 4 字节）
-        numel = 1
-        for dim in shape:
-            numel *= dim
-        size_bytes = numel * 4  # float32
+        if '.experts.weight2' in name:
+            # shape: [num_local_experts*intermediate_size, hidden]
+            # 在第0维按专家数合并
+            base_shape = list(ep_shapes[0])
+            total_experts_dim = sum(s[0] for s in ep_shapes)
+            base_shape[0] = total_experts_dim
+            return tuple(base_shape)
+
+        # 对于 local_experts 格式，每个专家是独立的，不需要合并 shape
+        # 但需要确保所有 EP rank 的专家都被记录
+        return ep_shapes[0]
+
+    def extract_weights(self) -> ExtractResult:
+        """
+        提取所有权重信息。
         
-        weight_map[name] = {
-            'shape': shape,
-            'dtype': dtype,
+        输出格式与 model_param_mapping_tp1.json 对齐：
+        {
+          "megatron_params": {
+            "module.embedding.word_embeddings.weight": {
+              "shape": [163840, 7168],
+              "dtype": "torch.bfloat16",
+              "requires_grad": true
+            },
+            ...
+          },
+          "metadata": {...}
         }
-        
-        return total_size + size_bytes
-
-    def extract_weights(self) -> Dict[str, Any]:
-        """提取所有权重信息（与 hf_weights_info.json 对齐）。"""
+        """
+        self._validate()
         self._build_rank_dir_map()
 
-        weight_map: Dict[str, Dict[str, Any]] = {}
+        # 检测 VPP
+        self.vpp_size, self._vpp_model_keys = self._detect_vpp()
+        if self.vpp_size:
+            if self.verbose:
+                logger.info('Detected VPP: vpp_size=%d', self.vpp_size)
+            if self.vpp_stage is None and self.dualpipe:
+                self.vpp_stage = max(1, self.num_layers // (self.pp_size * 2))
+                if self.verbose:
+                    logger.info('Auto-set vpp_stage=%d (dualpipe)', self.vpp_stage)
+            elif self.vpp_stage is None:
+                self.vpp_stage = 1
+                if self.verbose:
+                    logger.info('Using default vpp_stage=1')
+            self._build_vpprank_layer_map()
+
+        megatron_params: Dict[str, Dict[str, Any]] = {}
+        total_params = 0
         total_size = 0
+        errors: List[str] = []
+        warnings: List[str] = []
 
         if self.verbose:
-            logger.info("开始提取权重信息...")
+            logger.info("=" * 80)
+            logger.info("MCore 权重提取（原始格式）")
+            logger.info("=" * 80)
+            logger.info("MCore 目录: %s", self.mcore_dir)
+            logger.info("迭代目录: %s", self.iter_dir)
+            logger.info("并行配置: TP=%d, PP=%d, EP=%d, VPP=%s",
+                       self.tp_size, self.pp_size, self.ep_size, self.vpp_size)
+            logger.info("模型配置: layers=%d, hidden=%d, experts=%d",
+                       self.num_layers, self.hidden_size, self.num_experts)
 
-        # 遍历所有 PP ranks
-        for pp_rank in range(self.pp_size):
-            # 确定要加载的 EP ranks
-            ep_ranks_to_load: set = set()
-            for tp_rank in range(self.tp_size):
-                eps = self._rank_dir_map.get((tp_rank, pp_rank), [0])
-                ep_ranks_to_load.update(eps)
+        # 确定所有 stages
+        if self.vpp_size is None:
+            stages = [(pp, None) for pp in range(self.pp_size)]
+        else:
+            stages = [(pp, vpp) for pp in range(self.pp_size) for vpp in range(self.vpp_size)]
 
-            # 加载所有需要的 TP 和 EP ranks
-            all_states: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        if self.verbose:
+            logger.info("开始提取权重信息，共 %d 个 stage(s)...", len(stages))
 
-            for tp_rank in range(self.tp_size):
-                for ep_rank in ep_ranks_to_load:
-                    try:
-                        state = self._load_rank_state(tp_rank, pp_rank, ep_rank)
-                        all_states[(tp_rank, ep_rank)] = state
-                    except FileNotFoundError:
-                        continue
+        # 处理每个 stage
+        for pp_rank, vpp_rank in stages:
+            if self.verbose:
+                logger.info("处理 PP Rank %d%s...", 
+                           pp_rank, 
+                           f", VPP Rank {vpp_rank}" if vpp_rank is not None else "")
 
-            if not all_states:
-                logger.warning("PP rank %d: 没有加载到任何状态", pp_rank)
+            try:
+                models = self._load_models_for_stage(pp_rank, vpp_rank)
+            except Exception as e:
+                errors.append(f"无法加载 stage pp={pp_rank}, vpp={vpp_rank}: {e}")
                 continue
 
-            # 收集所有权重名称
-            all_weight_names: set = set()
-            for state in all_states.values():
-                all_weight_names.update(
-                    k for k in state.keys() if isinstance(state[k], torch.Tensor))
+            if not models:
+                errors.append(f"Stage pp={pp_rank}, vpp={vpp_rank} 没有模型")
+                continue
+
+            # 按权重名称收集所有 TP/EP rank 的张量
+            weight_tensors: Dict[str, Dict[Tuple[int, int], torch.Tensor]] = defaultdict(dict)
+            
+            for (tp_rank, ep_rank), state in models.items():
+                for name, tensor in state.items():
+                    if not isinstance(tensor, torch.Tensor):
+                        continue
+                    weight_tensors[name][(tp_rank, ep_rank)] = tensor
 
             # 处理每个权重
-            for name in all_weight_names:
-                # 收集所有 TP rank 的 shape 和 dtype
-                tp_shapes = []
-                dtype = None
-
-                for (tp_rank, ep_rank), state in all_states.items():
-                    if name in state:
-                        tensor = state[name]
-                        if isinstance(tensor, torch.Tensor):
-                            tp_shapes.append(tuple(tensor.shape))
-                            if dtype is None:
-                                dtype = _get_torch_dtype_name(tensor.dtype)
-
-                if not tp_shapes:
-                    continue
-
-                # 合并 shape
-                merged_shape = self._merge_tp_shapes(name, tp_shapes)
-
-                # 计算大小
-                numel = 1
-                for dim in merged_shape:
-                    numel *= dim
-
-                # 估计 element size
-                if dtype in ['float16', 'bfloat16']:
-                    element_size = 2
-                elif dtype == 'float32':
-                    element_size = 4
+            for name, tp_ep_tensors in weight_tensors.items():
+                # 按 EP rank 分组，在每个 EP 组内合并 TP
+                ep_merged_shapes: Dict[int, Tuple[int, ...]] = {}
+                ep_dtypes: Dict[int, str] = {}
+                ep_requires_grad: Dict[int, bool] = {}
+                
+                # 按 EP rank 分组
+                ep_groups: Dict[int, List[Tuple[int, Tuple[int, ...]]]] = defaultdict(list)
+                for (tp_rank, ep_rank), tensor in tp_ep_tensors.items():
+                    ep_groups[ep_rank].append((tp_rank, tuple(tensor.shape)))
+                    if ep_rank not in ep_dtypes:
+                        ep_dtypes[ep_rank] = _get_torch_dtype_name(tensor.dtype)
+                        ep_requires_grad[ep_rank] = getattr(tensor, 'requires_grad', True)
+                
+                # 在每个 EP 组内合并 TP shapes
+                for ep_rank, tp_shapes_list in ep_groups.items():
+                    tp_shapes = [s for _, s in sorted(tp_shapes_list)]
+                    ep_merged_shapes[ep_rank] = self._merge_tp_shapes(name, tp_shapes)
+                
+                # 合并所有 EP rank 的 shapes
+                if len(ep_merged_shapes) > 1 and self._is_ep_sharded(name):
+                    # EP 切分的权重需要合并
+                    sorted_ep_ranks = sorted(ep_merged_shapes.keys())
+                    sorted_shapes = [ep_merged_shapes[ep] for ep in sorted_ep_ranks]
+                    merged_shape = self._merge_ep_shapes(name, sorted_shapes, sorted_ep_ranks)
                 else:
-                    element_size = 2
-
-                size_bytes = numel * element_size
-
-                # 确定 layer id
-                layer_match = re.match(r'decoder\.layers\.(\d+)\.', name)
-                if layer_match:
-                    local_idx = int(layer_match.group(1))
-                    # 计算全局 layer id
-                    if self.pp_size > 1:
-                        layers_per_pp = self.num_layers // self.pp_size
-                        layer_id = pp_rank * layers_per_pp + local_idx
-                    else:
-                        layer_id = local_idx
-                else:
-                    layer_id = 0
-
-                # 转换 MCore 名称为 HF 名称
-                # Embedding
-                if name == 'embedding.word_embeddings.weight':
-                    hf_name = 'model.embed_tokens.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                # Final LayerNorm
-                if name == 'decoder.final_layernorm.weight':
-                    hf_name = 'model.norm.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                # Output layer
-                if name == 'output_layer.weight':
-                    hf_name = 'lm_head.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                # Decoder layers
-                layer_match = re.match(r'decoder\.layers\.(\d+)\.(.*)', name)
-                if not layer_match:
-                    continue
-
-                local_idx = int(layer_match.group(1))
-                rest = layer_match.group(2)
-
-                # 计算全局 layer id
-                if self.pp_size > 1:
-                    layers_per_pp = self.num_layers // self.pp_size
-                    layer_id = pp_rank * layers_per_pp + local_idx
-                else:
-                    layer_id = local_idx
-
-                prefix = f'model.layers.{layer_id}'
-                is_moe = self._is_moe_layer(layer_id)
-
-                # Self Attention
-                if rest == 'self_attention.linear_proj.weight':
-                    hf_name = f'{prefix}.self_attn.o_proj.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                        # 同时添加 rotary_emb.inv_freq
-                        total_size = self._add_rotary_emb_weights(
-                            weight_map, layer_id, dtype, total_size) - size_bytes
-                    continue
-
-                if rest == 'self_attention.linear_qkv.weight':
-                    # 展开 QKV
-                    qkv_out_dim, hidden_size = merged_shape
+                    # 非 EP 切分权重，取第一个
+                    merged_shape = list(ep_merged_shapes.values())[0]
+                
+                # 获取 dtype 和 requires_grad
+                dtype = list(ep_dtypes.values())[0]
+                requires_grad = list(ep_requires_grad.values())[0]
+                
+                # 转换 layer index (如果需要)
+                final_name = self._convert_layer_index(name, pp_rank, vpp_rank)
+                
+                # 生成 MCore 完整名称 (添加 module. 前缀)
+                mcore_full_name = f'module.{final_name}'
+                
+                # 添加到 megatron_params (避免重复)
+                if mcore_full_name not in megatron_params:
+                    size_bytes = _get_tensor_size(merged_shape, dtype)
                     
-                    # 计算各部分的输出维度
-                    q_out = self.num_attention_heads * self.head_dim
-                    k_out = self.num_key_value_heads * self.head_dim
-                    v_out = self.num_key_value_heads * self.head_dim
-                    
-                    # 验证形状是否匹配
-                    expected_total = q_out + k_out + v_out
-                    if qkv_out_dim != expected_total:
-                        # 如果形状不匹配，按比例分配
-                        ratio_q = self.num_attention_heads / (
-                            self.num_attention_heads + 2 * self.num_key_value_heads)
-                        ratio_kv = self.num_key_value_heads / (
-                            self.num_attention_heads + 2 * self.num_key_value_heads)
-                        q_out = int(qkv_out_dim * ratio_q)
-                        k_out = int(qkv_out_dim * ratio_kv)
-                        v_out = qkv_out_dim - q_out - k_out
-                    
-                    q_shape = (q_out, hidden_size)
-                    k_shape = (k_out, hidden_size)
-                    v_shape = (v_out, hidden_size)
-                    
-                    for proj_name, proj_shape in [('q_proj', q_shape), ('k_proj', k_shape), ('v_proj', v_shape)]:
-                        hf_proj_name = f'{prefix}.self_attn.{proj_name}.weight'
-                        if hf_proj_name not in weight_map:
-                            proj_numel = 1
-                            for dim in proj_shape:
-                                proj_numel *= dim
-                            proj_size = proj_numel * element_size
-                            weight_map[hf_proj_name] = {
-                                'shape': list(proj_shape),
-                                'dtype': dtype,
-                            }
-                            total_size += proj_size
-                    continue
+                    megatron_params[mcore_full_name] = {
+                        'shape': list(merged_shape),
+                        'dtype': dtype,
+                        'requires_grad': requires_grad,
+                    }
 
-                if rest == 'self_attention.q_layernorm.weight':
-                    hf_name = f'{prefix}.self_attn.q_layernorm.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                if rest == 'self_attention.k_layernorm.weight':
-                    hf_name = f'{prefix}.self_attn.k_layernorm.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                # LayerNorm
-                if rest == 'input_layernorm.weight':
-                    hf_name = f'{prefix}.input_layernorm.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                if rest in ('pre_mlp_layernorm.weight', 'post_attention_layernorm.weight'):
-                    hf_name = f'{prefix}.post_attention_layernorm.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                # MLP - Dense (非 MoE 层或 Shared Experts)
-                if rest == 'mlp.linear_fc1.weight':
-                    # 检查是否是 shared_experts 的权重（MoE 层中的 Dense MLP）
-                    if is_moe:
-                        # 这是 shared_experts
-                        fused_dim, hidden_size = merged_shape
-                        single_dim = fused_dim // 2
-                        
-                        for proj_name, proj_shape in [('gate_proj', (single_dim, hidden_size)), 
-                                                       ('up_proj', (single_dim, hidden_size))]:
-                            hf_proj_name = f'{prefix}.mlp.shared_experts.{proj_name}.weight'
-                            if hf_proj_name not in weight_map:
-                                proj_numel = 1
-                                for dim in proj_shape:
-                                    proj_numel *= dim
-                                proj_size = proj_numel * element_size
-                                weight_map[hf_proj_name] = {
-                                    'shape': list(proj_shape),
-                                    'dtype': dtype,
-                                }
-                                total_size += proj_size
-                    else:
-                        # 这是 Dense MLP
-                        fused_dim, hidden_size = merged_shape
-                        single_dim = fused_dim // 2
-                        
-                        for proj_name, proj_shape in [('gate_proj', (single_dim, hidden_size)), 
-                                                       ('up_proj', (single_dim, hidden_size))]:
-                            hf_proj_name = f'{prefix}.mlp.{proj_name}.weight'
-                            if hf_proj_name not in weight_map:
-                                proj_numel = 1
-                                for dim in proj_shape:
-                                    proj_numel *= dim
-                                proj_size = proj_numel * element_size
-                                weight_map[hf_proj_name] = {
-                                    'shape': list(proj_shape),
-                                    'dtype': dtype,
-                                }
-                                total_size += proj_size
-                    continue
-
-                if rest == 'mlp.linear_fc2.weight':
-                    if is_moe:
-                        # shared_experts down_proj
-                        hf_name = f'{prefix}.mlp.shared_experts.down_proj.weight'
-                    else:
-                        # Dense MLP down_proj
-                        hf_name = f'{prefix}.mlp.down_proj.weight'
-                    
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                # Shared Experts (显式指定的 shared_experts)
-                if rest == 'mlp.shared_experts.linear_fc1.weight':
-                    fused_dim, hidden_size = merged_shape
-                    single_dim = fused_dim // 2
-                    
-                    for proj_name, proj_shape in [('gate_proj', (single_dim, hidden_size)), 
-                                                   ('up_proj', (single_dim, hidden_size))]:
-                        hf_proj_name = f'{prefix}.mlp.shared_experts.{proj_name}.weight'
-                        if hf_proj_name not in weight_map:
-                            proj_numel = 1
-                            for dim in proj_shape:
-                                proj_numel *= dim
-                            proj_size = proj_numel * element_size
-                            weight_map[hf_proj_name] = {
-                                'shape': list(proj_shape),
-                                'dtype': dtype,
-                            }
-                            total_size += proj_size
-                    continue
-
-                if rest == 'mlp.shared_experts.linear_fc2.weight':
-                    hf_name = f'{prefix}.mlp.shared_experts.down_proj.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                # Router (仅 MoE 层)
-                if rest == 'mlp.router.weight':
-                    hf_name = f'{prefix}.mlp.gate.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                if rest == 'mlp.router.expert_bias':
-                    hf_name = f'{prefix}.mlp.gate.e_score_correction_bias'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                # MoE Experts - local_experts 格式
-                expert_fc1_match = re.match(
-                    r'mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight', rest)
-                if expert_fc1_match:
-                    local_expert_id = int(expert_fc1_match.group(1))
-                    num_local_experts = self.num_experts // self.ep_size
-                    
-                    # 计算全局专家 ID
-                    for (tp_rank, ep_rank), state in all_states.items():
-                        if name in state:
-                            global_expert_id = ep_rank * num_local_experts + local_expert_id
-                            break
-                    else:
-                        global_expert_id = local_expert_id
-
-                    fused_dim, hidden_size = merged_shape
-                    single_dim = fused_dim // 2
-                    
-                    for proj_name, proj_shape in [('gate_proj', (single_dim, hidden_size)), 
-                                                   ('up_proj', (single_dim, hidden_size))]:
-                        hf_proj_name = f'{prefix}.mlp.experts.{global_expert_id}.{proj_name}.weight'
-                        if hf_proj_name not in weight_map:
-                            proj_numel = 1
-                            for dim in proj_shape:
-                                proj_numel *= dim
-                            proj_size = proj_numel * element_size
-                            weight_map[hf_proj_name] = {
-                                'shape': list(proj_shape),
-                                'dtype': dtype,
-                            }
-                            total_size += proj_size
-                    continue
-
-                expert_fc2_match = re.match(
-                    r'mlp\.experts\.local_experts\.(\d+)\.linear_fc2\.weight', rest)
-                if expert_fc2_match:
-                    local_expert_id = int(expert_fc2_match.group(1))
-                    num_local_experts = self.num_experts // self.ep_size
-                    
-                    for (tp_rank, ep_rank), state in all_states.items():
-                        if name in state:
-                            global_expert_id = ep_rank * num_local_experts + local_expert_id
-                            break
-                    else:
-                        global_expert_id = local_expert_id
-
-                    hf_name = f'{prefix}.mlp.experts.{global_expert_id}.down_proj.weight'
-                    if hf_name not in weight_map:
-                        weight_map[hf_name] = {
-                            'shape': list(merged_shape),
-                            'dtype': dtype,
-                        }
-                        total_size += size_bytes
-                    continue
-
-                # MoE Experts - grouped_gemm 格式
-                if rest == 'mlp.experts.weight1':
-                    num_local_experts = self.num_experts // self.ep_size
-                    
-                    for (tp_rank, ep_rank), state in all_states.items():
-                        if name in state:
-                            expert_offset = ep_rank * num_local_experts
-                            
-                            # weight1: [hidden, num_local * intermed*2]
-                            hidden_size = merged_shape[0]
-                            intermed_2x_total = merged_shape[1]
-                            intermed_2x = intermed_2x_total // num_local_experts
-                            intermed = intermed_2x // 2
-                            
-                            for local_id in range(num_local_experts):
-                                global_expert_id = expert_offset + local_id
-                                gate_shape = (intermed, hidden_size)
-                                up_shape = (intermed, hidden_size)
-                                
-                                for proj_name, proj_shape in [('gate_proj', gate_shape), ('up_proj', up_shape)]:
-                                    hf_proj_name = f'{prefix}.mlp.experts.{global_expert_id}.{proj_name}.weight'
-                                    if hf_proj_name not in weight_map:
-                                        proj_numel = 1
-                                        for dim in proj_shape:
-                                            proj_numel *= dim
-                                        proj_size = proj_numel * element_size
-                                        weight_map[hf_proj_name] = {
-                                            'shape': list(proj_shape),
-                                            'dtype': dtype,
-                                        }
-                                        total_size += proj_size
-                            break
-                    continue
-
-                if rest == 'mlp.experts.weight2':
-                    num_local_experts = self.num_experts // self.ep_size
-                    
-                    for (tp_rank, ep_rank), state in all_states.items():
-                        if name in state:
-                            expert_offset = ep_rank * num_local_experts
-                            
-                            # weight2: [num_local * intermed, hidden]
-                            intermed_total = merged_shape[0]
-                            hidden_size = merged_shape[1]
-                            intermed = intermed_total // num_local_experts
-                            
-                            for local_id in range(num_local_experts):
-                                global_expert_id = expert_offset + local_id
-                                down_shape = (hidden_size, intermed)
-                                
-                                hf_proj_name = f'{prefix}.mlp.experts.{global_expert_id}.down_proj.weight'
-                                if hf_proj_name not in weight_map:
-                                    proj_numel = 1
-                                    for dim in down_shape:
-                                        proj_numel *= dim
-                                    proj_size = proj_numel * element_size
-                                    weight_map[hf_proj_name] = {
-                                        'shape': list(down_shape),
-                                        'dtype': dtype,
-                                    }
-                                    total_size += proj_size
-                            break
-                    continue
+                    # 统计
+                    numel = 1
+                    for dim in merged_shape:
+                        numel *= dim
+                    total_params += numel
+                    total_size += size_bytes
 
         if self.verbose:
-            logger.info("提取完成，共 %d 个权重，总大小: %d bytes (%.2f GB)",
-                       len(weight_map), total_size, total_size / 1e9)
+            logger.info("=" * 80)
+            logger.info("提取完成")
+            logger.info("=" * 80)
+            logger.info("统计信息:")
+            logger.info("  总权重数量: %d", len(megatron_params))
+            logger.info("  总参数量: %d", total_params)
+            logger.info("  总大小: %.2f GB", total_size / 1e9)
+            
+            # 按类型统计
+            layer_count = sum(1 for n in megatron_params if '.layers.' in n)
+            embed_count = sum(1 for n in megatron_params if 'embedding' in n)
+            norm_count = sum(1 for n in megatron_params if 'layernorm' in n.lower())
+            output_count = sum(1 for n in megatron_params if 'output_layer' in n)
+            
+            logger.info("权重分布:")
+            logger.info("  Embedding: %d", embed_count)
+            logger.info("  Layers: %d", layer_count)
+            logger.info("  LayerNorm: %d", norm_count)
+            logger.info("  Output Layer: %d", output_count)
+            
+            if errors:
+                logger.warning("错误: %d 个", len(errors))
+                for e in errors[:5]:
+                    logger.warning("  - %s", e)
+            
+            if warnings:
+                logger.warning("警告: %d 个", len(warnings))
+                for w in warnings[:5]:
+                    logger.warning("  - %s", w)
 
-        return {
-            'metadata': {
-                'total_size': total_size,
+        # 构建输出
+        metadata = {
+            'total_params': total_params,
+            'total_size_bytes': total_size,
+            'total_size_gb': round(total_size / 1e9, 2),
+            'num_weights': len(megatron_params),
+            'model_config': {
+                'num_layers': self.num_layers,
+                'hidden_size': self.hidden_size,
+                'vocab_size': self.vocab_size,
+                'num_attention_heads': self.num_attention_heads,
+                'num_key_value_heads': self.num_key_value_heads,
+                'num_experts': self.num_experts,
+                'first_k_dense_replace': self.first_k_dense_replace,
             },
-            'weight_map': weight_map,
+            'parallel_config': {
+                'tp_size': self.tp_size,
+                'pp_size': self.pp_size,
+                'ep_size': self.ep_size,
+                'vpp_size': self.vpp_size,
+            },
+            'source': {
+                'mcore_dir': self.mcore_dir,
+                'iter_dir': self.iter_dir,
+            },
+            'note': f'Weights merged from TP={self.tp_size}, EP={self.ep_size} ranks, shapes are original (not sharded)',
+        }
+        
+        if errors:
+            metadata['errors'] = errors
+        if warnings:
+            metadata['warnings'] = warnings
+
+        return ExtractResult(
+            megatron_params=megatron_params,
+            metadata=metadata,
+            total_params=total_params,
+            total_size=total_size,
+            errors=errors,
+            warnings=warnings,
+        )
+
+    def _convert_layer_index(self, name: str, pp_rank: int, 
+                             vpp_rank: Optional[int]) -> str:
+        """
+        将 checkpoint 中的 local layer index 转换为 global layer index。
+        
+        例如: decoder.layers.0.xxx -> decoder.layers.8.xxx (当 pp_rank=1, num_layers=32, pp_size=4)
+        """
+        layer_match = re.match(r'(decoder\.layers\.|model\.layers\.)(\d+)(\..*)', name)
+        if not layer_match:
+            return name
+        
+        prefix = layer_match.group(1)
+        local_idx = int(layer_match.group(2))
+        suffix = layer_match.group(3)
+        
+        global_idx = self._get_global_layer_id(local_idx, pp_rank, vpp_rank)
+        return f'{prefix}{global_idx}{suffix}'
+
+    def get_json_output(self) -> dict:
+        """生成 JSON 格式的输出。"""
+        result = self.extract_weights()
+        
+        return {
+            'megatron_params': result.megatron_params,
+            'metadata': result.metadata,
         }
 
     def save_json(self, output_path: str, indent: int = 2) -> None:
         """保存权重信息到 JSON 文件。"""
-        output = self.extract_weights()
+        output = self.get_json_output()
 
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(output, f, indent=indent, ensure_ascii=False)
@@ -878,23 +944,30 @@ class MCoreCheckpointReader:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='读取 MCore 格式权重并保存为 JSON（与 hf_weights_info.json 对齐）',
+        description='读取 MCore 格式权重并保存为 JSON（与 model_param_mapping_tp1.json 对齐）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   # 基本用法 (TP=1, PP=1, EP=1)
-  python get_mcore_weights_form_ckpt.py /path/to/mcore/ckpt --output weights_info.json
+  python get_mcore_weights_form_ckpt.py /path/to/mcore/ckpt --output model_param_mapping.json
 
   # 指定并行配置 (Kimi2-1T 默认配置: TP=2, PP=8, EP=64)
   python get_mcore_weights_form_ckpt.py /path/to/mcore/ckpt \\
     --tp 2 --pp 8 --ep 64 \\
     --num-layers 32 \\
-    --num-attention-heads 64 --num-key-value-heads 32 \\
+    --num-attention-heads 64 --num-key-value-heads 2 \\
     --hidden-size 7168 --num-experts 128 \\
-    --output weights_info.json
+    --vocab-size 163840 \\
+    --output model_param_mapping.json
+
+  # DualPipe 模式
+  python get_mcore_weights_form_ckpt.py /path/to/mcore/ckpt \\
+    --tp 2 --pp 8 --ep 64 \\
+    --schedules-method dualpipev --vpp-stage 2 \\
+    --output model_param_mapping.json
 
   # 静默模式
-  python get_mcore_weights_form_ckpt.py /path/to/mcore/ckpt --output weights_info.json --quiet
+  python get_mcore_weights_form_ckpt.py /path/to/mcore/ckpt --output model_param_mapping.json --quiet
         """
     )
 
@@ -929,22 +1002,30 @@ def main():
                         type=int,
                         default=7168,
                         help='隐藏层维度 (默认: 7168)')
-    parser.add_argument('--ffn-hidden-size',
-                        type=int,
-                        default=18432,
-                        help='Dense FFN 隐藏层维度 (默认: 18432)')
-    parser.add_argument('--moe-ffn-hidden-size',
-                        type=int,
-                        default=12288,
-                        help='MoE FFN 隐藏层维度 (默认: 12288)')
     parser.add_argument('--num-experts',
                         type=int,
                         default=128,
                         help='MoE 专家总数 (默认: 128)')
+    parser.add_argument('--vocab-size',
+                        type=int,
+                        default=163840,
+                        help='词表大小 (默认: 163840)')
     parser.add_argument('--first-k-dense-replace',
                         type=int,
                         default=2,
                         help='前 K 层使用 Dense MLP (默认: 2)')
+    parser.add_argument('--schedules-method',
+                        type=str,
+                        default=None,
+                        help='调度方法 (如 dualpipev)')
+    parser.add_argument('--vpp-stage',
+                        type=int,
+                        default=None,
+                        help='VPP stage 数 (用于 DualPipe)')
+    parser.add_argument('--io-threads',
+                        type=int,
+                        default=4,
+                        help='IO 线程数 (默认: 4)')
     parser.add_argument('--disable-mmap',
                         action='store_true',
                         help='禁用 torch.load 的 mmap')
@@ -967,9 +1048,11 @@ def main():
         num_attention_heads=args.num_attention_heads,
         num_key_value_heads=args.num_key_value_heads,
         hidden_size=args.hidden_size,
-        ffn_hidden_size=args.ffn_hidden_size,
-        moe_ffn_hidden_size=args.moe_ffn_hidden_size,
         first_k_dense_replace=args.first_k_dense_replace,
+        vocab_size=args.vocab_size,
+        schedules_method=args.schedules_method,
+        vpp_stage=args.vpp_stage,
+        io_threads=args.io_threads,
         disable_mmap=args.disable_mmap,
         verbose=not args.quiet,
     )
@@ -979,4 +1062,4 @@ def main():
 
 
 if __name__ == '__main__':
-    exit(main())
+    sys.exit(main())

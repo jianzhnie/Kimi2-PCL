@@ -8,6 +8,7 @@ without instantiating the full model (which would be memory-intensive for large 
 """
 
 import argparse
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -15,8 +16,6 @@ from typing import Dict, List, Tuple
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-import importlib.util
 
 
 def load_config_module():
@@ -90,30 +89,29 @@ def compute_weight_shape(name: str, config: DeepseekV3Config) -> Tuple[List[int]
         
         # Attention weights
         if "self_attn.q_proj.weight" in name:
-            # Standard GQA: q_proj outputs num_heads * head_dim
-            head_dim = config.hidden_size // config.num_attention_heads
-            return [config.num_attention_heads * head_dim, config.hidden_size], dtype
+            q_head_dim = getattr(config, 'qk_nope_head_dim', 128) + getattr(config, 'qk_rope_head_dim', 64)
+            return [config.num_attention_heads * q_head_dim, config.hidden_size], dtype
         
         if "self_attn.k_proj.weight" in name:
-            head_dim = config.hidden_size // config.num_attention_heads
-            return [config.num_key_value_heads * head_dim, config.hidden_size], dtype
+            k_head_dim = getattr(config, 'qk_nope_head_dim', 128) + getattr(config, 'qk_rope_head_dim', 64)
+            return [config.num_key_value_heads * k_head_dim, config.hidden_size], dtype
         
         if "self_attn.v_proj.weight" in name:
-            head_dim = config.hidden_size // config.num_attention_heads
-            return [config.num_key_value_heads * head_dim, config.hidden_size], dtype
+            v_head_dim = getattr(config, 'v_head_dim', 128)
+            return [config.num_key_value_heads * v_head_dim, config.hidden_size], dtype
         
         if "self_attn.o_proj.weight" in name:
-            head_dim = config.hidden_size // config.num_attention_heads
-            return [config.hidden_size, config.num_attention_heads * head_dim], dtype
+            v_head_dim = getattr(config, 'v_head_dim', 128)
+            return [config.hidden_size, config.num_attention_heads * v_head_dim], dtype
         
         # Q/K layer norms (optional, based on qk_layernorm config)
         if "self_attn.q_layernorm.weight" in name:
-            head_dim = config.hidden_size // config.num_attention_heads
-            return [head_dim], dtype
+            q_head_dim = getattr(config, 'qk_nope_head_dim', 128) + getattr(config, 'qk_rope_head_dim', 64)
+            return [q_head_dim], dtype
         
         if "self_attn.k_layernorm.weight" in name:
-            head_dim = config.hidden_size // config.num_attention_heads
-            return [head_dim], dtype
+            k_head_dim = getattr(config, 'qk_nope_head_dim', 128) + getattr(config, 'qk_rope_head_dim', 64)
+            return [k_head_dim], dtype
         
         # MoE weights
         if is_moe_layer:
@@ -337,7 +335,7 @@ def main():
     else:
         config = DeepseekV3Config()
     
-    print(f"Configuration:")
+    print("Configuration:")
     print(f"  vocab_size: {config.vocab_size}")
     print(f"  hidden_size: {config.hidden_size}")
     print(f"  num_hidden_layers: {config.num_hidden_layers}")
@@ -363,7 +361,7 @@ def main():
     # Print summary
     total_params = len(result["weight_map"])
     total_size_gb = result["metadata"]["total_size"] / (1024**3)
-    print(f"\nSummary:")
+    print("\nSummary:")
     print(f"  Total parameters: {total_params}")
     print(f"  Total size: {total_size_gb:.2f} GB ({result['metadata']['total_size']:,} bytes)")
     
