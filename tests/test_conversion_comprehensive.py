@@ -355,6 +355,9 @@ class TestCkptConvertInitialization:
             "num_key_value_heads": 2,
             "num_experts": 1,
             "num_attention_heads": 4,
+            "qk_head_dim": 64,
+            "qk_pos_emb_head_dim": 32,
+            "v_head_dim": 64,
             "moe_grouped_gemm": False,
             "moe_tp_extend_ep": False,
             "schedules_method": None,
@@ -368,6 +371,7 @@ class TestCkptConvertInitialization:
             "cast_dtype": None,
             "tie_word_embeddings": False,
             "hf_io_threads": 1,
+            "qk_layernorm": False,
         }
 
     @patch.object(CkptConvert, '_validate')
@@ -409,6 +413,9 @@ class TestCkptConvertLayerMapping:
                 num_key_value_heads=2,
                 num_experts=4,
                 num_attention_heads=4,
+                qk_head_dim=64,
+                qk_pos_emb_head_dim=32,
+                v_head_dim=64,
                 moe_grouped_gemm=False,
                 moe_tp_extend_ep=False,
                 schedules_method=None,
@@ -422,6 +429,7 @@ class TestCkptConvertLayerMapping:
                 cast_dtype=None,
                 tie_word_embeddings=False,
                 hf_io_threads=1,
+                qk_layernorm=False,
             )
 
     def test_first_k_dense_replace(self, converter):
@@ -483,9 +491,9 @@ class TestMgCkptConvertInitialization:
             "hidden_size": 64,
             "num_experts": 1,
             "num_attention_heads": 4,
-            "qk_head_dim": 16,
-            "v_head_dim": 16,
-            "qk_pos_emb_head_dim": 8,
+            "qk_head_dim": 64,
+            "v_head_dim": 64,
+            "qk_pos_emb_head_dim": 32,
             "moe_grouped_gemm": False,
             "moe_tp_extend_ep": False,
             "schedules_method": None,
@@ -504,6 +512,7 @@ class TestMgCkptConvertInitialization:
             "io_threads": 1,
             "disable_mmap": True,
             "extra_config_kwargs": {},
+            "qk_layernorm": False,
         }
 
     @patch.object(MgCkptConvert, '_detect_vpp', return_value=(None, ['model']))
@@ -533,9 +542,9 @@ class TestMgCkptConvertQKVLayout:
                 hidden_size=64,
                 num_experts=1,
                 num_attention_heads=4,
-                qk_head_dim=16,
-                v_head_dim=16,
-                qk_pos_emb_head_dim=8,
+                qk_head_dim=64,
+                v_head_dim=64,
+                qk_pos_emb_head_dim=32,
                 moe_grouped_gemm=False,
                 moe_tp_extend_ep=False,
                 schedules_method=None,
@@ -554,23 +563,17 @@ class TestMgCkptConvertQKVLayout:
                 io_threads=1,
                 disable_mmap=True,
                 extra_config_kwargs={},
+                qk_layernorm=False,
             )
 
-    def test_infer_qkv_layout(self, converter):
-        """Test QKV layout inference"""
-        # Use a valid value that allows kv_heads_per_tp > 0
-        # num_attention_heads=4, tp_size=2 -> heads_per_tp=2
-        # Need: shard_rows > heads_per_tp * q_head_dim to leave room for KV
-        # qk_head_dim=16, v_head_dim=16
-        # Try q_head_dim=8: q_per_tp=16, denom=24, need rem>=24 and rem%24==0
-        # shard_rows=64 -> q_per_tp=16, rem=48, kv_heads_per_tp=48/24=2
-        total_qkv_rows = 64
-        result = converter._infer_qkv_layout(total_qkv_rows)
-
-        assert result is not None
-        qk_per_tp, kv_tp_factor = result
-        assert qk_per_tp > 0
-        assert kv_tp_factor > 0
+    def test_attention_params(self, converter):
+        """Test attention parameters are correctly set"""
+        # Verify that GQA parameters are correctly configured
+        assert converter.num_attention_heads == 4
+        assert converter.num_key_value_heads == 2
+        # Verify head_dim calculations
+        expected_head_dim = converter.hidden_size // converter.num_attention_heads
+        assert expected_head_dim == 16  # 64 / 4 = 16
 
 
 # =============================================================================

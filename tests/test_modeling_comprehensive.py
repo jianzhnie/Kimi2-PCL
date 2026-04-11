@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from unittest.mock import Mock, patch, MagicMock
 
-from models.configuration_deepseek_1t import DeepseekV3Config
+from models.configuration_deepseek import DeepseekV3Config
 from models.modeling_deepseek import (
     DeepseekV3RMSNorm,
     DeepseekV3RotaryEmbedding,

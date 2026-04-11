@@ -10,8 +10,7 @@ import json
 import pytest
 from pathlib import Path
 
-from models.configuration_deepseek_1t import DeepseekV3Config as DeepseekV3Config1T
-from models.configuration_deepseek_100b import DeepseekV3Config as DeepseekV3Config100B
+from models.configuration_deepseek import DeepseekV3Config
 
 
 # =============================================================================
@@ -56,12 +55,12 @@ def full_config_kwargs():
 # 1T Config Tests
 # =============================================================================
 
-class TestDeepseekV3Config1T:
+class TestDeepseekV3Config:
     """Test DeepseekV3Config from 1T configuration"""
 
     def test_default_initialization(self):
         """Test config with default values from actual config file"""
-        config = DeepseekV3Config1T()
+        config = DeepseekV3Config()
 
         # Check default values (from actual config_1t.json)
         assert config.vocab_size == 163840
@@ -74,7 +73,7 @@ class TestDeepseekV3Config1T:
 
     def test_custom_initialization(self, minimal_config_kwargs):
         """Test config with custom values"""
-        config = DeepseekV3Config1T(**minimal_config_kwargs)
+        config = DeepseekV3Config(**minimal_config_kwargs)
 
         assert config.vocab_size == 128
         assert config.hidden_size == 64
@@ -82,7 +81,7 @@ class TestDeepseekV3Config1T:
 
     def test_full_initialization(self, full_config_kwargs):
         """Test config with all parameters"""
-        config = DeepseekV3Config1T(**full_config_kwargs)
+        config = DeepseekV3Config(**full_config_kwargs)
 
         for key, value in full_config_kwargs.items():
             assert getattr(config, key) == value
@@ -94,26 +93,26 @@ class TestDeepseekV3Config1T:
             "factor": 32.0,
             "original_max_position_embeddings": 4096,
         }
-        config = DeepseekV3Config1T(rope_scaling=rope_scaling)
+        config = DeepseekV3Config(rope_scaling=rope_scaling)
 
         assert config.rope_scaling == rope_scaling
 
     @pytest.mark.parametrize("hidden_act", ["swiglu", "gelu", "relu", "silu"])
     def test_activation_functions(self, hidden_act):
         """Test various activation functions"""
-        config = DeepseekV3Config1T(hidden_act=hidden_act)
+        config = DeepseekV3Config(hidden_act=hidden_act)
         assert config.hidden_act == hidden_act
 
     @pytest.mark.parametrize("dropout", [0.0, 0.1, 0.5])
     def test_dropout_values(self, dropout):
         """Test various dropout values"""
-        config = DeepseekV3Config1T(attention_dropout=dropout)
+        config = DeepseekV3Config(attention_dropout=dropout)
         assert config.attention_dropout == dropout
 
     def test_num_key_value_heads_gqa(self):
         """Test grouped query attention configuration"""
         # When group_query_attention=True, num_key_value_heads is calculated from num_query_groups
-        config = DeepseekV3Config1T(
+        config = DeepseekV3Config(
             num_attention_heads=64,
             num_query_groups=4,  # This will set num_key_value_heads = 64 // 4 = 16
         )
@@ -123,7 +122,7 @@ class TestDeepseekV3Config1T:
     def test_gqa_configuration(self):
         """Test grouped query attention with custom values"""
         # When group_query_attention=True, num_key_value_heads is calculated from num_query_groups
-        config = DeepseekV3Config1T(
+        config = DeepseekV3Config(
             num_attention_heads=64,
             num_query_groups=8,  # This will set num_key_value_heads = 64 // 8 = 8
         )
@@ -132,7 +131,7 @@ class TestDeepseekV3Config1T:
 
     def test_config_to_dict(self):
         """Test converting config to dictionary"""
-        config = DeepseekV3Config1T()
+        config = DeepseekV3Config()
         config_dict = config.to_dict()
 
         assert isinstance(config_dict, dict)
@@ -142,7 +141,7 @@ class TestDeepseekV3Config1T:
 
     def test_config_to_json_string(self):
         """Test converting config to JSON string"""
-        config = DeepseekV3Config1T()
+        config = DeepseekV3Config()
         json_str = config.to_json_string()
 
         assert isinstance(json_str, str)
@@ -152,7 +151,7 @@ class TestDeepseekV3Config1T:
 
     def test_config_save_and_load(self, tmp_path):
         """Test saving and loading config"""
-        config = DeepseekV3Config1T(
+        config = DeepseekV3Config(
             vocab_size=256,
             hidden_size=128,
             num_hidden_layers=4,
@@ -163,7 +162,7 @@ class TestDeepseekV3Config1T:
         config.save_pretrained(tmp_path)
 
         # Load
-        loaded_config = DeepseekV3Config1T.from_pretrained(tmp_path)
+        loaded_config = DeepseekV3Config.from_pretrained(tmp_path)
 
         assert loaded_config.vocab_size == config.vocab_size
         assert loaded_config.hidden_size == config.hidden_size
@@ -171,16 +170,16 @@ class TestDeepseekV3Config1T:
 
     def test_config_equality(self):
         """Test config equality comparison"""
-        config1 = DeepseekV3Config1T(vocab_size=128, hidden_size=64)
-        config2 = DeepseekV3Config1T(vocab_size=128, hidden_size=64)
-        config3 = DeepseekV3Config1T(vocab_size=256, hidden_size=64)
+        config1 = DeepseekV3Config(vocab_size=128, hidden_size=64)
+        config2 = DeepseekV3Config(vocab_size=128, hidden_size=64)
+        config3 = DeepseekV3Config(vocab_size=256, hidden_size=64)
 
         assert config1 == config2
         assert config1 != config3
 
     def test_config_repr(self):
         """Test config string representation"""
-        config = DeepseekV3Config1T()
+        config = DeepseekV3Config()
         repr_str = repr(config)
 
         assert "DeepseekV3Config" in repr_str
@@ -188,7 +187,7 @@ class TestDeepseekV3Config1T:
 
     def test_config_update(self):
         """Test updating config attributes"""
-        config = DeepseekV3Config1T()
+        config = DeepseekV3Config()
         config.update({"vocab_size": 256, "hidden_size": 128})
 
         assert config.vocab_size == 256
@@ -196,9 +195,9 @@ class TestDeepseekV3Config1T:
 
     def test_config_copy(self):
         """Test copying config via to_dict() and from_dict()"""
-        config = DeepseekV3Config1T(vocab_size=128, hidden_size=64)
+        config = DeepseekV3Config(vocab_size=128, hidden_size=64)
         config_dict = config.to_dict()
-        config_copy = DeepseekV3Config1T(**config_dict)
+        config_copy = DeepseekV3Config(**config_dict)
 
         assert config.vocab_size == config_copy.vocab_size
         assert config.hidden_size == config_copy.hidden_size
@@ -209,37 +208,37 @@ class TestDeepseekV3Config1T:
 # 100B Config Tests
 # =============================================================================
 
-class TestDeepseekV3Config100B:
+class TestDeepseekV3Config:
     """Test DeepseekV3Config from 100B configuration"""
 
     def test_default_initialization(self):
-        """Test config with default values"""
-        config = DeepseekV3Config100B()
+        """Test config with default values (1T model)"""
+        config = DeepseekV3Config()
 
-        # Check default values for 100B model (from actual config)
+        # Check default values for 1T model (from actual config)
         assert config.vocab_size == 163840
-        assert config.hidden_size == 4096
+        assert config.hidden_size == 7168
         assert config.num_hidden_layers == 32
-        assert config.num_attention_heads == 128
-        assert config.intermediate_size == 11264
+        assert config.num_attention_heads == 64
+        assert config.intermediate_size == 18432
 
     def test_custom_initialization(self, minimal_config_kwargs):
         """Test config with custom values"""
-        config = DeepseekV3Config100B(**minimal_config_kwargs)
+        config = DeepseekV3Config(**minimal_config_kwargs)
 
         assert config.vocab_size == 128
         assert config.hidden_size == 64
         assert config.num_hidden_layers == 2
 
-    def test_100b_vs_1t_differences(self):
-        """Test differences between 100B and 1T configs"""
-        config_100b = DeepseekV3Config100B()
-        config_1t = DeepseekV3Config1T()
+    def test_custom_vs_default_differences(self):
+        """Test differences between custom and default configs"""
+        config_default = DeepseekV3Config()
+        config_custom = DeepseekV3Config(hidden_size=4096, num_attention_heads=32)
 
-        # 100B has smaller hidden size than 1T
-        assert config_100b.hidden_size < config_1t.hidden_size
-        # Both have same number of layers (32), but heads differ
-        assert config_100b.num_attention_heads > config_1t.num_attention_heads
+        # Custom config has smaller hidden size than default
+        assert config_custom.hidden_size < config_default.hidden_size
+        # Custom config has fewer attention heads
+        assert config_custom.num_attention_heads < config_default.num_attention_heads
 
 
 # =============================================================================
@@ -251,7 +250,7 @@ class TestMoEConfiguration:
 
     def test_moe_default_config(self):
         """Test default MoE configuration"""
-        config = DeepseekV3Config1T()
+        config = DeepseekV3Config()
 
         assert config.n_routed_experts == 128
         assert config.n_shared_experts == 1
@@ -260,7 +259,7 @@ class TestMoEConfiguration:
 
     def test_moe_custom_config(self):
         """Test custom MoE configuration"""
-        config = DeepseekV3Config1T(
+        config = DeepseekV3Config(
             n_routed_experts=64,
             n_shared_experts=4,
             num_experts_per_tok=4,
@@ -274,25 +273,25 @@ class TestMoEConfiguration:
 
     def test_first_k_dense_replace(self):
         """Test first_k_dense_replace configuration"""
-        config = DeepseekV3Config1T(first_k_dense_replace=2)
+        config = DeepseekV3Config(first_k_dense_replace=2)
 
         assert config.first_k_dense_replace == 2
 
     def test_moe_layer_freq(self):
         """Test moe_layer_freq configuration"""
-        config = DeepseekV3Config1T(moe_layer_freq=1)
+        config = DeepseekV3Config(moe_layer_freq=1)
 
         assert config.moe_layer_freq == 1
 
     def test_moe_aux_loss_coeff(self):
         """Test auxiliary loss coefficient"""
-        config = DeepseekV3Config1T(moe_aux_loss_coeff=0.001)
+        config = DeepseekV3Config(moe_aux_loss_coeff=0.001)
 
         assert config.moe_aux_loss_coeff == 0.001
 
     def test_moe_z_loss_coeff(self):
         """Test z-loss coefficient"""
-        config = DeepseekV3Config1T(moe_z_loss_coeff=0.0001)
+        config = DeepseekV3Config(moe_z_loss_coeff=0.0001)
 
         assert config.moe_z_loss_coeff == 0.0001
 
@@ -307,7 +306,7 @@ class TestAttentionConfiguration:
     def test_gqa_configuration(self):
         """Test grouped query attention configuration"""
         # When group_query_attention=True, num_key_value_heads is calculated from num_query_groups
-        config = DeepseekV3Config1T(
+        config = DeepseekV3Config(
             num_attention_heads=64,
             num_query_groups=8,  # This will set num_key_value_heads = 64 // 8 = 8
         )
@@ -317,7 +316,7 @@ class TestAttentionConfiguration:
 
     def test_qk_head_dims(self):
         """Test Q/K head dimension configuration"""
-        config = DeepseekV3Config1T(
+        config = DeepseekV3Config(
             qk_nope_head_dim=128,
             qk_rope_head_dim=64,
             v_head_dim=128,
@@ -329,19 +328,19 @@ class TestAttentionConfiguration:
 
     def test_rope_theta(self):
         """Test RoPE theta (base frequency)"""
-        config = DeepseekV3Config1T(rope_theta=1000000.0)
+        config = DeepseekV3Config(rope_theta=1000000.0)
 
         assert config.rope_theta == 1000000.0
 
     def test_attention_bias(self):
         """Test attention bias configuration"""
-        config = DeepseekV3Config1T(attention_bias=False)
+        config = DeepseekV3Config(attention_bias=False)
 
         assert config.attention_bias == False
 
     def test_qk_layernorm(self):
         """Test Q/K layernorm configuration"""
-        config = DeepseekV3Config1T(qk_layernorm=True)
+        config = DeepseekV3Config(qk_layernorm=True)
 
         assert config.qk_layernorm == True
 
@@ -355,7 +354,7 @@ class TestRoPEScalingConfiguration:
 
     def test_no_scaling(self):
         """Test configuration without RoPE scaling"""
-        config = DeepseekV3Config1T(rope_scaling=None)
+        config = DeepseekV3Config(rope_scaling=None)
 
         assert config.rope_scaling is None
 
@@ -370,7 +369,7 @@ class TestRoPEScalingConfiguration:
             "mscale": 1,
             "mscale_all_dim": 0,
         }
-        config = DeepseekV3Config1T(rope_scaling=rope_scaling)
+        config = DeepseekV3Config(rope_scaling=rope_scaling)
 
         assert config.rope_scaling["type"] == "yarn"
         assert config.rope_scaling["factor"] == 32.0
@@ -381,7 +380,7 @@ class TestRoPEScalingConfiguration:
             "type": "linear",
             "factor": 2.0,
         }
-        config = DeepseekV3Config1T(rope_scaling=rope_scaling)
+        config = DeepseekV3Config(rope_scaling=rope_scaling)
 
         assert config.rope_scaling["type"] == "linear"
         assert config.rope_scaling["factor"] == 2.0
@@ -392,7 +391,7 @@ class TestRoPEScalingConfiguration:
             "type": "dynamic",
             "factor": 4.0,
         }
-        config = DeepseekV3Config1T(rope_scaling=rope_scaling)
+        config = DeepseekV3Config(rope_scaling=rope_scaling)
 
         assert config.rope_scaling["type"] == "dynamic"
         assert config.rope_scaling["factor"] == 4.0
@@ -407,7 +406,7 @@ class TestConfigEdgeCases:
 
     def test_very_small_config(self):
         """Test with very small configuration"""
-        config = DeepseekV3Config1T(
+        config = DeepseekV3Config(
             vocab_size=16,
             hidden_size=4,
             intermediate_size=8,
@@ -420,7 +419,7 @@ class TestConfigEdgeCases:
 
     def test_very_large_config(self):
         """Test with very large configuration"""
-        config = DeepseekV3Config1T(
+        config = DeepseekV3Config(
             vocab_size=500000,
             hidden_size=16384,
             intermediate_size=65536,
@@ -433,37 +432,37 @@ class TestConfigEdgeCases:
 
     def test_zero_dropout(self):
         """Test with zero dropout"""
-        config = DeepseekV3Config1T(attention_dropout=0.0)
+        config = DeepseekV3Config(attention_dropout=0.0)
 
         assert config.attention_dropout == 0.0
 
     def test_high_dropout(self):
         """Test with high dropout"""
-        config = DeepseekV3Config1T(attention_dropout=0.9)
+        config = DeepseekV3Config(attention_dropout=0.9)
 
         assert config.attention_dropout == 0.9
 
     def test_tie_word_embeddings(self):
         """Test tie_word_embeddings configuration"""
-        config = DeepseekV3Config1T(tie_word_embeddings=True)
+        config = DeepseekV3Config(tie_word_embeddings=True)
 
         assert config.tie_word_embeddings == True
 
     def test_pad_token_id(self):
         """Test pad_token_id configuration"""
-        config = DeepseekV3Config1T(pad_token_id=0)
+        config = DeepseekV3Config(pad_token_id=0)
 
         assert config.pad_token_id == 0
 
     def test_bos_token_id(self):
         """Test bos_token_id configuration"""
-        config = DeepseekV3Config1T(bos_token_id=1)
+        config = DeepseekV3Config(bos_token_id=1)
 
         assert config.bos_token_id == 1
 
     def test_eos_token_id(self):
         """Test eos_token_id configuration"""
-        config = DeepseekV3Config1T(eos_token_id=2)
+        config = DeepseekV3Config(eos_token_id=2)
 
         assert config.eos_token_id == 2
 
@@ -477,7 +476,7 @@ class TestConfigSerialization:
 
     def test_config_to_json_file(self, tmp_path):
         """Test saving config to JSON file"""
-        config = DeepseekV3Config1T(vocab_size=128, hidden_size=64)
+        config = DeepseekV3Config(vocab_size=128, hidden_size=64)
 
         json_path = tmp_path / "config.json"
         config.to_json_file(json_path)
@@ -505,7 +504,7 @@ class TestConfigSerialization:
         with open(json_path, "w") as f:
             json.dump(data, f)
 
-        config = DeepseekV3Config1T.from_json_file(json_path)
+        config = DeepseekV3Config.from_json_file(json_path)
 
         assert config.vocab_size == 256
         assert config.hidden_size == 128
@@ -517,7 +516,7 @@ class TestConfigSerialization:
             "factor": 32.0,
             "original_max_position_embeddings": 4096,
         }
-        config = DeepseekV3Config1T(rope_scaling=rope_scaling)
+        config = DeepseekV3Config(rope_scaling=rope_scaling)
 
         json_str = config.to_json_string()
         parsed = json.loads(json_str)
@@ -538,7 +537,7 @@ class TestRepositoryConfigFiles:
         config_path = repo_root / "models" / "config_1t.json"
 
         if config_path.exists():
-            config = DeepseekV3Config1T.from_json_file(config_path)
+            config = DeepseekV3Config.from_json_file(config_path)
             assert config.vocab_size == 163840
             assert config.hidden_size == 7168  # Actual value from config_1t.json
             assert config.num_hidden_layers == 32  # Actual value from config_1t.json
@@ -549,7 +548,7 @@ class TestRepositoryConfigFiles:
         config_path = repo_root / "models" / "config_100b.json"
 
         if config_path.exists():
-            config = DeepseekV3Config100B.from_json_file(config_path)
+            config = DeepseekV3Config.from_json_file(config_path)
             assert config.vocab_size == 163840
             assert config.hidden_size == 4096  # Actual value from config_100b.json
             assert config.num_hidden_layers == 28  # Actual value from config_100b.json
@@ -562,8 +561,8 @@ class TestRepositoryConfigFiles:
         config_100b_path = repo_root / "models" / "config_100b.json"
 
         if config_1t_path.exists() and config_100b_path.exists():
-            config_1t = DeepseekV3Config1T.from_json_file(config_1t_path)
-            config_100b = DeepseekV3Config100B.from_json_file(config_100b_path)
+            config_1t = DeepseekV3Config.from_json_file(config_1t_path)
+            config_100b = DeepseekV3Config.from_json_file(config_100b_path)
 
             # Both should have same vocab size
             assert config_1t.vocab_size == config_100b.vocab_size
