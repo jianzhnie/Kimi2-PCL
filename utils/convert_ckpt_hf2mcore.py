@@ -31,7 +31,13 @@ import torch
 from safetensors import safe_open
 
 # 导入权重映射定义
-from utils.hf2mcore_mapping import ModelConfig, WeightMapping, DimensionCalculator
+try:
+    from utils.hf2mcore_mapping import ModelConfig, WeightMapping, DimensionCalculator
+except ImportError:
+    # 支持直接运行脚本
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from utils.hf2mcore_mapping import ModelConfig, WeightMapping, DimensionCalculator
 
 logger.basicConfig(format='')
 logger.getLogger().setLevel(logger.INFO)

@@ -1,4 +1,5 @@
 import argparse
+import gc
 import hashlib
 import inspect
 import json
