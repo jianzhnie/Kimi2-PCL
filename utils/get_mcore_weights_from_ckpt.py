@@ -85,7 +85,7 @@ class ParallelConfig:
     
     @property
     def dualpipe(self) -> bool:
-        return self.schedules_method == 'dualpipev'
+        return self.schedules_method is not None and 'dualpipe' in self.schedules_method.lower()
 
 
 @dataclass
@@ -285,24 +285,38 @@ class LayerMapper(ABC):
 
 class StandardVppMapper(LayerMapper):
     """标准 VPP Layer 映射"""
-    
+
     def build_mapping(self, num_layers: int, pp_size: int, vpp_stage: int) -> Dict[int, Tuple[int, int, int]]:
         layers_per_vpp = vpp_stage
+        layers_per_pp = num_layers // pp_size
+        num_vpp_stages = layers_per_pp // layers_per_vpp
+
+        # 验证层数可被正确划分
+        if num_layers % pp_size != 0:
+            raise ValueError(f"num_layers({num_layers}) 必须能被 pp_size({pp_size}) 整除")
+        if layers_per_pp % layers_per_vpp != 0:
+            raise ValueError(f"layers_per_pp({layers_per_pp}) 必须能被 vpp_stage({vpp_stage}) 整除")
+
         mapping = {}
-        
         for pp_rank in range(pp_size):
-            for vpp_rank in range(num_layers // (pp_size * layers_per_vpp)):
+            for vpp_rank in range(num_vpp_stages):
                 for local_idx in range(layers_per_vpp):
-                    global_layer = pp_rank * (num_layers // pp_size) + vpp_rank * layers_per_vpp + local_idx
+                    global_layer = pp_rank * layers_per_pp + vpp_rank * layers_per_vpp + local_idx
                     mapping[global_layer] = (pp_rank, vpp_rank, local_idx)
-        
+
         return mapping
 
 
 class DualPipeMapper(LayerMapper):
     """DualPipe Layer 映射"""
-    
+
     def build_mapping(self, num_layers: int, pp_size: int, vpp_stage: int) -> Dict[int, Tuple[int, int, int]]:
+        # DualPipe 要求层数能被 pp_size * 2 整除
+        if num_layers % (pp_size * 2) != 0:
+            raise ValueError(
+                f"DualPipe 要求 num_layers({num_layers}) 能被 pp_size*2({pp_size * 2}) 整除"
+            )
+
         layers_per_pp = num_layers // pp_size
         layer_pop_num = layers_per_pp // 2
         all_layers = list(range(num_layers))
@@ -381,91 +395,119 @@ class MoeParallelStrategy(ParallelStrategy):
     }
     
     def get_tp_parallel_dim(self, name: str) -> Optional[int]:
-        """确定权重在哪个维度上进行张量并行切分"""
+        """确定权重在哪个维度上进行张量并行切分
+
+        Returns:
+            0: Row-wise parallel (切分第0维)
+            1: Column-wise parallel (切分第1维)
+            None: 不切分
+        """
         # 专家权重不参与 TP 切分
-        if self.PATTERNS['expert_weights'].search(name):
+        if '.experts.weight1' in name or '.experts.weight2' in name:
             return None
-        
-        # Shared experts 参与 TP 切分
+        if '.local_experts.' in name:
+            return None
+
+        # Shared experts 参与 TP 切分 (row-wise, 切分输出维度)
         if self.PATTERNS['shared_experts_fc1'].search(name):
             return 0
         if self.PATTERNS['shared_experts_fc2'].search(name):
             return 1
-        
+
         # Row-wise (dim=0): 输出维度被切分
+        # embedding: [vocab_size, hidden_size] -> 切分 vocab_size (dim=0)
+        # qkv: [qkv_dim, hidden_size] -> 切分 qkv_dim (dim=0)
+        # linear_fc1: [ffn_hidden_size, hidden_size] -> 切分 ffn_hidden_size (dim=0)
         if any(self.PATTERNS[p].search(name) for p in ['embedding', 'output', 'qkv']):
             return 0
         if 'mlp.linear_fc1' in name and 'shared_experts' not in name:
             return 0
-        
+
         # Column-wise (dim=1): 输入维度被切分
+        # linear_proj: [hidden_size, attention_proj_dim] -> 切分 attention_proj_dim (dim=1)
+        # linear_fc2: [hidden_size, ffn_hidden_size] -> 切分 ffn_hidden_size (dim=1)
         if self.PATTERNS['proj'].search(name):
             return 1
         if 'mlp.linear_fc2' in name and 'shared_experts' not in name:
             return 1
-        
+
         # 不切分
         if self.PATTERNS['layernorm'].search(name):
             return None
         if self.PATTERNS['router'].search(name):
             return None
-        
+
         return None
     
     def is_ep_sharded(self, name: str) -> bool:
         """判断权重是否在 EP 维度上切分"""
-        return self.PATTERNS['expert_weights'].search(name) is not None
+        # grouped_gemm 格式的 experts
+        if '.experts.weight1' in name or '.experts.weight2' in name:
+            return True
+        # local_experts 格式
+        if '.local_experts.' in name:
+            return True
+        return False
     
     def get_expected_shape(self, name: str, config: ModelConfig) -> Optional[Tuple[int, ...]]:
         """根据模型配置计算期望的 shape"""
         h = config.hidden_size
-        
+
         # Embedding / Output
         if self.PATTERNS['embedding'].search(name) or self.PATTERNS['output'].search(name):
             return (config.vocab_size, h)
-        
+
         # Q/K Layernorm (MLA)
         if self.PATTERNS['qk_norm'].search(name):
             return (config.kv_channels,)
-        
+
         # LayerNorm
         if self.PATTERNS['layernorm'].search(name):
             return (h,)
-        
+
         # Attention QKV
         if 'self_attention.linear_qkv.weight' in name:
             return (config.qkv_dim, h)
         if 'self_attention.linear_qkv.bias' in name:
             return (config.qkv_dim,)
-        
+
         # Attention projection
         if 'self_attention.linear_proj.weight' in name:
             return (h, config.attention_proj_dim)
-        
+
         # Dense MLP (first_k_dense_replace layers)
         if self.PATTERNS['dense_mlp_fc1'].search(name):
             return (config.ffn_hidden_size, h)
         if self.PATTERNS['dense_mlp_fc2'].search(name):
             return (h, config.ffn_hidden_size)
-        
+
         # Shared experts
         if self.PATTERNS['shared_experts_fc1'].search(name) and '.weight' in name:
             return (config.moe_ffn_hidden_size, h)
         if self.PATTERNS['shared_experts_fc2'].search(name) and '.weight' in name:
             return (h, config.moe_ffn_hidden_size)
-        
+
         # Router
         if 'router.weight' in name:
             return (config.num_experts, h)
         if 'router.expert_bias' in name:
             return (config.num_experts,)
-        
+        if 'router.score_bias' in name:
+            return (config.num_experts,)
+
         # Experts (grouped_gemm 格式)
+        # weight1: [hidden_size, num_experts * ffn_hidden_size * 2] (gated activation)
+        # 注意：*2 是因为 gated activation (如 SwiGLU) 有两个线性变换
         if '.experts.weight1' in name:
             return (h, config.num_experts * config.moe_ffn_hidden_size * 2)
         if '.experts.weight2' in name:
             return (config.num_experts * config.moe_ffn_hidden_size, h)
-        
+        # Local experts 格式 (非 grouped_gemm)
+        if '.local_experts.' in name and '.fc1' in name:
+            return (config.moe_ffn_hidden_size, h)
+        if '.local_experts.' in name and '.fc2' in name:
+            return (h, config.moe_ffn_hidden_size)
+
         return None
 
 
@@ -597,17 +639,27 @@ class CheckpointLoader:
         """解析 PP 和 EP 索引"""
         if not idxs or idxs[0] is None:
             return 0, 0
-        
-        if len(idxs) == 1:
-            v = idxs[0]
-            if self.parallel.pp_size > 1 and self.parallel.ep_size == 1:
-                return v, 0
-            elif self.parallel.pp_size == 1 and self.parallel.ep_size > 1:
-                return 0, v
-            else:
-                return (v, 0) if v < self.parallel.pp_size else (0, v)
-        
-        return idxs[0], idxs[1]
+
+        if len(idxs) >= 2:
+            # 明确的 pp_ep 或 ep_pp 格式，优先解释为 pp_ep
+            return idxs[0], idxs[1]
+
+        # 单索引情况：根据并行配置推断
+        v = idxs[0]
+        if self.parallel.pp_size > 1 and self.parallel.ep_size > 1:
+            # PP 和 EP 都大于 1 时，无法从单索引安全推断
+            # 假设格式为 tp_rank_pp_ep，其中 pp_ep 部分为 pp_rank * ep_size + ep_rank
+            # 但这里我们无法确定，抛出错误让用户检查
+            raise ValueError(
+                f"无法从单索引 {v} 推断 PP/EP 位置 (PP={self.parallel.pp_size}, EP={self.parallel.ep_size}). "
+                f"请检查 mp_rank 目录命名格式是否为 mp_rank_XX_PP_EEE"
+            )
+        elif self.parallel.pp_size > 1:
+            return v, 0
+        elif self.parallel.ep_size > 1:
+            return 0, v
+        else:
+            return 0, 0
     
     def get_ckpt_path(self, tp_rank: int, pp_rank: int, 
                       ep_rank: Optional[int]) -> str:
@@ -647,7 +699,7 @@ class CheckpointLoader:
              vpp_rank: Optional[int] = None) -> Dict[str, torch.Tensor]:
         """加载指定 rank 的 state"""
         path = self.get_ckpt_path(tp_rank, pp_rank, ep_rank)
-        
+
         # 检查缓存
         cached = self.cache.get(path)
         if cached is not None:
@@ -655,13 +707,26 @@ class CheckpointLoader:
         else:
             state = _torch_load_compat(path, disable_mmap=self.disable_mmap)
             self.cache.put(path, state)
-        
+
         # 提取 model 部分
-        key = f'model{vpp_rank}' if vpp_rank is not None else 'model'
-        if key in state:
-            return state[key]
-        elif 'state_dict' in state:
+        # 优先尝试 VPP 格式 (model0, model1, ...)
+        if vpp_rank is not None:
+            key = f'model{vpp_rank}'
+            if key in state:
+                return state[key]
+            # 有些 checkpoint 格式是 model[0], model[1] 或嵌套在 state_dict 中
+            if 'state_dict' in state:
+                sd = state['state_dict']
+                if key in sd:
+                    return sd[key]
+
+        # 非 VPP 格式
+        if 'model' in state:
+            return state['model']
+        if 'state_dict' in state:
             return state['state_dict']
+
+        # 如果以上都不匹配，返回整个 state（可能是扁平结构）
         return state
     
     def load_stage(self, pp_rank: int, vpp_rank: Optional[int], 
@@ -788,50 +853,79 @@ class MCoreCheckpointReader:
                     try:
                         path = self.loader.get_ckpt_path(tp, pp, 0 if self.parallel.ep_size > 1 else None)
                         state = _torch_load_compat(path, self.disable_mmap)
-                        model_keys = [k for k in state.keys() if k.startswith('model') and k != 'model']
+                        # 检查 state 结构
+                        if 'state_dict' in state:
+                            state = state['state_dict']
+                        elif 'model' in state:
+                            state = state['model']
+                        # 查找 model{N} 格式的 key
+                        model_keys = [k for k in state.keys() if re.match(r'^model\d+$', k)]
                         if len(model_keys) > 1:
                             return len(model_keys), model_keys
                         return None, []
                     except FileNotFoundError:
                         continue
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"VPP 检测失败: {e}")
         return None, []
     
     def _build_layer_mapping(self) -> None:
         """构建 layer 映射"""
         self.layer_mapper = LayerMapperFactory.create(self.parallel.dualpipe)
-        
+
         vpp_stage = self.parallel.vpp_stage
         if vpp_stage is None:
-            vpp_stage = max(1, self.model.num_layers // (self.parallel.pp_size * 2))
-        
+            # 默认每个 VPP stage 包含的层数
+            if self.parallel.dualpipe:
+                vpp_stage = max(1, self.model.num_layers // (self.parallel.pp_size * 2))
+            else:
+                # 标准 VPP: layers_per_pp // vpp_size，这里假设 vpp_size=2
+                vpp_stage = max(1, self.model.num_layers // (self.parallel.pp_size * 2))
+
         self._layer2loc = self.layer_mapper.build_mapping(
             self.model.num_layers, self.parallel.pp_size, vpp_stage
         )
-        
+
         if self.verbose:
-            logger.info('Layer mapping built: dualpipe=%s, vpp_stage=%d', 
-                       self.parallel.dualpipe, vpp_stage)
+            logger.info('Layer mapping built: dualpipe=%s, vpp_stage=%d, total_mappings=%d',
+                       self.parallel.dualpipe, vpp_stage, len(self._layer2loc))
     
-    def _get_global_layer_id(self, local_idx: int, pp_rank: int, 
+    def _get_global_layer_id(self, local_idx: int, pp_rank: int,
                              vpp_rank: Optional[int]) -> int:
         """获取全局 layer id"""
-        if self.parallel.vpp_size is None:
-            return pp_rank * (self.model.num_layers // self.parallel.pp_size) + local_idx
-        
+        layers_per_pp = self.model.num_layers // self.parallel.pp_size
+
+        if self.parallel.vpp_size is None or vpp_rank is None:
+            # 无 VPP 时，简单计算全局层号
+            return pp_rank * layers_per_pp + local_idx
+
+        # 有 VPP 时，通过映射表查找
         for global_id, (p, v, l) in self._layer2loc.items():
             if p == pp_rank and v == vpp_rank and l == local_idx:
                 return global_id
-        return local_idx
+
+        # 找不到时，使用启发式计算（更安全的 fallback）
+        logger.warning(
+            f"未找到 layer 映射: pp={pp_rank}, vpp={vpp_rank}, local={local_idx}, "
+            f"使用启发式计算"
+        )
+        # 启发式：pp_rank * layers_per_pp + vpp_rank * vpp_stage + local_idx
+        fallback_id = pp_rank * layers_per_pp + vpp_rank * self.parallel.vpp_stage + local_idx
+        if fallback_id >= self.model.num_layers:
+            raise ValueError(
+                f"计算的全局 layer id ({fallback_id}) 超出范围 "
+                f"[0, {self.model.num_layers}), 请检查 VPP 配置"
+            )
+        return fallback_id
     
-    def _convert_layer_index(self, name: str, pp_rank: int, 
+    def _convert_layer_index(self, name: str, pp_rank: int,
                              vpp_rank: Optional[int]) -> str:
         """转换 layer index 为全局索引"""
-        match = re.match(r'(decoder\.layers\.|model\.layers\.)(\d+)(.*)', name)
+        # 支持多种层命名格式: decoder.layers.X, model.layers.X, layers.X
+        match = re.match(r'((?:decoder\.|model\.)?layers\.)(\d+)(.*)', name)
         if not match:
             return name
-        
+
         prefix, local_idx, suffix = match.group(1), int(match.group(2)), match.group(3)
         global_idx = self._get_global_layer_id(local_idx, pp_rank, vpp_rank)
         return f'{prefix}{global_idx}{suffix}'
@@ -858,13 +952,23 @@ class MCoreCheckpointReader:
         """提取所有权重信息"""
         self._validate()
         self.loader.build_rank_map()
-        
+
         # 检测并配置 VPP
         self.parallel.vpp_size, _ = self._detect_vpp()
-        if self.parallel.vpp_size:
-            if self.parallel.vpp_stage is None:
+        if self.parallel.vpp_stage is None:
+            if self.parallel.dualpipe:
+                # DualPipe: 默认每个 stage 包含的层数
                 self.parallel.vpp_stage = max(1, self.model.num_layers // (self.parallel.pp_size * 2))
-            self._build_layer_mapping()
+            elif self.parallel.vpp_size:
+                # 标准 VPP: 根据检测到的 vpp_size 计算
+                layers_per_pp = self.model.num_layers // self.parallel.pp_size
+                self.parallel.vpp_stage = max(1, layers_per_pp // self.parallel.vpp_size)
+            else:
+                # 无 VPP: 每个 PP stage 视为一个 VPP stage
+                self.parallel.vpp_stage = max(1, self.model.num_layers // self.parallel.pp_size)
+
+        # 总是构建 layer mapping（支持 VPP 和非 VPP 场景）
+        self._build_layer_mapping()
         
         megatron_params: Dict[str, Dict[str, Any]] = {}
         total_params = 0
@@ -884,10 +988,10 @@ class MCoreCheckpointReader:
                        self.model.num_layers, self.model.hidden_size, self.model.num_experts)
         
         # 确定所有 stages
-        if self.parallel.vpp_size is None:
+        if self.parallel.vpp_size is None or self.parallel.vpp_size == 1:
             stages = [(pp, None) for pp in range(self.parallel.pp_size)]
         else:
-            stages = [(pp, vpp) for pp in range(self.parallel.pp_size) 
+            stages = [(pp, vpp) for pp in range(self.parallel.pp_size)
                      for vpp in range(self.parallel.vpp_size)]
         
         # 处理每个 stage
@@ -910,13 +1014,26 @@ class MCoreCheckpointReader:
             weight_tensors: Dict[str, Dict[Tuple[int, int], torch.Tensor]] = defaultdict(dict)
             for (tp_rank, ep_rank), state in models.items():
                 for name, tensor in state.items():
-                    if isinstance(tensor, torch.Tensor):
-                        weight_tensors[name][(tp_rank, ep_rank)] = tensor
+                    # 过滤非 Tensor 类型和内部状态（如 optimizer 状态）
+                    if not isinstance(tensor, torch.Tensor):
+                        continue
+                    # 跳过 optimizer 状态（通常以 '_extra_state' 或特定前缀开头）
+                    if name.startswith('_extra_state') or name.startswith('optimizer'):
+                        continue
+                    weight_tensors[name][(tp_rank, ep_rank)] = tensor
             
             # 处理每个权重
             for name, tp_ep_tensors in weight_tensors.items():
+                # 跳过空的 tensor 集合
+                if not tp_ep_tensors:
+                    continue
+
                 final_name = self._convert_layer_index(name, pp_rank, vpp_rank)
-                mcore_full_name = f'module.{final_name}'
+                # 确保名称以 module. 开头（如果不以 module. 或 model. 开头）
+                if not (final_name.startswith('module.') or final_name.startswith('model.')):
+                    mcore_full_name = f'module.{final_name}'
+                else:
+                    mcore_full_name = final_name
                 
                 if mcore_full_name in megatron_params:
                     continue
@@ -936,7 +1053,9 @@ class MCoreCheckpointReader:
                     warnings.extend(self._validate_shape(mcore_full_name, merged_shape))
                 
                 # 获取第一个 tensor 的 dtype 和 requires_grad
-                first_tensor = next(iter(tp_ep_tensors.values()))
+                # 确保按 (tp_rank, ep_rank) 排序，保证确定性
+                first_key = sorted(tp_ep_tensors.keys())[0]
+                first_tensor = tp_ep_tensors[first_key]
                 dtype = _get_torch_dtype_name(first_tensor.dtype)
                 requires_grad = getattr(first_tensor, 'requires_grad', True)
                 
