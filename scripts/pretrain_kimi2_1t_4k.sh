@@ -32,18 +32,21 @@ MOE_ARGS="
     --num-experts 128 \
     --moe-router-topk 2 \
     --moe-ffn-hidden-size 12288 \
-    --moe-router-load-balancing-type aux_loss \
+    --moe-router-load-balancing-type none \
     --moe-router-num-groups 8 \
     --moe-router-group-topk 2 \
     --moe-router-topk-scaling-factor 2.827 \
-    --moe-aux-loss-coeff 0.01 \
-    --moe-z-loss-coeff 0.001 \
     --seq-aux \
     --norm-topk-prob \
     --moe-router-score-function sigmoid \
     --moe-router-enable-expert-bias \
     --moe-router-dtype fp32 \
+    --moe-expert-capacity-factor 2.0 \
+    --moe-pad-expert-input-to-capacity \
 "
+
+# 启用 MOE TP 扩展 EP 模式（EP 在 TP 维度上分布）
+export MOE_TP_EXTEND_EP=true
 
 BALANCE_ARGS="
     --balanced-moe-experts \
@@ -84,9 +87,6 @@ GPT_ARGS="
     --spec mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec \
     --gemm-gradient-accumulation-fusion \
     --swap-optimizer \
-    --recompute-granularity full \
-    --recompute-method block \
-    --recompute-num-layers 1 \
     --recompute-activation-function \
     --moe-zero-memory level0 \
     --expert-tensor-parallel-size 1 \
