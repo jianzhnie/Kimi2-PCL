@@ -6,7 +6,7 @@ MCore 格式权重读取与保存工具
 输出格式与 model_param_mapping.json 的 megatron_params 部分对齐。
 
 用法:
-  python get_mcore_weights_form_ckpt.py /path/to/mcore/checkpoint \
+  python get_mcore_weights_from_ckpt.py /path/to/mcore/checkpoint \
     --tp 2 --pp 8 --ep 64 \
     --num-layers 32 \
     --output model_param_mapping.json
@@ -259,6 +259,9 @@ class CheckpointCache:
     
     def put(self, path: str, state: dict) -> None:
         if path in self._cache:
+            # 更新访问顺序，将当前 path 移到最新
+            self._access_order.remove(path)
+            self._access_order.append(path)
             return
         while len(self._cache) >= self._max_size:
             oldest = self._access_order.pop(0)
@@ -383,8 +386,8 @@ class MoeParallelStrategy(ParallelStrategy):
         'expert_weights': re.compile(r'\.experts\.(?:weight[12]|local_experts)'),
         'shared_experts_fc1': re.compile(r'shared_experts\.linear_fc1'),
         'shared_experts_fc2': re.compile(r'shared_experts\.linear_fc2'),
-        'embedding': re.compile(r'embedding\.word_embeddings\.weight'),
-        'output': re.compile(r'output_layer\.weight'),
+        'embedding': re.compile(r'(?:embedding\.)?word_embeddings\.weight'),
+        'output': re.compile(r'(?:output_layer|output)\.weight'),
         'qkv': re.compile(r'self_attention\.linear_qkv'),
         'proj': re.compile(r'self_attention\.linear_proj'),
         'dense_mlp_fc1': re.compile(r'\.mlp\.linear_fc1\.weight$'),
@@ -569,23 +572,63 @@ class ShapeMerger:
             tp_ep_shapes: {(tp_rank, ep_rank): shape}
             is_ep_sharded: 是否在 EP 维度切分
         """
-        # 按 EP rank 分组
-        ep_groups: Dict[int, List[Tuple[int, Tuple[int, ...]]]] = defaultdict(list)
-        for (tp_rank, ep_rank), shape in tp_ep_shapes.items():
-            ep_groups[ep_rank].append((tp_rank, shape))
+        if not tp_ep_shapes:
+            return ()
         
-        # 在每个 EP 组内合并 TP shapes
-        ep_merged: Dict[int, Tuple[int, ...]] = {}
-        for ep_rank, tp_list in ep_groups.items():
-            tp_shapes = [s for _, s in sorted(tp_list)]
-            ep_merged[ep_rank] = self.merge_tp_shapes(name, tp_shapes)
-        
-        # 合并 EP 维度
-        if is_ep_sharded and len(ep_merged) > 1:
-            sorted_shapes = [ep_merged[ep] for ep in sorted(ep_merged.keys())]
-            return self.merge_ep_shapes(name, sorted_shapes)
+        if is_ep_sharded:
+            # EP sharded 权重 (如 experts): 按 EP 分组，组内合并 TP，然后跨 EP 合并
+            ep_groups: Dict[int, List[Tuple[int, Tuple[int, ...]]]] = defaultdict(list)
+            for (tp_rank, ep_rank), shape in tp_ep_shapes.items():
+                ep_groups[ep_rank].append((tp_rank, shape))
+            
+            # 在每个 EP 组内合并 TP shapes
+            ep_merged: Dict[int, Tuple[int, ...]] = {}
+            for ep_rank, tp_list in ep_groups.items():
+                tp_shapes = [s for _, s in sorted(tp_list)]
+                ep_merged[ep_rank] = self.merge_tp_shapes(name, tp_shapes)
+            
+            # 跨 EP 合并
+            if len(ep_merged) > 1:
+                sorted_shapes = [ep_merged[ep] for ep in sorted(ep_merged.keys())]
+                return self.merge_ep_shapes(name, sorted_shapes)
+            else:
+                return list(ep_merged.values())[0]
         else:
-            return ep_merged[sorted(ep_merged.keys())[0]]
+            # 非 EP sharded 权重 (如 embedding, shared_experts, layernorm 等):
+            # 直接按 TP rank 合并所有 shapes，忽略 EP 差异
+            # 在这种格式中，TP=0 存在偶数 EP，TP=1 存在奇数 EP
+            tp_shapes_dict: Dict[int, List[Tuple[int, ...]]] = defaultdict(list)
+            for (tp_rank, ep_rank), shape in tp_ep_shapes.items():
+                tp_shapes_dict[tp_rank].append(shape)
+            
+            # 调试输出
+            if logger.isEnabledFor(logging.DEBUG) and ('embedding' in name or 'layers.0.self_attention' in name):
+                logger.debug("    merge (非EP): tp_shapes_dict keys=%s, shapes=%s", 
+                            sorted(tp_shapes_dict.keys()), 
+                            [tp_shapes_dict[tp][0] for tp in sorted(tp_shapes_dict.keys())])
+            
+            # 每个 TP rank 应该只有一个 shape（从任意一个 EP 加载即可，它们都相同）
+            merged_by_tp: Dict[int, Tuple[int, ...]] = {}
+            for tp_rank, shapes in tp_shapes_dict.items():
+                # 验证同一 TP 的不同 EP 副本是否相同
+                if len(shapes) > 1:
+                    first_shape = shapes[0]
+                    for i, shape in enumerate(shapes[1:], 1):
+                        if shape != first_shape:
+                            raise ValueError(
+                                f"Shape 不一致: {name}, TP={tp_rank}, "
+                                f"EP 副本 0: {first_shape} vs EP 副本 {i}: {shape}"
+                            )
+                merged_by_tp[tp_rank] = shapes[0]
+            
+            # 按 TP rank 排序并合并
+            sorted_shapes = [merged_by_tp[tp] for tp in sorted(merged_by_tp.keys())]
+            merged = self.merge_tp_shapes(name, sorted_shapes)
+            
+            if logger.isEnabledFor(logging.DEBUG) and ('embedding' in name or 'layers.0.self_attention' in name):
+                logger.debug("    merge result: %s", merged)
+            
+            return merged
 
 
 # =============================================================================
@@ -678,7 +721,7 @@ class CheckpointLoader:
     def _build_candidates(self, tp_rank: int, pp_rank: int, 
                           ep_rank: Optional[int]) -> List[str]:
         """构建候选路径列表"""
-        p, tp, pp, ep = self.parallel, self.parallel.tp_size, self.parallel.pp_size, self.parallel.ep_size
+        tp, pp, ep = self.parallel.tp_size, self.parallel.pp_size, self.parallel.ep_size
         
         if ep_rank is not None:
             return [
@@ -1012,6 +1055,8 @@ class MCoreCheckpointReader:
             
             # 收集所有权重
             weight_tensors: Dict[str, Dict[Tuple[int, int], torch.Tensor]] = defaultdict(dict)
+            if self.verbose:
+                logger.info("  本 stage 加载的 TP/EP: %s", sorted(models.keys()))
             for (tp_rank, ep_rank), state in models.items():
                 for name, tensor in state.items():
                     # 过滤非 Tensor 类型和内部状态（如 optimizer 状态）
@@ -1027,6 +1072,10 @@ class MCoreCheckpointReader:
                 # 跳过空的 tensor 集合
                 if not tp_ep_tensors:
                     continue
+                
+                # 调试：打印 embedding 和第一个 layer 的 tp_ep_tensors keys
+                if self.verbose and ('embedding' in name or 'layers.0.self_attention' in name):
+                    logger.info("  %s: tp_ep_tensors keys=%s", name, sorted(tp_ep_tensors.keys()))
 
                 final_name = self._convert_layer_index(name, pp_rank, vpp_rank)
                 # 确保名称以 module. 开头（如果不以 module. 或 model. 开头）
@@ -1186,14 +1235,14 @@ def main():
         epilog="""
 示例:
   # 基本用法
-  python get_mcore_weights_form_ckpt.py /path/to/mcore/ckpt --output model.json
+  python get_mcore_weights_from_ckpt.py /path/to/mcore/ckpt --output model.json
 
   # Kimi2-1T 配置 (TP=2, PP=8, EP=64)
-  python get_mcore_weights_form_ckpt.py /path/to/mcore/ckpt \\
+  python get_mcore_weights_from_ckpt.py /path/to/mcore/ckpt \\
     --tp 2 --pp 8 --ep 64 --num-layers 32 --output model.json
 
   # DualPipe 模式
-  python get_mcore_weights_form_ckpt.py /path/to/mcore/ckpt \\
+  python get_mcore_weights_from_ckpt.py /path/to/mcore/ckpt \\
     --tp 2 --pp 8 --ep 64 --schedules-method dualpipev --output model.json
         """
     )
