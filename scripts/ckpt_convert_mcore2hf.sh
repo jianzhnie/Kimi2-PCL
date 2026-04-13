@@ -127,6 +127,7 @@ echo "  NUM_EXPERTS: ${NUM_EXPERTS}"
 echo "  N_SHARED_EXPERTS: ${N_SHARED_EXPERTS}"
 echo "  MOE_ROUTER_TOPK: ${MOE_ROUTER_TOPK}"
 echo "  MOE_FFN_HIDDEN_SIZE: ${MOE_FFN_HIDDEN_SIZE}"
+echo "  MOE_GROUPED_GEMM: enabled"
 echo "============================================================"
 echo ""
 
@@ -144,12 +145,14 @@ python "${CONVERT_SCRIPT}" \
   --ffn-hidden-size "${FFN_HIDDEN_SIZE}" \
   --vocab-size "${VOCAB_SIZE}" \
   --num-attention-heads "${NUM_ATTENTION_HEADS}" \
-  --num-guery-groups "${NUM_QUERY_GROUPS}" \
+  --num-query-groups "${NUM_QUERY_GROUPS}" \
   --qk-head-dim "${KV_CHANNELS}" \
   --rotary-base "${ROTARY_BASE}" \
   --first-k-dense-replace "${FIRST_K_DENSE_REPLACE}" \
   --num-experts "${NUM_EXPERTS}" \
   --moe-ffn-hidden-size "${MOE_FFN_HIDDEN_SIZE}" \
+  --n-shared-experts "${N_SHARED_EXPERTS}" \
+  --moe-router-topk "${MOE_ROUTER_TOPK}" \
   --max-position-embeddings "131072" \
   "${EXTRA_ARGS[@]}"
 
