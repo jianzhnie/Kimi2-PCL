@@ -18,22 +18,6 @@ import torch
 logger.basicConfig(format='')
 logger.getLogger().setLevel(logger.INFO)
 
-HIDDEN_SIZE = 7168
-NUM_EXPERTS = 128
-FIRST_K_DENSE_REPLACE = 2
-NUM_ATTENTION_HEADS = 64
-QK_HEAD_DIM = 128
-QK_POS_EMB_HEAD_DIM = 64
-V_HEAD_DIM = 128
-# NUM_QUERY_GROUPS 表示 KV head 总数（num_key_value_heads），
-# 对于 Kimi2-1T 为 32（64 Q heads / 2 GQA groups = 32 KV heads）。
-# 注意：不要将 GQA 分组比（2）赋值给此常量。
-NUM_KEY_VALUE_HEADS = 32
-FFN_HIDDEN_SIZE = 18432
-MOE_FFN_HIDDEN_SIZE = 12288
-VOCAB_SIZE = 163840
-
-
 def _parse_int_list(value: Optional[str]) -> Optional[list[int]]:
     if value is None or value == '':
         return None
@@ -197,8 +181,6 @@ class MgCkptConvert:
         num_experts: int,
         num_attention_heads: int,
         qk_head_dim: int,
-        v_head_dim: int,
-        qk_pos_emb_head_dim: int,
         moe_grouped_gemm: bool,
         moe_tp_extend_ep: bool,
         schedules_method: str | None,
@@ -206,7 +188,7 @@ class MgCkptConvert:
         num_layer_list: str | None,
         noop_layers: str | None,
         rotary_base: float,
-        num_key_value_heads: int | None = None,
+        num_query_groups: int | None = None,
         vocab_size: int | None = None,
         max_position_embeddings: int | None = None,
         tie_word_embeddings: bool = False,
@@ -237,8 +219,6 @@ class MgCkptConvert:
         self.num_experts = num_experts
         self.num_attention_heads = num_attention_heads
         self.qk_head_dim = qk_head_dim
-        self.v_head_dim = v_head_dim
-        self.qk_pos_emb_head_dim = qk_pos_emb_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
         self.moe_tp_extend_ep = moe_tp_extend_ep
         if self.moe_tp_extend_ep:
@@ -252,7 +232,7 @@ class MgCkptConvert:
         self.num_layer_list = num_layer_list
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
         self.rotary_base = rotary_base
-        self.num_key_value_heads = num_key_value_heads
+        self.num_query_groups = num_query_groups
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.tie_word_embeddings = tie_word_embeddings
@@ -427,18 +407,6 @@ class MgCkptConvert:
             cfg['n_routed_experts'] = self.num_experts
         if 'num_experts' in cfg:
             cfg['num_experts'] = self.num_experts
-
-        # kv_heads 优先从权重自动检测（detected_num_kv_heads）or 命令行参数 num_key_value_heads（应为 KV head 总数，如 32）。
-        # 注意：num_key_value_heads 必须传入 KV head 总数，而非 GQA 分组比(num_query_groups=2)；
-        #      传入 GQA 分组比会导致写出的 config 中 num_key_value_heads 错误。
-        #      应改为传入 KV head 总数（如 32）。
-
-        kv_heads = self.detected_num_kv_heads or self.num_key_value_heads
-        if kv_heads is not None:
-            cfg['num_key_value_heads'] = kv_heads
-            cfg['group_query_attention'] = kv_heads < self.num_attention_heads
-            if cfg['group_query_attention']:
-                cfg['num_query_groups'] = self.num_attention_heads // kv_heads
 
         if self.vocab_size is not None:
             cfg['vocab_size'] = self.vocab_size
@@ -1090,13 +1058,6 @@ class MgCkptConvert:
                     del d
                     gc.collect()
 
-                # Megatron grouped_gemm 存储格式（hf2mcore 写入时）：
-                #   w1: [hidden_size, num_local * (intermed*2)]  (permute 后 reshape)
-                #   w2: [num_local * intermed, hidden_size]      (直接 reshape)
-                # 还原步骤（可逆性已验证）：
-                #   w1_3d: view(hidden, num_local, intermed*2) → permute(1,0,2) → [num_local, hidden, intermed*2]
-                #   fc1 = w1_3d[li].t() → [intermed*2, hidden]，即 cat([gate, up], dim=0)
-                #   w2_3d: view(num_local, intermed, hidden)；down = w2_3d[li].t() → [hidden, intermed]
                 local_w1 = shards_w1[0] if len(shards_w1) == 1 else torch.cat(
                     shards_w1, dim=1)
                 local_w2 = shards_w2[0] if len(shards_w2) == 1 else torch.cat(
@@ -1276,8 +1237,6 @@ class MgCkptConvert:
                 num_experts=self.num_experts,
                 num_attention_heads=self.num_attention_heads,
                 qk_head_dim=self.qk_head_dim,
-                v_head_dim=self.v_head_dim,
-                qk_pos_emb_head_dim=self.qk_pos_emb_head_dim,
                 moe_grouped_gemm=self.moe_grouped_gemm,
                 moe_tp_extend_ep=self.moe_tp_extend_ep,
                 schedules_method=self.schedules_method,
@@ -1285,7 +1244,7 @@ class MgCkptConvert:
                 num_layer_list=self.num_layer_list,
                 noop_layers=','.join(map(str, self.noop_layers_list)),
                 rotary_base=float(self.rotary_base),
-                num_key_value_heads=self.num_key_value_heads,
+                num_query_groups=self.num_query_groups,
                 vocab_size=self.vocab_size,
                 max_position_embeddings=self.max_position_embeddings,
                 tie_word_embeddings=self.tie_word_embeddings,
@@ -1408,7 +1367,7 @@ def get_args():
                         help='Number of transformer layers.')
     parser.add_argument('--first-k-dense-replace',
                         type=int,
-                        default=FIRST_K_DENSE_REPLACE,
+                        default=2,
                         help='Customizing the number of dense layers.')
     parser.add_argument('--rotary-base',
                         type=float,
@@ -1430,14 +1389,6 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override qk head dim.')
-    parser.add_argument('--v-head-dim',
-                        type=int,
-                        default=None,
-                        help='Override v head dim.')
-    parser.add_argument('--qk-pos-emb-head-dim',
-                        type=int,
-                        default=None,
-                        help='Override qk pos emb head dim.')
     parser.add_argument('--max-position-embeddings',
                         type=int,
                         default=None,
@@ -1449,6 +1400,10 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override num key value heads (GQA).')
+    parser.add_argument('--num-query-groups',
+                        type=int,
+                        default=None,
+                        help='Number of query groups for GQA')
     parser.add_argument('--qk-layernorm',
                         action='store_true',
                         help='Enable QK LayerNorm (must match training config)')
@@ -1464,6 +1419,45 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override MoE expert intermediate size.')
+    parser.add_argument('--moe-router-topk',
+                        type=int,
+                        default=2,
+                        help='MoE router top-k (num_experts_per_tok).')
+    parser.add_argument('--n-shared-experts',
+                        type=int,
+                        default=1,
+                        help='Number of shared experts.')
+    parser.add_argument('--moe-router-num-groups',
+                        type=int,
+                        default=8,
+                        help='Number of groups for group-limited expert routing.')
+    parser.add_argument('--moe-router-group-topk',
+                        type=int,
+                        default=2,
+                        help='Top-k groups to select from.')
+    parser.add_argument('--moe-router-topk-scaling-factor',
+                        type=float,
+                        default=2.827,
+                        help='Scaling factor for routed expert outputs (routed_scaling_factor).')
+    parser.add_argument('--moe-router-score-function',
+                        type=str,
+                        default='sigmoid',
+                        choices=['sigmoid', 'softmax'],
+                        help='Scoring function for MoE routing.')
+    parser.add_argument('--moe-router-enable-expert-bias',
+                        action='store_true',
+                        help='Enable expert bias in router.')
+    parser.add_argument('--moe-router-dtype',
+                        type=str,
+                        default='fp32',
+                        choices=['fp32', 'fp16', 'bf16'],
+                        help='Data type for MoE router computation.')
+    parser.add_argument('--norm-topk-prob',
+                        action='store_true',
+                        help='Normalize top-k probabilities.')
+    parser.add_argument('--seq-aux',
+                        action='store_true',
+                        help='Use sequence-level auxiliary loss.')
     parser.add_argument('--hf-config-template',
                         type=str,
                         default=None,
@@ -1483,13 +1477,17 @@ def main() -> None:
     if args.num_layers is None:
         raise ValueError('必须提供 --num-layers')
 
-    hidden_size = args.hidden_size or HIDDEN_SIZE
-    num_experts = args.num_experts or NUM_EXPERTS
-    num_attention_heads = args.num_attention_heads or NUM_ATTENTION_HEADS
-    qk_head_dim = args.qk_head_dim or QK_HEAD_DIM
-    v_head_dim = args.v_head_dim or V_HEAD_DIM
-    qk_pos_emb_head_dim = args.qk_pos_emb_head_dim or QK_POS_EMB_HEAD_DIM
-
+    # 添加 MOE 相关配置到 extra_config_kwargs
+    extra_config_kwargs['num_experts_per_tok'] = args.moe_router_topk
+    extra_config_kwargs['n_shared_experts'] = args.n_shared_experts
+    extra_config_kwargs['n_group'] = args.moe_router_num_groups
+    extra_config_kwargs['topk_group'] = args.moe_router_group_topk
+    extra_config_kwargs['routed_scaling_factor'] = args.moe_router_topk_scaling_factor
+    extra_config_kwargs['scoring_func'] = args.moe_router_score_function
+    extra_config_kwargs['moe_router_enable_expert_bias'] = args.moe_router_enable_expert_bias
+    extra_config_kwargs['moe_router_dtype'] = args.moe_router_dtype
+    extra_config_kwargs['norm_topk_prob'] = args.norm_topk_prob
+    extra_config_kwargs['seq_aux'] = args.seq_aux
     tie_word_embeddings = bool(getattr(args, 'tie_word_embeddings', False))
 
     converter = MgCkptConvert(
@@ -1500,12 +1498,6 @@ def main() -> None:
         pp_size=args.source_pipeline_parallel_size,
         ep_size=args.source_expert_parallel_size,
         first_k_dense_replace=args.first_k_dense_replace,
-        hidden_size=hidden_size,
-        num_experts=num_experts,
-        num_attention_heads=num_attention_heads,
-        qk_head_dim=qk_head_dim,
-        v_head_dim=v_head_dim,
-        qk_pos_emb_head_dim=qk_pos_emb_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
         moe_tp_extend_ep=args.moe_tp_extend_ep,
         schedules_method=args.schedules_method,
@@ -1514,6 +1506,7 @@ def main() -> None:
         noop_layers=args.noop_layers,
         rotary_base=args.rotary_base,
         num_key_value_heads=args.num_key_value_heads,
+        num_query_groups=args.num_query_groups,
         vocab_size=args.vocab_size,
         max_position_embeddings=args.max_position_embeddings,
         tie_word_embeddings=tie_word_embeddings,
