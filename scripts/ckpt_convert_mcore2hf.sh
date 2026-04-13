@@ -21,8 +21,9 @@ set -euo pipefail
 
 # 默认路径配置
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
-LOAD_DIR="${LOAD_DIR:-}"
-SAVE_DIR="${SAVE_DIR:-}"
+ckpt_dir="/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2_L32_exp_4096_dies/b834d725-34df-47ca-ab07-4b93a36b9e87/"
+LOAD_DIR="${LOAD_DIR:-$ckpt_dir}"
+SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf}"
 
 # 检查必要参数
 if [[ -z "${LOAD_DIR}" ]]; then
