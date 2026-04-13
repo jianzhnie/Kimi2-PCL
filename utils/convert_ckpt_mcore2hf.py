@@ -18,6 +18,7 @@ import torch
 logger.basicConfig(format='')
 logger.getLogger().setLevel(logger.INFO)
 
+
 def _parse_int_list(value: Optional[str]) -> Optional[list[int]]:
     if value is None or value == '':
         return None
@@ -180,26 +181,26 @@ class MgCkptConvert:
         hidden_size: int,
         num_experts: int,
         num_attention_heads: int,
+        num_query_groups: int,
         qk_head_dim: int,
         moe_grouped_gemm: bool,
-        moe_tp_extend_ep: bool,
         schedules_method: str | None,
         vpp_stage: int | None,
         num_layer_list: str | None,
         noop_layers: str | None,
+        qk_layernorm: bool,
         rotary_base: float,
-        num_query_groups: int | None = None,
         vocab_size: int | None = None,
         max_position_embeddings: int | None = None,
         tie_word_embeddings: bool = False,
         ffn_hidden_size: int | None = None,
         moe_ffn_hidden_size: int | None = None,
+        n_shared_experts: int = 1,
+        moe_router_topk: int = 2,
         hf_config_template: str | None = None,
         cast_dtype: str | None = None,
         io_threads: int = 4,
         disable_mmap: bool = False,
-        extra_config_kwargs: dict | None = None,
-        qk_layernorm: bool = False,
     ):
         self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
         self.log_rank_load = os.environ.get('CKPT_CONVERT_LOG_RANK',
@@ -218,34 +219,32 @@ class MgCkptConvert:
         self.hidden_size = hidden_size
         self.num_experts = num_experts
         self.num_attention_heads = num_attention_heads
+        self.num_query_groups = num_query_groups
         self.qk_head_dim = qk_head_dim
+        # GQA 配置: qk_head_dim=128 (kv_channels), v_head_dim=128
+        # 标准 GQA 使用统一的 head 维度，不需要 MLA 的 decoupled RoPE 处理
+        self.v_head_dim = qk_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
-        self.moe_tp_extend_ep = moe_tp_extend_ep
-        if self.moe_tp_extend_ep:
-            logger.warning(
-                '--moe-tp-extend-ep is currently accepted but not used in '
-                'mcore->hf reconstruction; conversion assumes standard EP layout.'
-            )
+        self.qk_layernorm = qk_layernorm
         self.schedules_method = schedules_method
         self.dualpipe = schedules_method == 'dualpipev'
         self.vpp_stage = vpp_stage
         self.num_layer_list = num_layer_list
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
         self.rotary_base = rotary_base
-        self.num_query_groups = num_query_groups
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.tie_word_embeddings = tie_word_embeddings
         self.ffn_hidden_size = ffn_hidden_size
         self.moe_ffn_hidden_size = moe_ffn_hidden_size
-        self.hf_config_template = hf_config_template
+        self.n_shared_experts = n_shared_experts
+        self.moe_router_topk = moe_router_topk
         self.detected_num_kv_heads = None
         self._resolved_q_head_dim = None
         self._resolved_kv_heads_per_tp = None
         self.cast_dtype = cast_dtype
         self.io_threads = max(1, int(io_threads))
         self.disable_mmap = bool(disable_mmap)
-        self.extra_config_kwargs = extra_config_kwargs or {}
         self.qk_layernorm = qk_layernorm
         self._target_dtype = _dtype_from_str(
             cast_dtype) if cast_dtype else None
@@ -280,7 +279,8 @@ class MgCkptConvert:
             self.layer2loc_vpp: dict[int, tuple[int, int, int]] = {}
             self._build_vpprank_layer_map()
 
-        # 修正：使用 qk_pos_emb_head_dim 计算 inv_dim
+        # GQA 使用标准 RoPE，head_dim 为完整的 qk_head_dim
+        self._head_dim_for_rope = qk_head_dim
         self._reset_inv_freq()
 
         self.weight_map: dict[str, str] = {}
@@ -304,7 +304,8 @@ class MgCkptConvert:
                 logger.info('Missing (tp,pp) in rank dirs: %s', missing[:20])
 
     def _reset_inv_freq(self) -> None:
-        inv_dim = int(self.qk_pos_emb_head_dim)
+        # GQA: 使用完整的 head_dim 计算 RoPE 频率
+        inv_dim = int(self._head_dim_for_rope)
         if inv_dim <= 0:
             self.inv_freq = torch.empty((0, ), dtype=torch.float32)
             return
@@ -322,10 +323,9 @@ class MgCkptConvert:
         if max_q_head_dim <= 0:
             return None
 
+        # GQA: 只考虑标准 head_dim
         preferred: list[int] = []
-        preferred.append(self.qk_head_dim + self.qk_pos_emb_head_dim)
         preferred.append(self.qk_head_dim)
-        preferred.append(self.qk_pos_emb_head_dim)
         preferred = [d for d in preferred if isinstance(d, int) and d > 0]
 
         seen: set[int] = set()
@@ -360,8 +360,6 @@ class MgCkptConvert:
             os.path.join(os.path.dirname(__file__), '..', 'models'))
 
     def _select_config_template(self) -> str:
-        if self.hf_config_template:
-            return self.hf_config_template
         models_dir = self._repo_models_dir()
         cfg_file = os.path.join(models_dir, 'config.json')
         if os.path.isfile(cfg_file):
@@ -374,13 +372,7 @@ class MgCkptConvert:
                     return cfg_file
             except Exception:
                 pass
-        candidates = [
-            os.path.join(models_dir, 'config.json'),
-        ]
-        for p in candidates:
-            if os.path.isfile(p):
-                return p
-        raise FileNotFoundError(f'找不到可用的 HF config 模板: {candidates}')
+        raise FileNotFoundError(f'找不到可用的 HF config 模板: {cfg_file}')
 
     def _write_hf_artifacts(self) -> None:
         models_dir = self._repo_models_dir()
@@ -393,8 +385,9 @@ class MgCkptConvert:
         cfg['hidden_size'] = self.hidden_size
         cfg['num_hidden_layers'] = self.num_real_layers
         cfg['num_attention_heads'] = self.num_attention_heads
-        cfg['qk_nope_head_dim'] = self.qk_head_dim
-        cfg['qk_rope_head_dim'] = self.qk_pos_emb_head_dim
+        cfg['num_key_value_heads'] = self.num_query_groups
+        # GQA 配置
+        cfg['qk_head_dim'] = self.qk_head_dim
         cfg['v_head_dim'] = self.v_head_dim
         cfg['qk_layernorm'] = self.qk_layernorm
         cfg['rope_theta'] = float(self.rotary_base)
@@ -414,35 +407,8 @@ class MgCkptConvert:
             cfg['intermediate_size'] = self.ffn_hidden_size
         if self.moe_ffn_hidden_size is not None:
             cfg['moe_intermediate_size'] = self.moe_ffn_hidden_size
-
-        # 显式更新 rope_scaling 以匹配训练脚本 (默认 factor=32.0, type=yarn)
-        if 'rope_scaling_type' in self.extra_config_kwargs or (
-                'rope_scaling' in cfg
-                and isinstance(cfg['rope_scaling'], dict)):
-            if 'rope_scaling' not in cfg or not isinstance(
-                    cfg['rope_scaling'], dict):
-                cfg['rope_scaling'] = {}
-            cfg['rope_scaling']['factor'] = self.extra_config_kwargs.get(
-                'rope_scaling_factor', 32.0)
-            cfg['rope_scaling']['type'] = self.extra_config_kwargs.get(
-                'rope_scaling_type', 'yarn')
-            cfg['rope_scaling'][
-                'original_max_position_embeddings'] = self.extra_config_kwargs.get(
-                    'rope_scaling_original_max_position_embeddings', 4096)
-            cfg['rope_scaling']['mscale'] = self.extra_config_kwargs.get(
-                'rope_scaling_mscale', 1.0)
-            cfg['rope_scaling'][
-                'mscale_all_dim'] = self.extra_config_kwargs.get(
-                    'rope_scaling_mscale_all_dim', 1.0)
-
-        # 更新 MoE 相关的额外参数
-        for k, v in self.extra_config_kwargs.items():
-            if k.startswith('moe_') or k in [
-                    'n_shared_experts', 'routed_scaling_factor', 'n_group',
-                    'topk_group', 'scoring_func', 'norm_topk_prob', 'seq_aux',
-                    'rms_norm_eps'
-            ]:
-                cfg[k] = v
+        cfg['n_shared_experts'] = self.n_shared_experts
+        cfg['num_experts_per_tok'] = self.moe_router_topk
 
         with open(os.path.join(self.hf_save_dir, 'config.json'), 'w') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -874,8 +840,8 @@ class MgCkptConvert:
             raise ValueError(
                 f'num_attention_heads={self.num_attention_heads} 不能整除 tp_size={self.tp_size}'
             )
-        q_head_dim = self._resolved_q_head_dim or (self.qk_head_dim +
-                                                   self.qk_pos_emb_head_dim)
+        # GQA: 使用标准 head_dim，不需要 MLA 的 decoupled 维度
+        q_head_dim = self._resolved_q_head_dim or self.qk_head_dim
         kv_heads_per_tp_fixed = self._resolved_kv_heads_per_tp
 
         for tp_rank in range(self.tp_size):
@@ -895,10 +861,9 @@ class MgCkptConvert:
                             f'{qkv_key} 分片形状异常: {qkv_shard.shape}, q_per_tp={q_per_tp_try}'
                         )
                     inferred_q_head_dim, inferred_kv_heads_per_tp = inferred
-                    if (inferred_q_head_dim !=
-                            self.qk_head_dim + self.qk_pos_emb_head_dim):
-                        self.qk_head_dim = 0
-                        self.qk_pos_emb_head_dim = int(inferred_q_head_dim)
+                    # GQA: 如果推断的 head_dim 与配置不同，更新 rope 计算
+                    if inferred_q_head_dim != self.qk_head_dim:
+                        self._head_dim_for_rope = int(inferred_q_head_dim)
                         self._reset_inv_freq()
                     self._resolved_q_head_dim = int(inferred_q_head_dim)
                     self._resolved_kv_heads_per_tp = int(
@@ -913,12 +878,14 @@ class MgCkptConvert:
                             int(qkv_shard.shape[0]),
                         )
 
+            # GQA: 标准 Q/K/V 分割
             q_per_tp = heads_per_tp * q_head_dim
             rem = qkv_shard.shape[0] - q_per_tp
             if rem < 0:
                 raise ValueError(
                     f'{qkv_key} 分片形状异常: {qkv_shard.shape}, q_per_tp={q_per_tp}'
                 )
+            # GQA: K 和 V 使用相同的 head_dim
             denom = q_head_dim + self.v_head_dim
             if denom <= 0 or rem % denom != 0:
                 raise ValueError(
@@ -927,6 +894,7 @@ class MgCkptConvert:
             kv_heads_per_tp = kv_heads_per_tp_fixed or (rem // denom)
             if self.detected_num_kv_heads is None:
                 self.detected_num_kv_heads = kv_heads_per_tp * self.tp_size
+            # GQA: K 使用与 Q 相同的 head_dim
             k_per_tp = kv_heads_per_tp * q_head_dim
             v_per_tp = kv_heads_per_tp * self.v_head_dim
             q_r, k_r, v_r = torch.split(qkv_shard,
@@ -1236,15 +1204,15 @@ class MgCkptConvert:
                 hidden_size=self.hidden_size,
                 num_experts=self.num_experts,
                 num_attention_heads=self.num_attention_heads,
+                num_query_groups=self.num_query_groups,
                 qk_head_dim=self.qk_head_dim,
+                v_head_dim=self.v_head_dim,
                 moe_grouped_gemm=self.moe_grouped_gemm,
-                moe_tp_extend_ep=self.moe_tp_extend_ep,
                 schedules_method=self.schedules_method,
                 vpp_stage=self.vpp_stage,
                 num_layer_list=self.num_layer_list,
                 noop_layers=','.join(map(str, self.noop_layers_list)),
                 rotary_base=float(self.rotary_base),
-                num_query_groups=self.num_query_groups,
                 vocab_size=self.vocab_size,
                 max_position_embeddings=self.max_position_embeddings,
                 tie_word_embeddings=self.tie_word_embeddings,
@@ -1254,7 +1222,6 @@ class MgCkptConvert:
                 cast_dtype=self.cast_dtype,
                 io_threads=1,
                 disable_mmap=self.disable_mmap,
-                extra_config_kwargs=self.extra_config_kwargs,
             )
             t0 = time.time()
             logger.info('Parallel convert: pp_workers=%d stages=%d',
@@ -1329,12 +1296,9 @@ def get_args():
         '--num-layer-list',
         type=str,
         help='a list of number of layers, separated by comma; e.g., 4,4,4,4')
-    parser.add_argument(
-        '--moe-tp-extend-ep',
-        action='store_true',
-        help=
-        'use tp group to extend experts parallism instead of sharding weight tensor of experts in tp group'
-    )
+    parser.add_argument('--qk-layernorm',
+                        action='store_true',
+                        help='Enable QK LayerNorm (must match training config)')
     parser.add_argument(
         '--schedules-method',
         type=str,
@@ -1385,10 +1349,14 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override attention heads.')
-    parser.add_argument('--qk-head-dim',
+    parser.add_argument('--num-query-groups',
                         type=int,
                         default=None,
-                        help='Override qk head dim.')
+                        help='Number of query groups for GQA')
+    parser.add_argument('--qk-head-dim',
+                        type=int,
+                        default=128,
+                        help='Q/K head dimension (kv-channels).')
     parser.add_argument('--max-position-embeddings',
                         type=int,
                         default=None,
@@ -1396,17 +1364,6 @@ def get_args():
     parser.add_argument('--tie-word-embeddings',
                         action='store_true',
                         help='Tie word embeddings and output layer.')
-    parser.add_argument('--num-key-value-heads',
-                        type=int,
-                        default=None,
-                        help='Override num key value heads (GQA).')
-    parser.add_argument('--num-query-groups',
-                        type=int,
-                        default=None,
-                        help='Number of query groups for GQA')
-    parser.add_argument('--qk-layernorm',
-                        action='store_true',
-                        help='Enable QK LayerNorm (must match training config)')
     parser.add_argument('--vocab-size',
                         type=int,
                         default=None,
@@ -1419,49 +1376,14 @@ def get_args():
                         type=int,
                         default=None,
                         help='Override MoE expert intermediate size.')
-    parser.add_argument('--moe-router-topk',
-                        type=int,
-                        default=2,
-                        help='MoE router top-k (num_experts_per_tok).')
     parser.add_argument('--n-shared-experts',
                         type=int,
                         default=1,
-                        help='Number of shared experts.')
-    parser.add_argument('--moe-router-num-groups',
-                        type=int,
-                        default=8,
-                        help='Number of groups for group-limited expert routing.')
-    parser.add_argument('--moe-router-group-topk',
+                        help='Number of shared experts (default: 1)')
+    parser.add_argument('--moe-router-topk',
                         type=int,
                         default=2,
-                        help='Top-k groups to select from.')
-    parser.add_argument('--moe-router-topk-scaling-factor',
-                        type=float,
-                        default=2.827,
-                        help='Scaling factor for routed expert outputs (routed_scaling_factor).')
-    parser.add_argument('--moe-router-score-function',
-                        type=str,
-                        default='sigmoid',
-                        choices=['sigmoid', 'softmax'],
-                        help='Scoring function for MoE routing.')
-    parser.add_argument('--moe-router-enable-expert-bias',
-                        action='store_true',
-                        help='Enable expert bias in router.')
-    parser.add_argument('--moe-router-dtype',
-                        type=str,
-                        default='fp32',
-                        choices=['fp32', 'fp16', 'bf16'],
-                        help='Data type for MoE router computation.')
-    parser.add_argument('--norm-topk-prob',
-                        action='store_true',
-                        help='Normalize top-k probabilities.')
-    parser.add_argument('--seq-aux',
-                        action='store_true',
-                        help='Use sequence-level auxiliary loss.')
-    parser.add_argument('--hf-config-template',
-                        type=str,
-                        default=None,
-                        help='HF config json path used as template.')
+                        help='MoE router top-k (default: 2)')
 
     args = parser.parse_args()
     return args
@@ -1473,22 +1395,16 @@ def main() -> None:
     if args.pp_workers is not None:
         os.environ['CKPT_CONVERT_PP_WORKERS'] = str(int(args.pp_workers))
 
-    extra_config_kwargs = {}
     if args.num_layers is None:
         raise ValueError('必须提供 --num-layers')
-
-    # 添加 MOE 相关配置到 extra_config_kwargs
-    extra_config_kwargs['num_experts_per_tok'] = args.moe_router_topk
-    extra_config_kwargs['n_shared_experts'] = args.n_shared_experts
-    extra_config_kwargs['n_group'] = args.moe_router_num_groups
-    extra_config_kwargs['topk_group'] = args.moe_router_group_topk
-    extra_config_kwargs['routed_scaling_factor'] = args.moe_router_topk_scaling_factor
-    extra_config_kwargs['scoring_func'] = args.moe_router_score_function
-    extra_config_kwargs['moe_router_enable_expert_bias'] = args.moe_router_enable_expert_bias
-    extra_config_kwargs['moe_router_dtype'] = args.moe_router_dtype
-    extra_config_kwargs['norm_topk_prob'] = args.norm_topk_prob
-    extra_config_kwargs['seq_aux'] = args.seq_aux
-    tie_word_embeddings = bool(getattr(args, 'tie_word_embeddings', False))
+    if args.hidden_size is None:
+        raise ValueError('必须提供 --hidden-size')
+    if args.num_attention_heads is None:
+        raise ValueError('必须提供 --num-attention-heads')
+    if args.num_query_groups is None:
+        raise ValueError('必须提供 --num-query-groups')
+    if args.num_experts is None:
+        raise ValueError('必须提供 --num-experts')
 
     converter = MgCkptConvert(
         mg_load_dir=args.load_dir,
@@ -1498,25 +1414,27 @@ def main() -> None:
         pp_size=args.source_pipeline_parallel_size,
         ep_size=args.source_expert_parallel_size,
         first_k_dense_replace=args.first_k_dense_replace,
+        hidden_size=args.hidden_size,
+        num_experts=args.num_experts,
+        num_attention_heads=args.num_attention_heads,
+        num_query_groups=args.num_query_groups,
+        qk_head_dim=args.qk_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
-        moe_tp_extend_ep=args.moe_tp_extend_ep,
         schedules_method=args.schedules_method,
         vpp_stage=args.num_layers_per_virtual_pipeline_stage,
         num_layer_list=args.num_layer_list,
         noop_layers=args.noop_layers,
         rotary_base=args.rotary_base,
-        num_key_value_heads=args.num_key_value_heads,
-        num_query_groups=args.num_query_groups,
         vocab_size=args.vocab_size,
         max_position_embeddings=args.max_position_embeddings,
-        tie_word_embeddings=tie_word_embeddings,
+        tie_word_embeddings=args.tie_word_embeddings,
         ffn_hidden_size=args.ffn_hidden_size,
         moe_ffn_hidden_size=args.moe_ffn_hidden_size,
-        hf_config_template=args.hf_config_template,
+        n_shared_experts=args.n_shared_experts,
+        moe_router_topk=args.moe_router_topk,
         cast_dtype=args.cast_dtype,
         io_threads=args.io_threads,
         disable_mmap=args.disable_mmap,
-        extra_config_kwargs=extra_config_kwargs,
         qk_layernorm=args.qk_layernorm,
     )
     converter.run()
