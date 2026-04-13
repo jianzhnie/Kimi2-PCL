@@ -245,7 +245,6 @@ class MgCkptConvert:
         self.cast_dtype = cast_dtype
         self.io_threads = max(1, int(io_threads))
         self.disable_mmap = bool(disable_mmap)
-        self.qk_layernorm = qk_layernorm
         self._target_dtype = _dtype_from_str(
             cast_dtype) if cast_dtype else None
         self._sparse_cache: dict[tuple[int, int, int, int | None],
@@ -795,7 +794,7 @@ class MgCkptConvert:
             self, hf: dict[str, torch.Tensor],
             models: dict[tuple[int, int], dict[str, torch.Tensor]]) -> None:
         parts = [
-            models[(tp_rank, 0)]['embedding.word_embeddings.weight']
+            models[(tp_rank, 0)].pop('embedding.word_embeddings.weight')
             for tp_rank in range(self.tp_size)
         ]
         hf['model.embed_tokens.weight'] = torch.cat(parts, dim=0)
@@ -921,49 +920,6 @@ class MgCkptConvert:
         hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone(
         )
         return
-
-    def _reconstruct_router(self, models: dict[tuple[int, int],
-                                               dict[str, torch.Tensor]],
-                            key: str) -> torch.Tensor:
-        t = models.get((0, 0), {}).get(key)
-        if t is not None and t.shape[0] == self.num_experts:
-            return models[(0, 0)].pop(key).clone()
-
-        for _, v in models.items():
-            if key in v:
-                if v[key].shape[0] == self.num_experts:
-                    return v.pop(key).clone()
-
-        sample = None
-        for _, v in models.items():
-            if key in v:
-                sample = v[key]
-                break
-
-        if sample is None:
-            raise ValueError(
-                f'Router weight {key} not found in any loaded model')
-
-        out = torch.empty((self.num_experts, ) + sample.shape[1:],
-                          dtype=sample.dtype)
-
-        num_local = self.num_experts // self.ep_size
-        for ep_rank in range(self.ep_size):
-            target_tp = -1
-            for tp in range(self.tp_size):
-                if (tp, ep_rank) in models and key in models[(tp, ep_rank)]:
-                    target_tp = tp
-                    break
-
-            if target_tp != -1:
-                part = models[(target_tp, ep_rank)].pop(key)
-                if part.shape[0] == num_local:
-                    out[ep_rank * num_local:(ep_rank + 1) * num_local] = part
-                else:
-                    raise ValueError(
-                        f'{key} rank {ep_rank} shape mismatch: {part.shape}')
-
-        return out
 
     def _set_layer_mlp(self, hf: dict[str, torch.Tensor],
                        models: dict[tuple[int, int], dict[str, torch.Tensor]],
@@ -1111,7 +1067,6 @@ class MgCkptConvert:
 
     def _convert_one_stage(self, pp_rank: int, vpp_rank: int | None,
                            total_shards: int) -> None:
-        import gc
         self._sparse_cache = {}
 
         models = self._load_models_for_stage(pp_rank=pp_rank,
@@ -1206,18 +1161,20 @@ class MgCkptConvert:
                 num_attention_heads=self.num_attention_heads,
                 num_query_groups=self.num_query_groups,
                 qk_head_dim=self.qk_head_dim,
-                v_head_dim=self.v_head_dim,
                 moe_grouped_gemm=self.moe_grouped_gemm,
                 schedules_method=self.schedules_method,
                 vpp_stage=self.vpp_stage,
                 num_layer_list=self.num_layer_list,
                 noop_layers=','.join(map(str, self.noop_layers_list)),
+                qk_layernorm=self.qk_layernorm,
                 rotary_base=float(self.rotary_base),
                 vocab_size=self.vocab_size,
                 max_position_embeddings=self.max_position_embeddings,
                 tie_word_embeddings=self.tie_word_embeddings,
                 ffn_hidden_size=self.ffn_hidden_size,
                 moe_ffn_hidden_size=self.moe_ffn_hidden_size,
+                n_shared_experts=self.n_shared_experts,
+                moe_router_topk=self.moe_router_topk,
                 hf_config_template=self.hf_config_template,
                 cast_dtype=self.cast_dtype,
                 io_threads=1,
