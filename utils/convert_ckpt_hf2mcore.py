@@ -177,6 +177,7 @@ class CkptConvert:
         self.noop_layers = noop_layers
         self.qlora_nf4 = qlora_nf4
         self.rotary_base = rotary_base
+        self.num_query_groups = num_query_groups
         self.qk_layernorm = qk_layernorm
 
         self.noop_layers_list = sorted(_parse_int_list(noop_layers) or [])
@@ -377,6 +378,20 @@ class CkptConvert:
                 raise ValueError('moe-tp-extend-ep 需要 tp_size > 1 才有意义')
             if self.ep_size % self.tp_size != 0:
                 raise ValueError('moe-tp-extend-ep 需要 ep_size 能整除 tp_size')
+
+    def _validate_attention_config(self) -> None:
+        if self.num_attention_heads % self.tp_size != 0:
+            raise ValueError(
+                f'num_attention_heads ({self.num_attention_heads}) '
+                f'must be divisible by tp_size ({self.tp_size})')
+        if self.num_query_groups % self.tp_size != 0:
+            raise ValueError(
+                f'num_query_groups ({self.num_query_groups}) '
+                f'must be divisible by tp_size ({self.tp_size})')
+        if self.num_attention_heads % self.num_query_groups != 0:
+            raise ValueError(
+                f'num_attention_heads ({self.num_attention_heads}) '
+                f'must be divisible by num_query_groups ({self.num_query_groups})')
 
     def _read_weight_map(self) -> dict[str, str]:
         """Read weight map from HF model directory.
@@ -785,11 +800,6 @@ class CkptConvert:
         qkv_key = f'{prefix}.linear_qkv.weight'
         proj_key = f'{prefix}.linear_proj.weight'
 
-        # 检查是否使用了 MLA (Multi-head Latent Attention)，当前只支持 GQA
-        if 'model.layers.0.self_attn.q_proj.weight' not in self.weight_map and 'model.layers.0.self_attn.q_a_proj.weight' in self.weight_map:
-            raise ValueError(
-                '检测到 MLA 权重(如 q_a_proj)，但当前代码已移除 MLA 支持，只支持 GQA。请检查输入的 HF 权重。')
-
         q_weight = weights.pop(
             f'model.layers.{hf_layer}.self_attn.q_proj.weight')
         k_weight = weights.pop(
@@ -812,6 +822,8 @@ class CkptConvert:
 
         expected_q_head_dim = self.qk_head_dim
         expected_q_rows = self.num_attention_heads * expected_q_head_dim
+        expected_k_rows = self.num_query_groups * self.qk_head_dim
+        expected_v_rows = self.num_query_groups * self.v_head_dim
         if q_weight.shape[0] != expected_q_rows:
             raise ValueError(
                 f'Q projection row mismatch: expected {expected_q_rows}, got {q_weight.shape[0]}'
@@ -1307,6 +1319,7 @@ class CkptConvert:
             vocab_size=self.vocab_size,
             num_experts=self.num_experts,
             num_attention_heads=self.num_attention_heads,
+            num_query_groups=self.num_query_groups,
             qk_head_dim=self.qk_head_dim,
             v_head_dim=self.v_head_dim,
             moe_grouped_gemm=self.moe_grouped_gemm,
@@ -1429,6 +1442,12 @@ def get_args():
         default=None,
         help='Override attention heads (default: from HF config).',
     )
+    parser.add_argument(
+        '--num-query-groups',
+        type=int,
+        default=None,
+        help='Number of query groups for GQA (default: from HF config).',
+    )
     parser.add_argument('--qk-head-dim',
                         type=int,
                         default=None,
@@ -1509,6 +1528,7 @@ def main() -> None:
         vocab_size=args.vocab_size,
         num_experts=args.num_experts,
         num_attention_heads=args.num_attention_heads,
+        num_query_groups=args.num_query_groups,
         qk_head_dim=args.qk_head_dim,
         v_head_dim=args.v_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,

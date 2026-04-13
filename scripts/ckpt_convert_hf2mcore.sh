@@ -8,7 +8,7 @@
 # 模型配置:
 #   - 32 层 Transformer
 #   - Hidden size: 7168
-#   - Attention heads: 64 (Q) / 32 (KV) - GQA
+#   - Attention heads: 64 (Q) / 2 (KV) - GQA
 #   - MoE: 128 experts, 前 2 层为 Dense
 #   - Vocab size: 163840
 #
@@ -32,9 +32,9 @@ if [[ -f "/usr/local/Ascend/ascend-toolkit/set_env.sh" ]]; then
 fi
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-# MOE_TP_EXTEND_EP: 使用 TP 组扩展 EP 并行 (用于昇腾等硬件优化)
-# 默认禁用 (0)，可通过 MOE_TP_EXTEND_EP=1 启用
-export MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-0}"
+# MOE_TP_EXTEND_EP: 使用 TP 组扩展 EP 并行 (与训练脚本 pretrain_kimi2_1t_4k.sh 保持一致)
+# 默认启用 (1)，与训练配置匹配
+export MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-1}"
 
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 
@@ -66,6 +66,7 @@ fi
 TP="${TP:-2}"                          # Tensor Parallel size
 PP="${PP:-8}"                          # Pipeline Parallel size
 EP="${EP:-64}"                         # Expert Parallel size
+VPP_STAGE="${VPP_STAGE:1}"             # VPP = 1
 PP_WORKERS="${PP_WORKERS:-2}"          # PP 并行工作进程数
 IO_THREADS="${IO_THREADS:-2}"          # HF 权重加载线程数
 SAVE_WORKERS="${SAVE_WORKERS:-0}"      # 保存权重线程数 (0=自动)
@@ -83,6 +84,7 @@ MOE_FFN_HIDDEN_SIZE="${MOE_FFN_HIDDEN_SIZE:-12288}"  # MoE FFN 中间维度
 VOCAB_SIZE="${VOCAB_SIZE:-163840}"                # 词汇表大小
 NUM_EXPERTS="${NUM_EXPERTS:-128}"                 # 专家数量
 NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-64}"  # Q attention heads
+NUM_QUERY_GROUPS="${NUM_QUERY_GROUPS:-2}"          # KV query groups (GQA)
 QK_HEAD_DIM="${QK_HEAD_DIM:-128}"                 # QK head 维度
 V_HEAD_DIM="${V_HEAD_DIM:-128}"                   # V head 维度
 ROTARY_BASE="${ROTARY_BASE:-50000}"               # RoPE 基数
@@ -178,6 +180,7 @@ python "${CONVERT_SCRIPT}" \
   --vocab-size "${VOCAB_SIZE}" \
   --num-experts "${NUM_EXPERTS}" \
   --num-attention-heads "${NUM_ATTENTION_HEADS}" \
+  --num-query-groups "${NUM_QUERY_GROUPS}" \
   --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}" \
   --qk-head-dim "${QK_HEAD_DIM}" \
   --v-head-dim "${V_HEAD_DIM}" \
