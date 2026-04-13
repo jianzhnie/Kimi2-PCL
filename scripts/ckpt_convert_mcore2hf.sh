@@ -65,6 +65,10 @@ N_SHARED_EXPERTS="${N_SHARED_EXPERTS:-1}"
 MOE_ROUTER_TOPK="${MOE_ROUTER_TOPK:-2}"
 MOE_FFN_HIDDEN_SIZE="${MOE_FFN_HIDDEN_SIZE:-12288}"
 
+# VPP / DualPipe 配置 (与训练脚本保持一致)
+SCHEDULES_METHOD="${SCHEDULES_METHOD:-dualpipev}"
+VPP_STAGE="${VPP_STAGE:-2}"
+
 # =============================================================================
 # 检查输入输出路径
 # =============================================================================
@@ -96,6 +100,9 @@ EXTRA_ARGS+=(--moe-grouped-gemm)
 
 # QK LayerNorm (GQA_ARGS 中启用)
 EXTRA_ARGS+=(--qk-layernorm)
+
+# DualPipe 调度与 VPP (与训练脚本保持一致)
+EXTRA_ARGS+=(--schedules-method "${SCHEDULES_METHOD}")
 
 # =============================================================================
 # 打印配置信息
@@ -129,6 +136,10 @@ echo "  N_SHARED_EXPERTS: ${N_SHARED_EXPERTS}"
 echo "  MOE_ROUTER_TOPK: ${MOE_ROUTER_TOPK}"
 echo "  MOE_FFN_HIDDEN_SIZE: ${MOE_FFN_HIDDEN_SIZE}"
 echo "  MOE_GROUPED_GEMM: enabled"
+echo ""
+echo "VPP / DualPipe 配置:"
+echo "  SCHEDULES_METHOD: ${SCHEDULES_METHOD}"
+echo "  VPP_STAGE: ${VPP_STAGE}"
 echo "============================================================"
 echo ""
 
@@ -141,6 +152,7 @@ python "${CONVERT_SCRIPT}" \
   --source-tensor-parallel-size "${TP}" \
   --source-pipeline-parallel-size "${PP}" \
   --source-expert-parallel-size "${EP}" \
+  --vpp-stage "${VPP_STAGE}" \
   --num-layers "${NUM_LAYERS}" \
   --hidden-size "${HIDDEN_SIZE}" \
   --ffn-hidden-size "${FFN_HIDDEN_SIZE}" \
