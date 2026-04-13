@@ -19,7 +19,6 @@ class DeepseekV3Config(PretrainedConfig):
         num_hidden_layers=32,
         num_nextn_predict_layers=0,
         num_attention_heads=64,
-        num_key_value_heads=None,
         num_query_groups=2,
         kv_channels=128,
         group_query_attention=True,
@@ -65,9 +64,6 @@ class DeepseekV3Config(PretrainedConfig):
         attention_bias=False,
         attention_dropout=0.0,
         qk_layernorm=True,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -99,11 +95,6 @@ class DeepseekV3Config(PretrainedConfig):
         self.seq_aux = seq_aux
         self.moe_router_enable_expert_bias = moe_router_enable_expert_bias
         self.moe_router_dtype = moe_router_dtype
-        if group_query_attention and num_query_groups:
-            num_key_value_heads = num_attention_heads // num_query_groups
-        elif num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-        self.num_key_value_heads = num_key_value_heads
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
@@ -114,10 +105,6 @@ class DeepseekV3Config(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.fa_without_pad = fa_without_pad
-        self.qk_layernorm = qk_layernorm
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = v_head_dim
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
