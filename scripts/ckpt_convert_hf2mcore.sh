@@ -83,9 +83,7 @@ MOE_FFN_HIDDEN_SIZE="${MOE_FFN_HIDDEN_SIZE:-12288}"  # MoE FFN 中间维度
 VOCAB_SIZE="${VOCAB_SIZE:-163840}"                # 词汇表大小
 NUM_EXPERTS="${NUM_EXPERTS:-128}"                 # 专家数量
 NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-64}"  # Q attention heads
-NUM_KEY_VALUE_HEADS="${NUM_KEY_VALUE_HEADS:-32}"  # KV attention heads (GQA)
-QK_HEAD_DIM="${QK_HEAD_DIM:-128}"                 # QK 无位置编码维度
-QK_POS_EMB_HEAD_DIM="${QK_POS_EMB_HEAD_DIM:-64}"  # QK 位置编码维度
+QK_HEAD_DIM="${QK_HEAD_DIM:-128}"                 # QK head 维度
 V_HEAD_DIM="${V_HEAD_DIM:-128}"                   # V head 维度
 ROTARY_BASE="${ROTARY_BASE:-50000}"               # RoPE 基数
 MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"  # 最大位置编码
@@ -180,10 +178,8 @@ python "${CONVERT_SCRIPT}" \
   --vocab-size "${VOCAB_SIZE}" \
   --num-experts "${NUM_EXPERTS}" \
   --num-attention-heads "${NUM_ATTENTION_HEADS}" \
-  --num-key-value-heads "${NUM_KEY_VALUE_HEADS}" \
   --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}" \
   --qk-head-dim "${QK_HEAD_DIM}" \
   --v-head-dim "${V_HEAD_DIM}" \
-  --qk-pos-emb-head-dim "${QK_POS_EMB_HEAD_DIM}" \
   --sha256-manifest "${SAVE_DIR}/sha256_manifest.json" \
   "${EXTRA_ARGS[@]}"
