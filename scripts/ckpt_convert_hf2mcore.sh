@@ -12,9 +12,9 @@
 #   - MoE: 128 experts, 前 2 层为 Dense
 #   - Vocab size: 163840
 #
-# 默认并行配置 (与训练脚本一致):
+# 默认并行配置 (与训练脚本 pretrain_kimi2_1t_4k.sh 保持一致):
 #   - TP (Tensor Parallel): 2
-#   - PP (Pipeline Parallel): 8  
+#   - PP (Pipeline Parallel): 8
 #   - EP (Expert Parallel): 64
 #   - 调度: DualPipeV
 # =============================================================================
@@ -33,8 +33,8 @@ fi
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 # MOE_TP_EXTEND_EP: 使用 TP 组扩展 EP 并行 (与训练脚本 pretrain_kimi2_1t_4k.sh 保持一致)
-# 默认启用 (1)，与训练配置匹配
-export MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-1}"
+# 默认启用 (0)，与训练配置匹配
+export MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-0}"
 
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 
@@ -45,7 +45,7 @@ if [[ ! -d "${REPO_ROOT}" ]]; then
 fi
 
 LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf}"
-SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf2mcore_iter900}"
+SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf2mcore}"
 
 if [[ -z "${LOAD_DIR}" ]]; then
   echo "ERROR: LOAD_DIR must be set (source HuggingFace checkpoint directory)" >&2
@@ -66,12 +66,12 @@ fi
 TP="${TP:-2}"                          # Tensor Parallel size
 PP="${PP:-8}"                          # Pipeline Parallel size
 EP="${EP:-64}"                         # Expert Parallel size
-VPP_STAGE="${VPP_STAGE:1}"             # VPP = 1
+VPP_STAGE="${VPP_STAGE:-}"             # VPP stage (dualpipev 下留空)
 PP_WORKERS="${PP_WORKERS:-2}"          # PP 并行工作进程数
 IO_THREADS="${IO_THREADS:-2}"          # HF 权重加载线程数
 SAVE_WORKERS="${SAVE_WORKERS:-0}"      # 保存权重线程数 (0=自动)
 CAST_DTYPE="${CAST_DTYPE:-bf16}"       # 输出数据类型
-SCHEDULES_METHOD="${SCHEDULES_METHOD:-dualpipev}"  # 调度算法
+SCHEDULES_METHOD="${SCHEDULES_METHOD:-}"  # 调度算法 (与训练脚本一致)
 
 # =============================================================================
 # 模型架构配置 (与 models/config.json 保持一致)
@@ -157,7 +157,8 @@ echo "  LOAD_DIR: ${LOAD_DIR}"
 echo "  SAVE_DIR: ${SAVE_DIR}"
 echo "  TP=${TP}, PP=${PP}, EP=${EP}"
 echo "  PP_WORKERS=${PP_WORKERS}, SAVE_WORKERS=${SAVE_WORKERS}"
-echo "  MOE_TP_EXTEND_EP=${MOE_TP_EXTEND_EP:-0}"
+echo "  MOE_TP_EXTEND_EP=${MOE_TP_EXTEND_EP}"
+echo "  SCHEDULES_METHOD=${SCHEDULES_METHOD}"
 echo ""
 
 python "${CONVERT_SCRIPT}" \

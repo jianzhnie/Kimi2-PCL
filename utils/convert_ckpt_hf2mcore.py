@@ -25,7 +25,7 @@ from collections import defaultdict
 from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
                                 as_completed)
 from multiprocessing import get_context
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 from safetensors import safe_open
@@ -124,11 +124,11 @@ class CkptConvert:
         v_head_dim: int,
         moe_grouped_gemm: bool,
         moe_tp_extend_ep: bool,
-        schedules_method: str | None,
-        vpp_stage: int | None,
-        num_layer_list: str | None,
-        noop_layers: str | None,
-        qlora_nf4: bool,
+        schedules_method: str | None = None,
+        vpp_stage: int | None = None,
+        num_layer_list: str | None = None,
+        noop_layers: str | None = None,
+        qlora_nf4: bool = False,
         rotary_base: float = 50000.0,
         print_init_summary: bool = True,
         pp_workers: int = 1,
@@ -363,6 +363,8 @@ class CkptConvert:
             raise ValueError('num_layers 必须能整除 pp_size，或显式给定 num-layer-list')
         if self.first_k_dense_replace < 0 or self.first_k_dense_replace > self.num_layers:
             raise ValueError('first-k-dense-replace 非法')
+        if self.num_experts is None:
+            raise ValueError('num_experts 不能为空')
         if self.num_experts % self.ep_size != 0:
             raise ValueError('num_experts 必须能整除 ep_size')
         if self.num_layer_list is not None and self.vpp_stage is not None:
@@ -1181,19 +1183,19 @@ class CkptConvert:
         outpath = os.path.join(outdir, 'model_optim_rng.pt')
 
         if vpp:
-            payload = {
-                'model0':
-                self._cast_model_dict(mg_model[0][ep_rank][tp_rank]),
-                'model1':
-                self._cast_model_dict(mg_model[1][ep_rank][tp_rank]),
-                'checkpoint_version':
-                3.0,
-                'iteration':
-                1,
+            # 动态遍历所有 VPP stages，避免硬编码 model0/model1 导致 stage 丢失
+            vpp_size = getattr(self, 'vpp_size', 2)
+            payload: dict[str, Any] = {
+                f'model{i}': self._cast_model_dict(mg_model[i][ep_rank][tp_rank])
+                for i in range(vpp_size)
+            }
+            payload.update({
+                'checkpoint_version': 3.0,
+                'iteration': 1,
                 'args': {
                     'rotary_base': self.rotary_base
                 },
-            }
+            })
         else:
             payload = {
                 'model':
