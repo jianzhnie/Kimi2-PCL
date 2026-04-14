@@ -118,8 +118,8 @@ class DeepseekV3LayerNorm(nn.Module):
         # Standard LayerNorm: normalize then apply weight and bias
         mean = hidden_states.mean(-1, keepdim=True)
         variance = (hidden_states - mean).pow(2).mean(-1, keepdim=True)
-        hidden_states = (hidden_states - mean) * torch.rsqrt(variance +
-                                                              self.variance_epsilon)
+        hidden_states = (hidden_states -
+                         mean) * torch.rsqrt(variance + self.variance_epsilon)
         # Apply weight and bias
         hidden_states = hidden_states * self.weight + self.bias
         return hidden_states.to(input_dtype)
@@ -743,7 +743,8 @@ class DeepseekV3Attention(nn.Module):
         self.layer_idx = layer_idx
         if layer_idx is None:
             logger.warning_once(
-                f'Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended.')
+                f"Instantiating {self.__class__.__name__} without passing 'layer_idx' is not recommended."
+            )
 
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
@@ -769,27 +770,21 @@ class DeepseekV3Attention(nn.Module):
 
         # Q projection: [in=hidden_size, out=num_heads * head_dim] = [7168, 8192]
         # Weight shape: [8192, 7168] - maps to Q part of Megatron's linear_qkv [8704, 7168]
-        self.q_proj = nn.Linear(
-            self.hidden_size,
-            self.num_heads * self.head_dim,
-            bias=config.attention_bias
-        )
+        self.q_proj = nn.Linear(self.hidden_size,
+                                self.num_heads * self.head_dim,
+                                bias=config.attention_bias)
 
         # K projection: [in=hidden_size, out=num_kv_heads * head_dim] = [7168, 256]
         # Weight shape: [256, 7168] - maps to K part of Megatron's linear_qkv
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias
-        )
+        self.k_proj = nn.Linear(self.hidden_size,
+                                self.num_key_value_heads * self.head_dim,
+                                bias=config.attention_bias)
 
         # V projection: [in=hidden_size, out=num_kv_heads * head_dim] = [7168, 256]
         # Weight shape: [256, 7168] - maps to V part of Megatron's linear_qkv
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_key_value_heads * self.head_dim,
-            bias=config.attention_bias
-        )
+        self.v_proj = nn.Linear(self.hidden_size,
+                                self.num_key_value_heads * self.head_dim,
+                                bias=config.attention_bias)
 
         # O projection: [in=num_heads * head_dim, out=hidden_size] = [8192, 7168]
         # Weight shape: [7168, 8192] - matches Megatron linear_proj [7168, 8192]
@@ -801,8 +796,10 @@ class DeepseekV3Attention(nn.Module):
 
         # GQA: q_layernorm/k_layernorm on head_dim (kv_channels=128)
         if getattr(config, 'qk_layernorm', False):
-            self.q_layernorm = DeepseekV3LayerNorm(self.head_dim, eps=config.rms_norm_eps)
-            self.k_layernorm = DeepseekV3LayerNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.q_layernorm = DeepseekV3LayerNorm(self.head_dim,
+                                                   eps=config.rms_norm_eps)
+            self.k_layernorm = DeepseekV3LayerNorm(self.head_dim,
+                                                   eps=config.rms_norm_eps)
         else:
             self.q_layernorm = None
             self.k_layernorm = None
@@ -876,18 +873,20 @@ class DeepseekV3Attention(nn.Module):
                Optional[Tuple[torch.Tensor]]]:
         if 'padding_mask' in kwargs:
             warnings.warn(
-                'Passing `padding_mask` is deprecated and will be removed in v4.37.'
+                "Passing 'padding_mask' is deprecated and will be removed in v4.37."
             )
         bsz, q_len, _ = hidden_states.size()
 
         # GQA: Q/K/V all use head_dim = kv_channels = 128
         # Q: [b, s, 7168] -> [b, s, 8192] -> [b, s, 64, 128]
-        query_states = self.q_proj(hidden_states).view(
-            bsz, q_len, self.num_heads, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(bsz, q_len,
+                                                       self.num_heads,
+                                                       self.head_dim)
 
         # K: [b, s, 7168] -> [b, s, 256] -> [b, s, 2, 128]
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len,
+                                                     self.num_key_value_heads,
+                                                     self.head_dim)
 
         # V: [b, s, 7168] -> [b, s, 256] -> [b, s, 2, 128]
         value_states = self.v_proj(hidden_states).view(
@@ -907,9 +906,10 @@ class DeepseekV3Attention(nn.Module):
         kv_seq_len = value_states.shape[-2]
         if past_key_value is not None:
             if self.layer_idx is None:
-                raise ValueError(f'layer_idx must be provided for KV caching.')
+                raise ValueError('layer_idx must be provided for KV caching.')
             if hasattr(past_key_value, 'get_usable_length'):
-                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+                kv_seq_len += past_key_value.get_usable_length(
+                    kv_seq_len, self.layer_idx)
             else:
                 kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
@@ -929,23 +929,27 @@ class DeepseekV3Attention(nn.Module):
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
         # Attention computation: Q[b,64,s,128] @ K^T[b,64,s,128] -> [b,64,s,s]
-        attn_weights = torch.matmul(
-            query_states, key_states.transpose(2, 3)) * self.softmax_scale
+        attn_weights = torch.matmul(query_states, key_states.transpose(
+            2, 3)) * self.softmax_scale
 
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
 
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training)
+        attn_weights = nn.functional.softmax(attn_weights,
+                                             dim=-1,
+                                             dtype=torch.float32).to(
+                                                 query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights,
+                                             p=self.attention_dropout,
+                                             training=self.training)
 
         # Attention output: [b, 64, s, 128]
         attn_output = torch.matmul(attn_weights, value_states)
 
         # Reshape and project: [b, s, 8192] -> [b, s, 7168]
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = attn_output.reshape(bsz, q_len,
+                                          self.num_heads * self.head_dim)
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -965,7 +969,8 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
+        self._flash_attn_uses_top_left_mask = not is_flash_attn_greater_or_equal_2_10(
+        )
 
     def forward(
         self,
@@ -979,7 +984,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
                Optional[Tuple[torch.Tensor]]]:
         if 'padding_mask' in kwargs:
-            warnings.warn('Passing `padding_mask` is deprecated.')
+            warnings.warn("Passing 'padding_mask' is deprecated.")
             attention_mask = kwargs.pop('padding_mask')
 
         if getattr(self.config, 'fa_without_pad', False):
@@ -989,10 +994,12 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         bsz, q_len, _ = hidden_states.size()
 
         # GQA: Q/K/V all use head_dim = 128
-        query_states = self.q_proj(hidden_states).view(
-            bsz, q_len, self.num_heads, self.head_dim)
-        key_states = self.k_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim)
+        query_states = self.q_proj(hidden_states).view(bsz, q_len,
+                                                       self.num_heads,
+                                                       self.head_dim)
+        key_states = self.k_proj(hidden_states).view(bsz, q_len,
+                                                     self.num_key_value_heads,
+                                                     self.head_dim)
         value_states = self.v_proj(hidden_states).view(
             bsz, q_len, self.num_key_value_heads, self.head_dim)
 
@@ -1005,7 +1012,8 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         kv_seq_len = value_states.shape[1]
         if past_key_value is not None:
             if hasattr(past_key_value, 'get_usable_length'):
-                kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+                kv_seq_len += past_key_value.get_usable_length(
+                    kv_seq_len, self.layer_idx)
             else:
                 kv_seq_len += past_key_value.get_seq_length(self.layer_idx)
 
@@ -1026,7 +1034,8 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             value_states_cache = value_states.transpose(1, 2)
             cache_kwargs = {'sin': sin, 'cos': cos}
             key_states_cache, value_states_cache = past_key_value.update(
-                key_states_cache, value_states_cache, self.layer_idx, cache_kwargs)
+                key_states_cache, value_states_cache, self.layer_idx,
+                cache_kwargs)
             key_states = key_states_cache.transpose(1, 2)
             value_states = value_states_cache.transpose(1, 2)
 
@@ -1043,8 +1052,8 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                 target_dtype = self.q_proj.weight.dtype
 
             logger.warning_once(
-                f'The input hidden states seems to be silently casted in float32, this might be related to'
-                f' the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in'
+                'The input hidden states seems to be silently casted in float32, this might be related to'
+                ' the fact you have upcasted embedding or layer norm layers in float32. We will cast back the input in'
                 f' {target_dtype}.')
 
             query_states = query_states.to(target_dtype)
@@ -1063,8 +1072,8 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         )
 
         # Reshape: [b, s, 64, 128] -> [b, s, 8192] -> [b, s, 7168]
-        attn_output = attn_output.reshape(bsz, q_len,
-                                          self.num_heads * self.head_dim).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads *
+                                          self.head_dim).contiguous()
         attn_output = self.o_proj(attn_output)
 
         if not output_attentions:
@@ -1107,11 +1116,13 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             n_rep = self.num_key_value_groups
             # [b, s, 2, 128] -> [b, s, 64, 128]
             key_states = key_states[:, :, :, None, :].expand(
-                batch_size, seq_len, num_kv_heads, n_rep, head_dim
-            ).reshape(batch_size, seq_len, num_kv_heads * n_rep, head_dim)
+                batch_size, seq_len, num_kv_heads, n_rep,
+                head_dim).reshape(batch_size, seq_len, num_kv_heads * n_rep,
+                                  head_dim)
             value_states = value_states[:, :, :, None, :].expand(
-                batch_size, seq_len, num_kv_heads, n_rep, head_dim
-            ).reshape(batch_size, seq_len, num_kv_heads * n_rep, head_dim)
+                batch_size, seq_len, num_kv_heads, n_rep,
+                head_dim).reshape(batch_size, seq_len, num_kv_heads * n_rep,
+                                  head_dim)
 
         if attention_mask is not None:
             batch_size = query_states.shape[0]
@@ -1250,11 +1261,11 @@ class DeepseekV3DecoderLayer(nn.Module):
             use_cache (`bool`, *optional*):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
-            past_key_value (`Tuple(torch.FloatTensor)`, *optional`): cached past key and value projection states
+            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
         if 'padding_mask' in kwargs:
             warnings.warn(
-                'Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`'
+                "Passing 'padding_mask' is deprecated and will be removed in v4.37. Please make sure use 'attention_mask' instead."
             )
         residual = hidden_states
 
