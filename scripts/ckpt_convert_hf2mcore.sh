@@ -63,9 +63,9 @@ TP="${TP:-2}"                          # Tensor Parallel size
 PP="${PP:-8}"                          # Pipeline Parallel size
 EP="${EP:-8}"                        # Expert Parallel size
 VPP_STAGE="${VPP_STAGE:-}"             # VPP stage (dualpipev 下留空)
-PP_WORKERS="${PP_WORKERS:-2}"          # PP 并行工作进程数
-IO_THREADS="${IO_THREADS:-2}"          # HF 权重加载线程数
-SAVE_WORKERS="${SAVE_WORKERS:-0}"      # 保存权重线程数 (0=自动)
+PP_WORKERS="${PP_WORKERS:-1}"          # PP 并行工作进程数
+IO_THREADS="${IO_THREADS:-1}"          # HF 权重加载线程数
+SAVE_WORKERS="${SAVE_WORKERS:-1}"      # 保存权重线程数 (0=自动)
 CAST_DTYPE="${CAST_DTYPE:-bf16}"       # 输出数据类型
 SCHEDULES_METHOD="${SCHEDULES_METHOD:-}"  # 调度算法 (与训练脚本一致，默认 dualpipev)
 
