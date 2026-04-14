@@ -20,7 +20,6 @@ DEFAULT_TEST_CONFIG = {
     'num_attention_heads': 4,
     'num_key_value_heads': 2,
     'qk_head_dim': 128,
-    'qk_pos_emb_head_dim': 64,
     'v_head_dim': 128,
     'vocab_size': 1000,
 }
@@ -36,7 +35,7 @@ def get_model_dimensions(config: dict = None) -> dict:
         Dictionary with calculated dimensions
     """
     cfg = config or DEFAULT_TEST_CONFIG
-    q_head_dim = cfg['qk_head_dim'] + cfg['qk_pos_emb_head_dim']
+    q_head_dim = cfg['qk_head_dim']
     
     return {
         'hidden_size': cfg['hidden_size'],
@@ -330,6 +329,14 @@ def test_parallel_saving() -> bool:
             "--target-tensor-parallel-size", "2",
             "--target-pipeline-parallel-size", "2",
             "--target-expert-parallel-size", "1",
+            "--num-experts", "1",
+            "--num-attention-heads", "4",
+            "--num-query-groups", "2",
+            "--qk-head-dim", "128",
+            "--v-head-dim", "128",
+            "--hidden-size", "128",
+            "--ffn-hidden-size", "256",
+            "--vocab-size", "1000",
             "--save-workers", "4",
             "--cast-dtype", "fp32",
             "--first-k-dense-replace", "4",
@@ -390,7 +397,14 @@ def test_moe_parallel_saving() -> bool:
             "--target-pipeline-parallel-size", "2",
             "--target-expert-parallel-size", "2",
             "--num-experts", "8",
+            "--num-attention-heads", "4",
+            "--num-query-groups", "2",
+            "--qk-head-dim", "128",
+            "--v-head-dim", "128",
+            "--hidden-size", "128",
+            "--ffn-hidden-size", "256",
             "--moe-ffn-hidden-size", "512",
+            "--vocab-size", "1000",
             "--save-workers", "4",
             "--cast-dtype", "fp32",
             "--first-k-dense-replace", "2",

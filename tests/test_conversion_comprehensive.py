@@ -20,7 +20,6 @@ from safetensors.torch import save_file
 # Import conversion modules
 from utils.convert_ckpt_hf2mcore import (
     _parse_int_list,
-    _read_hf_config,
     _ensure_iter_path,
     _dtype_from_str,
     _sha256_file,
@@ -146,32 +145,6 @@ class TestParseIntList:
     def test_parse_with_spaces(self):
         """Test parsing with spaces around commas"""
         assert _parse_int_list("1, 2, 3") == [1, 2, 3]
-
-
-class TestReadHFConfig:
-    """Test _read_hf_config function"""
-
-    def test_read_existing_config(self, temp_hf_checkpoint):
-        """Test reading existing config"""
-        config = _read_hf_config(temp_hf_checkpoint)
-        assert config["vocab_size"] == 128
-        assert config["hidden_size"] == 64
-
-    def test_read_missing_config(self):
-        """Test reading missing config returns empty dict"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config = _read_hf_config(tmpdir)
-            assert config == {}
-
-    def test_read_invalid_json(self):
-        """Test reading invalid JSON"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            config_path = Path(tmpdir) / "config.json"
-            with open(config_path, "w") as f:
-                f.write("invalid json")
-
-            with pytest.raises(json.JSONDecodeError):
-                _read_hf_config(tmpdir)
 
 
 class TestEnsureIterPath:
@@ -352,14 +325,12 @@ class TestCkptConvertInitialization:
             "ffn_hidden_size": 128,
             "moe_ffn_hidden_size": 128,
             "vocab_size": 128,
-            "num_key_value_heads": 2,
+            "num_query_groups": 2,
             "num_experts": 1,
             "num_attention_heads": 4,
             "qk_head_dim": 64,
-            "qk_pos_emb_head_dim": 32,
             "v_head_dim": 64,
             "moe_grouped_gemm": False,
-            "moe_tp_extend_ep": False,
             "schedules_method": None,
             "vpp_stage": None,
             "num_layer_list": None,
@@ -410,14 +381,12 @@ class TestCkptConvertLayerMapping:
                 ffn_hidden_size=128,
                 moe_ffn_hidden_size=128,
                 vocab_size=128,
-                num_key_value_heads=2,
+                num_query_groups=2,
                 num_experts=4,
                 num_attention_heads=4,
                 qk_head_dim=64,
-                qk_pos_emb_head_dim=32,
                 v_head_dim=64,
                 moe_grouped_gemm=False,
-                moe_tp_extend_ep=False,
                 schedules_method=None,
                 vpp_stage=None,
                 num_layer_list=None,
@@ -491,28 +460,26 @@ class TestMgCkptConvertInitialization:
             "hidden_size": 64,
             "num_experts": 1,
             "num_attention_heads": 4,
+            "num_query_groups": 2,
             "qk_head_dim": 64,
-            "v_head_dim": 64,
-            "qk_pos_emb_head_dim": 32,
             "moe_grouped_gemm": False,
-            "moe_tp_extend_ep": False,
             "schedules_method": None,
             "vpp_stage": None,
             "num_layer_list": None,
             "noop_layers": "",
+            "qk_layernorm": False,
             "rotary_base": 50000.0,
-            "num_key_value_heads": 2,
             "vocab_size": 128,
             "max_position_embeddings": 512,
             "tie_word_embeddings": False,
             "ffn_hidden_size": 128,
             "moe_ffn_hidden_size": 128,
+            "n_shared_experts": 1,
+            "moe_router_topk": 2,
             "hf_config_template": None,
             "cast_dtype": None,
             "io_threads": 1,
             "disable_mmap": True,
-            "extra_config_kwargs": {},
-            "qk_layernorm": False,
         }
 
     @patch.object(MgCkptConvert, '_detect_vpp', return_value=(None, ['model']))
@@ -542,35 +509,35 @@ class TestMgCkptConvertQKVLayout:
                 hidden_size=64,
                 num_experts=1,
                 num_attention_heads=4,
+                num_query_groups=2,
                 qk_head_dim=64,
-                v_head_dim=64,
-                qk_pos_emb_head_dim=32,
                 moe_grouped_gemm=False,
-                moe_tp_extend_ep=False,
                 schedules_method=None,
                 vpp_stage=None,
                 num_layer_list=None,
                 noop_layers='',
+                qk_layernorm=False,
                 rotary_base=50000.0,
-                num_key_value_heads=2,
                 vocab_size=128,
                 max_position_embeddings=512,
                 tie_word_embeddings=False,
                 ffn_hidden_size=128,
                 moe_ffn_hidden_size=128,
+                n_shared_experts=1,
+                moe_router_topk=2,
                 hf_config_template=None,
                 cast_dtype=None,
                 io_threads=1,
                 disable_mmap=True,
-                extra_config_kwargs={},
-                qk_layernorm=False,
             )
 
     def test_attention_params(self, converter):
         """Test attention parameters are correctly set"""
         # Verify that GQA parameters are correctly configured
         assert converter.num_attention_heads == 4
-        assert converter.num_key_value_heads == 2
+        assert converter.num_query_groups == 2
+        # GQA: v_head_dim equals qk_head_dim
+        assert converter.v_head_dim == converter.qk_head_dim
         # Verify head_dim calculations
         expected_head_dim = converter.hidden_size // converter.num_attention_heads
         assert expected_head_dim == 16  # 64 / 4 = 16
@@ -659,10 +626,6 @@ class TestBenchmarks:
             benchmark(_sha256_file, temp_path)
         finally:
             os.unlink(temp_path)
-
-    def test_read_hf_config_benchmark(self, benchmark, temp_hf_checkpoint):
-        """Benchmark reading HF config"""
-        benchmark(_read_hf_config, temp_hf_checkpoint)
 
 
 if __name__ == "__main__":

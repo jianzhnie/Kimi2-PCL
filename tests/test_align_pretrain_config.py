@@ -273,7 +273,6 @@ def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root, moe_gr
         '--source-tensor-parallel-size', str(p['tp_size']),
         '--source-pipeline-parallel-size', str(p['pp_size']),
         '--source-expert-parallel-size', str(p['ep_size']),
-        '--moe-tp-extend-ep',
         '--schedules-method', 'dualpipev',
         '--hidden-size', str(p['hidden_size']),
         '--ffn-hidden-size', str(p['ffn_hidden']),
@@ -291,7 +290,6 @@ def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root, moe_gr
     ]
     if moe_grouped_gemm:
         cmd_m2h.append('--moe-grouped-gemm')
-    cmd_m2h.append('--moe-tp-extend-ep')
 
     import convert_ckpt_mcore2hf
     with pytest.MonkeyPatch().context() as m:
@@ -315,8 +313,7 @@ def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root, moe_gr
     ]
     if moe_grouped_gemm:
         cmd_h2m.append('--moe-grouped-gemm')
-    cmd_h2m.append('--moe-tp-extend-ep')
-        
+
     import convert_ckpt_hf2mcore
     with pytest.MonkeyPatch().context() as m:
         m.setattr(sys, 'argv', cmd_h2m)
