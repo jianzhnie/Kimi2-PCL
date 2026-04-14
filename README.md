@@ -84,7 +84,7 @@ python utils/convert_ckpt_hf2mcore.py \
 - `--num-layers` / `--hidden-size` / `--num-attention-heads` 等：通常可从 HF `config.json` 自动推断；当你的 HF 配置字段不完整或需要覆盖时再显式指定。
 - `--target-*-parallel-size`：目标 TP/PP/EP 并行度。
 - `--pp-workers`：PP workers 的数量（用于特殊调度模式下的映射计算）。
-- `--moe-grouped-gemm` / `--moe-tp-extend-ep`：MoE 权重布局相关开关。
+- `--moe-grouped-gemm`：MoE 权重布局相关开关。
 - `--vpp-stage` / `--schedules-method dualpipev`：VPP/dualpipev 相关配置。
 - `--num-layer-list`：当 `num_layers` 不能整除 `pp_size` 时，显式给定每个 PP 的层数分配（形如 `4,4,4,4`）。
 - `--noop-layers`：指定 noop layer 索引列表（逗号分隔），用于与训练侧的 “跳层/空层” 配置对齐。
