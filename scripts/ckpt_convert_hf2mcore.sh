@@ -32,10 +32,6 @@ if [[ -f "/usr/local/Ascend/ascend-toolkit/set_env.sh" ]]; then
 fi
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-# MOE_TP_EXTEND_EP: 使用 TP 组扩展 EP 并行 (与训练脚本 pretrain_kimi2_1t_4k.sh 保持一致)
-# 默认启用 (0)，与训练配置匹配
-export MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-0}"
-
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 
 # 检查 REPO_ROOT 是否有效
@@ -129,17 +125,6 @@ fi
 if [[ -n "${NUM_LAYER_LIST}" ]]; then
   EXTRA_ARGS+=(--num-layer-list "${NUM_LAYER_LIST}")
 fi
-if [[ "${MOE_TP_EXTEND_EP:-0}" == "1" ]]; then
-  if [[ "${TP}" -le 1 ]]; then
-    echo "MOE_TP_EXTEND_EP=1 需要 TP>1" >&2
-    exit 2
-  fi
-  if (( EP % TP != 0 )); then
-    echo "MOE_TP_EXTEND_EP=1 需要 EP 能整除 TP: EP=${EP} TP=${TP}" >&2
-    exit 2
-  fi
-  EXTRA_ARGS+=(--moe-tp-extend-ep)
-fi
 if [[ -n "${VPP_STAGE:-}" ]]; then
   EXTRA_ARGS+=(--vpp-stage "${VPP_STAGE}")
 fi
@@ -157,7 +142,6 @@ echo "  LOAD_DIR: ${LOAD_DIR}"
 echo "  SAVE_DIR: ${SAVE_DIR}"
 echo "  TP=${TP}, PP=${PP}, EP=${EP}"
 echo "  PP_WORKERS=${PP_WORKERS}, SAVE_WORKERS=${SAVE_WORKERS}"
-echo "  MOE_TP_EXTEND_EP=${MOE_TP_EXTEND_EP}"
 echo "  SCHEDULES_METHOD=${SCHEDULES_METHOD}"
 echo ""
 

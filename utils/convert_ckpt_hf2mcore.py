@@ -123,7 +123,6 @@ class CkptConvert:
         qk_head_dim: int,
         v_head_dim: int,
         moe_grouped_gemm: bool,
-        moe_tp_extend_ep: bool,
         schedules_method: str | None = None,
         vpp_stage: int | None = None,
         num_layer_list: str | None = None,
@@ -169,7 +168,6 @@ class CkptConvert:
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
-        self.moe_tp_extend_ep = moe_tp_extend_ep
         self.schedules_method = schedules_method
         self.dualpipe = schedules_method == 'dualpipev'
         self.vpp_stage = vpp_stage
@@ -375,11 +373,6 @@ class CkptConvert:
             raise ValueError('ffn-hidden-size 必须 > 0')
         if self.moe_ffn_hidden_size is not None and self.moe_ffn_hidden_size <= 0:
             raise ValueError('moe-ffn-hidden-size 必须 > 0')
-        if self.moe_tp_extend_ep:
-            if self.tp_size <= 1:
-                raise ValueError('moe-tp-extend-ep 需要 tp_size > 1 才有意义')
-            if self.ep_size % self.tp_size != 0:
-                raise ValueError('moe-tp-extend-ep 需要 ep_size 能整除 tp_size')
         self._validate_attention_config()
 
     def _validate_attention_config(self) -> None:
@@ -993,41 +986,21 @@ class CkptConvert:
         experts_weight1_key = f'{prefix}.experts.weight1'
         experts_weight2_key = f'{prefix}.experts.weight2'
 
-        if self.moe_tp_extend_ep:
-            num_local = self.num_experts // self.ep_size
-            for ep_rank in range(self.ep_size):
-                tp_rank = ep_rank % self.tp_size
-                mg_model[ep_rank][tp_rank][router_key] = router_w[
-                    ep_rank * num_local:(ep_rank + 1) * num_local].clone()
+        for ep_rank in range(self.ep_size):
+            for tp_rank in range(self.tp_size):
+                mg_model[ep_rank][tp_rank][router_key] = router_w
                 if router_b is not None:
-                    mg_model[ep_rank][tp_rank][router_bias_key] = router_b[
-                        ep_rank * num_local:(ep_rank + 1) * num_local].clone()
-                mg_model[ep_rank][tp_rank][shared_fc1_key] = shared_fc1_shards[
-                    tp_rank]
-                mg_model[ep_rank][tp_rank][shared_fc2_key] = shared_fc2_shards[
-                    tp_rank]
+                    mg_model[ep_rank][tp_rank][router_bias_key] = router_b
+                mg_model[ep_rank][tp_rank][
+                    shared_fc1_key] = shared_fc1_shards[tp_rank]
+                mg_model[ep_rank][tp_rank][
+                    shared_fc2_key] = shared_fc2_shards[tp_rank]
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                       shared_fc1_key,
                                       shared_fc1_shards[tp_rank])
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                       shared_fc2_key,
                                       shared_fc2_shards[tp_rank])
-        else:
-            for ep_rank in range(self.ep_size):
-                for tp_rank in range(self.tp_size):
-                    mg_model[ep_rank][tp_rank][router_key] = router_w
-                    if router_b is not None:
-                        mg_model[ep_rank][tp_rank][router_bias_key] = router_b
-                    mg_model[ep_rank][tp_rank][
-                        shared_fc1_key] = shared_fc1_shards[tp_rank]
-                    mg_model[ep_rank][tp_rank][
-                        shared_fc2_key] = shared_fc2_shards[tp_rank]
-                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
-                                          shared_fc1_key,
-                                          shared_fc1_shards[tp_rank])
-                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
-                                          shared_fc2_key,
-                                          shared_fc2_shards[tp_rank])
 
         if self.moe_grouped_gemm:
             # experts_linear_fc1_list 每个元素形状: [hidden_size, intermediate_size*2]
@@ -1043,14 +1016,35 @@ class CkptConvert:
                 raise ValueError(
                     f'moe grouped gemm hidden_size 不匹配: hidden_size={self.hidden_size} gemm_fc1={tuple(gemm_fc1.shape)} gemm_fc2={tuple(gemm_fc2.shape)}'
                 )
-            if self.moe_tp_extend_ep:
-                gemm_fc1_ep = torch.chunk(gemm_fc1, self.ep_size, dim=0)
-                gemm_fc2_ep = torch.chunk(gemm_fc2, self.ep_size, dim=0)
-                for ep_rank in range(self.ep_size):
-                    tp_rank = ep_rank % self.tp_size
-                    w1 = gemm_fc1_ep[ep_rank].permute(1, 0, 2).reshape(
-                        self.hidden_size, -1).contiguous()
-                    w2 = gemm_fc2_ep[ep_rank].reshape(
+            if gemm_fc1.shape[2] % self.tp_size != 0:
+                raise ValueError(
+                    f'moe grouped gemm 需要 intermediate*2 能整除 tp_size: gemm_fc1={tuple(gemm_fc1.shape)} tp={self.tp_size}'
+                )
+            if gemm_fc2.shape[1] % self.tp_size != 0:
+                raise ValueError(
+                    f'moe grouped gemm 需要 intermediate 能整除 tp_size: gemm_fc2={tuple(gemm_fc2.shape)} tp={self.tp_size}'
+                )
+            gemm_fc1_ep = torch.chunk(
+                gemm_fc1,
+                self.ep_size,
+                dim=0,
+            )
+            gemm_fc2_ep = torch.chunk(
+                gemm_fc2,
+                self.ep_size,
+                dim=0,
+            )
+            for ep_rank in range(self.ep_size):
+                fc1_tp = torch.chunk(gemm_fc1_ep[ep_rank],
+                                     self.tp_size,
+                                     dim=2)
+                fc2_tp = torch.chunk(gemm_fc2_ep[ep_rank],
+                                     self.tp_size,
+                                     dim=1)
+                for tp_rank in range(self.tp_size):
+                    w1 = fc1_tp[tp_rank].reshape(self.hidden_size,
+                                                 -1).contiguous()
+                    w2 = fc2_tp[tp_rank].reshape(
                         -1, self.hidden_size).contiguous()
                     mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
                     mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
@@ -1058,99 +1052,44 @@ class CkptConvert:
                                           experts_weight1_key, w1)
                     self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                           experts_weight2_key, w2)
-            else:
-                if gemm_fc1.shape[2] % self.tp_size != 0:
-                    raise ValueError(
-                        f'moe grouped gemm 需要 intermediate*2 能整除 tp_size: gemm_fc1={tuple(gemm_fc1.shape)} tp={self.tp_size}'
-                    )
-                if gemm_fc2.shape[1] % self.tp_size != 0:
-                    raise ValueError(
-                        f'moe grouped gemm 需要 intermediate 能整除 tp_size: gemm_fc2={tuple(gemm_fc2.shape)} tp={self.tp_size}'
-                    )
-                gemm_fc1_ep = torch.chunk(
-                    gemm_fc1,
-                    self.ep_size,
-                    dim=0,
-                )
-                gemm_fc2_ep = torch.chunk(
-                    gemm_fc2,
-                    self.ep_size,
-                    dim=0,
-                )
-                for ep_rank in range(self.ep_size):
-                    fc1_tp = torch.chunk(gemm_fc1_ep[ep_rank],
-                                         self.tp_size,
-                                         dim=2)
-                    fc2_tp = torch.chunk(gemm_fc2_ep[ep_rank],
-                                         self.tp_size,
-                                         dim=1)
-                    for tp_rank in range(self.tp_size):
-                        w1 = fc1_tp[tp_rank].reshape(self.hidden_size,
-                                                     -1).contiguous()
-                        w2 = fc2_tp[tp_rank].reshape(
-                            -1, self.hidden_size).contiguous()
-                        mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
-                        mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
-                        self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
-                                              experts_weight1_key, w1)
-                        self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
-                                              experts_weight2_key, w2)
-        else:
-            num_local_experts = self.num_experts // self.ep_size
-            for ep_rank in range(self.ep_size):
-                for local_idx in range(num_local_experts):
-                    global_idx = local_idx + ep_rank * num_local_experts
-                    local_fc1 = experts_linear_fc1_list[global_idx].t()
-                    local_fc2 = experts_linear_fc2_list[global_idx].t()
-                    local_prefix = f'{prefix}.experts.local_experts.{local_idx}'
-                    if self.moe_tp_extend_ep:
-                        tp_rank = ep_rank % self.tp_size
-                        mg_model[ep_rank][tp_rank][
-                            f'{local_prefix}.linear_fc1.weight'] = local_fc1.contiguous(
-                            )
-                        mg_model[ep_rank][tp_rank][
-                            f'{local_prefix}.linear_fc2.weight'] = local_fc2.contiguous(
-                            )
-                        self._maybe_quant_nf4(
-                            mg_model[ep_rank][tp_rank],
-                            f'{local_prefix}.linear_fc1.weight',
-                            mg_model[ep_rank][tp_rank]
-                            [f'{local_prefix}.linear_fc1.weight'])
-                        self._maybe_quant_nf4(
-                            mg_model[ep_rank][tp_rank],
-                            f'{local_prefix}.linear_fc2.weight',
-                            mg_model[ep_rank][tp_rank]
-                            [f'{local_prefix}.linear_fc2.weight'])
-                    else:
-                        local_fc1_tp = torch.chunk(local_fc1,
-                                                   self.tp_size,
-                                                   dim=0)
-                        local_fc2_tp = torch.chunk(local_fc2,
-                                                   self.tp_size,
-                                                   dim=1)
-                        local_fc1_shards = [
-                            t.contiguous() if not t.is_contiguous() else t
-                            for t in local_fc1_tp
-                        ]
-                        local_fc2_shards = [
-                            t.contiguous() if not t.is_contiguous() else t
-                            for t in local_fc2_tp
-                        ]
-                        for tp_rank in range(self.tp_size):
-                            mg_model[ep_rank][tp_rank][
-                                f'{local_prefix}.linear_fc1.weight'] = local_fc1_shards[
-                                    tp_rank]
-                            mg_model[ep_rank][tp_rank][
-                                f'{local_prefix}.linear_fc2.weight'] = local_fc2_shards[
-                                    tp_rank]
-                            self._maybe_quant_nf4(
-                                mg_model[ep_rank][tp_rank],
-                                f'{local_prefix}.linear_fc1.weight',
-                                local_fc1_shards[tp_rank])
-                            self._maybe_quant_nf4(
-                                mg_model[ep_rank][tp_rank],
-                                f'{local_prefix}.linear_fc2.weight',
-                                local_fc2_shards[tp_rank])
+            return
+
+        num_local_experts = self.num_experts // self.ep_size
+        for ep_rank in range(self.ep_size):
+            for local_idx in range(num_local_experts):
+                global_idx = local_idx + ep_rank * num_local_experts
+                local_fc1 = experts_linear_fc1_list[global_idx].t()
+                local_fc2 = experts_linear_fc2_list[global_idx].t()
+                local_prefix = f'{prefix}.experts.local_experts.{local_idx}'
+                local_fc1_tp = torch.chunk(local_fc1,
+                                           self.tp_size,
+                                           dim=0)
+                local_fc2_tp = torch.chunk(local_fc2,
+                                           self.tp_size,
+                                           dim=1)
+                local_fc1_shards = [
+                    t.contiguous() if not t.is_contiguous() else t
+                    for t in local_fc1_tp
+                ]
+                local_fc2_shards = [
+                    t.contiguous() if not t.is_contiguous() else t
+                    for t in local_fc2_tp
+                ]
+                for tp_rank in range(self.tp_size):
+                    mg_model[ep_rank][tp_rank][
+                        f'{local_prefix}.linear_fc1.weight'] = local_fc1_shards[
+                            tp_rank]
+                    mg_model[ep_rank][tp_rank][
+                        f'{local_prefix}.linear_fc2.weight'] = local_fc2_shards[
+                            tp_rank]
+                    self._maybe_quant_nf4(
+                        mg_model[ep_rank][tp_rank],
+                        f'{local_prefix}.linear_fc1.weight',
+                        local_fc1_shards[tp_rank])
+                    self._maybe_quant_nf4(
+                        mg_model[ep_rank][tp_rank],
+                        f'{local_prefix}.linear_fc2.weight',
+                        local_fc2_shards[tp_rank])
 
     def _maybe_cast(self, t: torch.Tensor) -> torch.Tensor:
         if self._target_dtype is None:
@@ -1233,8 +1172,6 @@ class CkptConvert:
         rank_tasks = []
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
-                if self.moe_tp_extend_ep and (ep_rank % self.tp_size) != tp_rank:
-                    continue
                 rank_tasks.append((tp_rank, ep_rank))
 
         # 预先创建所有输出目录（避免多线程同时创建导致的竞态条件）
@@ -1324,7 +1261,6 @@ class CkptConvert:
             qk_head_dim=self.qk_head_dim,
             v_head_dim=self.v_head_dim,
             moe_grouped_gemm=self.moe_grouped_gemm,
-            moe_tp_extend_ep=self.moe_tp_extend_ep,
             schedules_method=self.schedules_method,
             vpp_stage=None if self.dualpipe else self.vpp_stage,
             num_layer_list=self.num_layer_list,
@@ -1469,12 +1405,6 @@ def get_args():
                         action='store_true',
                         help='Tie word embeddings and output layer.')
     parser.add_argument(
-        '--moe-tp-extend-ep',
-        action='store_true',
-        help=
-        'use tp group to extend experts parallism instead of sharding weight tensor of experts in tp group',
-    )
-    parser.add_argument(
         '--schedules-method',
         type=str,
         default=None,
@@ -1533,7 +1463,6 @@ def main() -> None:
         qk_head_dim=args.qk_head_dim,
         v_head_dim=args.v_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
-        moe_tp_extend_ep=args.moe_tp_extend_ep,
         schedules_method=args.schedules_method,
         vpp_stage=args.num_layers_per_virtual_pipeline_stage,
         num_layer_list=args.num_layer_list,
