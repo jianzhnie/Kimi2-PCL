@@ -1478,6 +1478,7 @@ def main() -> None:
         save_workers=args.save_workers,
         cast_dtype=args.cast_dtype,
         tie_word_embeddings=args.tie_word_embeddings,
+        hf_io_threads=args.hf_io_threads,
         qk_layernorm=args.qk_layernorm,
     )
     converter.run()

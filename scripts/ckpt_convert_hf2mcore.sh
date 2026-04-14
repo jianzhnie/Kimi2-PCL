@@ -61,13 +61,13 @@ fi
 # =============================================================================
 TP="${TP:-2}"                          # Tensor Parallel size
 PP="${PP:-8}"                          # Pipeline Parallel size
-EP="${EP:-64}"                         # Expert Parallel size
+EP="${EP:-8}"                        # Expert Parallel size
 VPP_STAGE="${VPP_STAGE:-}"             # VPP stage (dualpipev 下留空)
 PP_WORKERS="${PP_WORKERS:-2}"          # PP 并行工作进程数
 IO_THREADS="${IO_THREADS:-2}"          # HF 权重加载线程数
 SAVE_WORKERS="${SAVE_WORKERS:-0}"      # 保存权重线程数 (0=自动)
 CAST_DTYPE="${CAST_DTYPE:-bf16}"       # 输出数据类型
-SCHEDULES_METHOD="${SCHEDULES_METHOD:-}"  # 调度算法 (与训练脚本一致)
+SCHEDULES_METHOD="${SCHEDULES_METHOD:-}"  # 调度算法 (与训练脚本一致，默认 dualpipev)
 
 # =============================================================================
 # 模型架构配置 (与 models/config.json 保持一致)
@@ -84,9 +84,11 @@ NUM_QUERY_GROUPS="${NUM_QUERY_GROUPS:-2}"          # KV query groups (GQA)
 QK_HEAD_DIM="${QK_HEAD_DIM:-128}"                 # QK head 维度
 V_HEAD_DIM="${V_HEAD_DIM:-128}"                   # V head 维度
 ROTARY_BASE="${ROTARY_BASE:-50000}"               # RoPE 基数
-MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"  # 最大位置编码
-
 # 可选配置
+# 注意: 训练脚本使用 --untie-embeddings-and-output-weights，因此默认不绑定 embedding 和 lm_head。
+# 如需绑定，请设置 TIE_WORD_EMBEDDINGS=1 并添加 --tie-word-embeddings。
+TIE_WORD_EMBEDDINGS="${TIE_WORD_EMBEDDINGS:-0}"
+
 NOOP_LAYERS="${NOOP_LAYERS:-}"           # 空层列表 (逗号分隔)
 NUM_LAYER_LIST="${NUM_LAYER_LIST:-}"     # 自定义每层分配列表
 
@@ -136,6 +138,9 @@ fi
 if [[ "${QK_LAYERNORM:-1}" == "1" ]]; then
   EXTRA_ARGS+=(--qk-layernorm)
 fi
+if [[ "${TIE_WORD_EMBEDDINGS:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--tie-word-embeddings)
+fi
 
 echo "Starting conversion..."
 echo "  LOAD_DIR: ${LOAD_DIR}"
@@ -166,7 +171,6 @@ python "${CONVERT_SCRIPT}" \
   --num-experts "${NUM_EXPERTS}" \
   --num-attention-heads "${NUM_ATTENTION_HEADS}" \
   --num-query-groups "${NUM_QUERY_GROUPS}" \
-  --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}" \
   --qk-head-dim "${QK_HEAD_DIM}" \
   --v-head-dim "${V_HEAD_DIM}" \
   --sha256-manifest "${SAVE_DIR}/sha256_manifest.json" \
