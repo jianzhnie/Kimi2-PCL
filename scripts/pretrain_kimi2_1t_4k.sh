@@ -45,9 +45,6 @@ MOE_ARGS="
     --moe-pad-expert-input-to-capacity \
 "
 
-# 启用 MOE TP 扩展 EP 模式（EP 在 TP 维度上分布）
-export MOE_TP_EXTEND_EP=true
-
 BALANCE_ARGS="
     --balanced-moe-experts \
 "
