@@ -1190,8 +1190,13 @@ class CkptConvert:
             logger.info('Parallel saving: %d tasks with max %d workers',
                         total_tasks, max_save_workers)
 
-        # 为了向后兼容，检查是否有保存线程数的环境变量
-        save_workers = int(os.environ.get('CKPT_CONVERT_SAVE_WORKERS', str(max_save_workers)))
+        # 优先使用用户显式指定的 save_workers；0 表示自动
+        if self.save_workers > 0:
+            save_workers = min(self.save_workers, max_save_workers)
+        else:
+            save_workers = max_save_workers
+        # 环境变量可覆盖上述决定（向后兼容）
+        save_workers = int(os.environ.get('CKPT_CONVERT_SAVE_WORKERS', str(save_workers)))
         save_workers = min(save_workers, max_save_workers)
 
         if save_workers <= 1:
