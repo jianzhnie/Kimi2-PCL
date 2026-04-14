@@ -378,6 +378,7 @@ class CkptConvert:
                 raise ValueError('moe-tp-extend-ep 需要 tp_size > 1 才有意义')
             if self.ep_size % self.tp_size != 0:
                 raise ValueError('moe-tp-extend-ep 需要 ep_size 能整除 tp_size')
+        self._validate_attention_config()
 
     def _validate_attention_config(self) -> None:
         if self.num_attention_heads % self.tp_size != 0:
@@ -817,8 +818,6 @@ class CkptConvert:
 
         q_norm_key = f'{prefix}.q_layernorm.weight'
         k_norm_key = f'{prefix}.k_layernorm.weight'
-
-        self._validate_attention_config()
 
         expected_q_head_dim = self.qk_head_dim
         expected_q_rows = self.num_attention_heads * expected_q_head_dim
