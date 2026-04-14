@@ -704,16 +704,15 @@ class DeepseekV3MoE(nn.Module):
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    num_query_groups, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
     """
-    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    batch, num_query_groups, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
     hidden_states = hidden_states[:, :,
-                                  None, :, :].expand(batch,
-                                                     num_key_value_heads,
+                                  None, :, :].expand(batch, num_query_groups,
                                                      n_rep, slen, head_dim)
-    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen,
+    return hidden_states.reshape(batch, num_query_groups * n_rep, slen,
                                  head_dim)
 
 
@@ -749,20 +748,17 @@ class DeepseekV3Attention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = config.num_query_groups
+        self.num_query_groups = config.num_query_groups
 
         # Validate head configuration
-        if self.num_heads % self.num_key_value_heads != 0:
+        if self.num_heads % self.num_query_groups != 0:
             raise ValueError(
                 f'num_attention_heads ({self.num_heads}) must be divisible by '
-                f'num_key_value_heads ({self.num_key_value_heads})')
+                f'num_query_groups ({self.num_query_groups})')
 
         # GQA dimensions: head_dim = kv_channels = 128
         self.head_dim = config.kv_channels
         self.kv_channels = config.kv_channels
-
-        # For GQA: repeat factor from kv_heads to num_heads
-        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
@@ -777,13 +773,13 @@ class DeepseekV3Attention(nn.Module):
         # K projection: [in=hidden_size, out=num_kv_heads * head_dim] = [7168, 256]
         # Weight shape: [256, 7168] - maps to K part of Megatron's linear_qkv
         self.k_proj = nn.Linear(self.hidden_size,
-                                self.num_key_value_heads * self.head_dim,
+                                self.num_query_groups * self.head_dim,
                                 bias=config.attention_bias)
 
         # V projection: [in=hidden_size, out=num_kv_heads * head_dim] = [7168, 256]
         # Weight shape: [256, 7168] - maps to V part of Megatron's linear_qkv
         self.v_proj = nn.Linear(self.hidden_size,
-                                self.num_key_value_heads * self.head_dim,
+                                self.num_query_groups * self.head_dim,
                                 bias=config.attention_bias)
 
         # O projection: [in=num_heads * head_dim, out=hidden_size] = [8192, 7168]
@@ -885,12 +881,13 @@ class DeepseekV3Attention(nn.Module):
 
         # K: [b, s, 7168] -> [b, s, 256] -> [b, s, 2, 128]
         key_states = self.k_proj(hidden_states).view(bsz, q_len,
-                                                     self.num_key_value_heads,
+                                                     self.num_query_groups,
                                                      self.head_dim)
 
         # V: [b, s, 7168] -> [b, s, 256] -> [b, s, 2, 128]
-        value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len,
+                                                       self.num_query_groups,
+                                                       self.head_dim)
 
         # Apply q_layernorm and k_layernorm on head_dim
         if self.q_layernorm is not None:
@@ -998,10 +995,11 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                                                        self.num_heads,
                                                        self.head_dim)
         key_states = self.k_proj(hidden_states).view(bsz, q_len,
-                                                     self.num_key_value_heads,
+                                                     self.num_query_groups,
                                                      self.head_dim)
-        value_states = self.v_proj(hidden_states).view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = self.v_proj(hidden_states).view(bsz, q_len,
+                                                       self.num_query_groups,
+                                                       self.head_dim)
 
         # Apply layernorm on head_dim
         if self.q_layernorm is not None:
@@ -1111,9 +1109,9 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
             causal = self.is_causal and query_length != 1
 
         # Repeat K/V for GQA before flash attention
-        if self.num_key_value_groups > 1:
+        if self.num_query_groups > 1:
             batch_size, seq_len, num_kv_heads, head_dim = key_states.shape
-            n_rep = self.num_key_value_groups
+            n_rep = self.num_query_groups
             # [b, s, 2, 128] -> [b, s, 64, 128]
             key_states = key_states[:, :, :, None, :].expand(
                 batch_size, seq_len, num_kv_heads, n_rep,
@@ -1170,22 +1168,22 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
                     query_length):
         indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(
             attention_mask)
-        batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+        batch_size, kv_seq_len, num_query_groups, head_dim = key_layer.shape
 
         key_layer = index_first_axis(
-            key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads,
+            key_layer.reshape(batch_size * kv_seq_len, num_query_groups,
                               head_dim),
             indices_k,
         )
         value_layer = index_first_axis(
-            value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads,
+            value_layer.reshape(batch_size * kv_seq_len, num_query_groups,
                                 head_dim),
             indices_k,
         )
         if query_length == kv_seq_len:
             query_layer = index_first_axis(
-                query_layer.reshape(batch_size * kv_seq_len, self.num_heads,
-                                    head_dim),
+                query_layer.reshape(batch_size * kv_seq_len,
+                                    self.num_query_groups, head_dim),
                 indices_k,
             )
             cu_seqlens_q = cu_seqlens_k
