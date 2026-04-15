@@ -199,6 +199,10 @@ class CkptConvert:
             if k.startswith('model.layers.'):
                 layer_id = int(k.split('model.layers.')[1].split('.')[0])
                 self.layer_keys_map[layer_id].append(k)
+
+        # Detect MoE vs Dense layers from actual HF weight structure
+        self._detect_moe_structure()
+
         self.iter_path = _ensure_iter_path(self.mg_save_path)
 
         if self.vpp_stage is None:
@@ -389,6 +393,106 @@ class CkptConvert:
                 f'num_attention_heads ({self.num_attention_heads}) '
                 f'must be divisible by num_query_groups ({self.num_query_groups})')
 
+    def _detect_moe_structure(self) -> None:
+        """Detect MoE vs Dense layers from actual HF weight structure.
+
+        Inspects the HF weight_map to determine which layers have MoE
+        weights (mlp.gate.weight) vs Dense weights (mlp.gate_proj.weight),
+        and validates against first_k_dense_replace.
+
+        Raises:
+            ValueError: If the detected structure is inconsistent or
+                conflicts with first_k_dense_replace.
+        """
+        self.hf_dense_layers: list[int] = []
+        self.hf_moe_layers: list[int] = []
+        self.hf_unknown_layers: list[int] = []
+
+        if not self.weight_map:
+            return
+
+        for layer_id in sorted(set(
+                int(k.split('model.layers.')[1].split('.')[0])
+                for k in self.weight_map
+                if k.startswith('model.layers.'))):
+            has_moe_router = (f'model.layers.{layer_id}.mlp.gate.weight'
+                              in self.weight_map)
+            has_dense_gate = (f'model.layers.{layer_id}.mlp.gate_proj.weight'
+                              in self.weight_map)
+            if has_moe_router:
+                self.hf_moe_layers.append(layer_id)
+            elif has_dense_gate:
+                self.hf_dense_layers.append(layer_id)
+            else:
+                self.hf_unknown_layers.append(layer_id)
+
+        if self.verbose and self.print_init_summary:
+            logger.info(
+                'HF structure: dense_layers=%s moe_layers=%s unknown=%s',
+                self.hf_dense_layers[:20],
+                self.hf_moe_layers[:20],
+                self.hf_unknown_layers[:20],
+            )
+
+        # Validate against first_k_dense_replace
+        expected_dense = set(range(self.first_k_dense_replace))
+        actual_dense = set(self.hf_dense_layers)
+        actual_moe = set(self.hf_moe_layers)
+
+        if expected_dense != actual_dense and actual_moe:
+            # Check if the detected MoE layers match what we expect
+            expected_moe = set(range(self.first_k_dense_replace,
+                                     self.num_layers)) - set(
+                self.noop_layers_list)
+            wrong_dense = actual_moe & expected_dense
+            wrong_moe = actual_dense & expected_moe
+            if wrong_dense:
+                logger.warning(
+                    'HF layers %s are MoE but first_k_dense_replace=%d '
+                    'says they should be dense. Check --first-k-dense-replace.',
+                    sorted(wrong_dense), self.first_k_dense_replace)
+            if wrong_moe:
+                logger.warning(
+                    'HF layers %s are Dense but first_k_dense_replace=%d '
+                    'says they should be MoE. Check --first-k-dense-replace.',
+                    sorted(wrong_moe), self.first_k_dense_replace)
+
+        # Validate critical global weights
+        if 'model.embed_tokens.weight' not in self.weight_map:
+            raise KeyError(
+                'HF model missing model.embed_tokens.weight')
+        if not self.tie_word_embeddings:
+            if 'lm_head.weight' not in self.weight_map:
+                raise KeyError(
+                    'HF model missing lm_head.weight and '
+                    'tie_word_embeddings is not enabled')
+        if 'model.norm.weight' not in self.weight_map:
+            raise KeyError(
+                'HF model missing model.norm.weight (final layernorm)')
+
+    def _log_expected_param_summary(self) -> None:
+        """Log expected Megatron parameter names per (ep, tp) rank pair."""
+        num_dense = min(self.first_k_dense_replace, self.num_layers)
+        num_moe = self.num_layers - num_dense - len(self.noop_layers_list)
+
+        # Per-layer param counts
+        dense_params = 8  # input_layernorm, pre_mlp_layernorm, qkv, proj, q_ln, k_ln, fc1, fc2
+        # MoE layer: dense_params (8) + router.weight + router.expert_bias +
+        #            shared_fc1 + shared_fc2 + experts.weight1 + experts.weight2 = 12
+        moe_params = 12
+        if not self.moe_grouped_gemm:
+            # non-grouped gemm uses local_experts instead of weight1/weight2
+            moe_params = 8 + 2 * (self.num_experts // self.ep_size) + 4
+
+        expected = 1 + num_dense * dense_params + num_moe * moe_params + 2
+        # +1 for embedding, +2 for final_layernorm + output_layer
+
+        if self.verbose:
+            logger.info(
+                'Expected params per (ep,tp) rank: ~%d '
+                '(embedding=1, %d dense_layers*%d, %d moe_layers*%d, post=2)',
+                expected, num_dense, dense_params, num_moe, moe_params)
+
     def _read_weight_map(self) -> dict[str, str]:
         """Read weight map from HF model directory.
         
@@ -494,8 +598,9 @@ class CkptConvert:
             num_noop = len(self.noop_layers_list)
             num_real_layers = self.num_layers - num_noop
             real_layers = list(range(num_real_layers))
-            for vpp_rank in range(self.vpp_size):
-                for pp_rank in range(self.pp_size):
+            # Megatron 标准 VPP 采用 PP-first 分配：每个物理 PP rank 的 VPP stages 连续
+            for pp_rank in range(self.pp_size):
+                for vpp_rank in range(self.vpp_size):
                     self.vpprank_layer_idxs[pp_rank][vpp_rank] = [
                         real_layers.pop(0)
                         for _ in range(layers_each_vpp[pp_rank][vpp_rank])
@@ -863,7 +968,7 @@ class CkptConvert:
     ) -> None:
         """
         转换 MLP 层权重从 HF 格式到 MCore 格式。
-        
+
         支持两种模式:
         1. Dense MLP (前 first_k_dense_replace 层):
             - HF: gate_proj, up_proj (分离) -> MCore: linear_fc1 (融合)
@@ -882,7 +987,31 @@ class CkptConvert:
         """
         prefix = f'decoder.layers.{local_layer_idx}.mlp'
 
-        if hf_layer < self.first_k_dense_replace:
+        # Determine if this layer is Dense MLP or MoE based on actual
+        # weight structure.  first_k_dense_replace is the primary hint,
+        # but we also check the loaded weights to catch mismatches.
+        is_dense_layer = hf_layer < self.first_k_dense_replace
+        has_moe_key = f'model.layers.{hf_layer}.mlp.gate.weight' in weights
+        has_dense_key = f'model.layers.{hf_layer}.mlp.gate_proj.weight' in weights
+
+        if is_dense_layer and has_moe_key and not has_dense_key:
+            logger.warning(
+                'layer %d: first_k_dense_replace=%d says dense, '
+                'but HF model has MoE structure. Using MoE path.',
+                hf_layer, self.first_k_dense_replace)
+            is_dense_layer = False
+        elif not is_dense_layer and has_dense_key and not has_moe_key:
+            logger.warning(
+                'layer %d: first_k_dense_replace=%d says MoE, '
+                'but HF model has dense MLP structure. Using dense path.',
+                hf_layer, self.first_k_dense_replace)
+            is_dense_layer = True
+        elif not is_dense_layer and not has_moe_key and not has_dense_key:
+            raise KeyError(
+                f'layer {hf_layer}: neither MoE (mlp.gate.weight) nor '
+                f'dense (mlp.gate_proj.weight) keys found in HF weights')
+
+        if is_dense_layer:
             gate = weights.pop(f'model.layers.{hf_layer}.mlp.gate_proj.weight')
             up = weights.pop(f'model.layers.{hf_layer}.mlp.up_proj.weight')
             down = weights.pop(f'model.layers.{hf_layer}.mlp.down_proj.weight')
@@ -1240,6 +1369,7 @@ class CkptConvert:
                         int(pp_rank), int(total_tasks), dt, total_tasks / max(dt, 0.01))
 
     def run(self) -> None:
+        self._log_expected_param_summary()
         workers = int(self.pp_workers)
         if workers <= 1:
             for pp_rank in range(self.pp_size):

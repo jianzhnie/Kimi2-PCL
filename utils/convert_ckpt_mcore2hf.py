@@ -584,8 +584,9 @@ class MgCkptConvert:
                     layers_each_vpp[pp_idx][vpp_idx] -= 1
 
             real_layers = list(range(self.num_real_layers))
-            for vpp_rank in range(self.vpp_size):
-                for pp_rank in range(self.pp_size):
+            # Megatron 标准 VPP 采用 PP-first 分配：每个物理 PP rank 的 VPP stages 连续
+            for pp_rank in range(self.pp_size):
+                for vpp_rank in range(self.vpp_size):
                     self.vpprank_layer_idxs[pp_rank][vpp_rank] = [
                         real_layers.pop(0)
                         for _ in range(layers_each_vpp[pp_rank][vpp_rank])
