@@ -225,7 +225,7 @@ def test_pretrain_config_matches_1t_success(repo_root):
     """
     import pretrain_config
     script = os.path.join(repo_root, 'scripts', 'pretrain_kimi2_1t_4k.sh')
-    cfg_path = os.path.join(repo_root, 'models', 'config_1t.json')
+    cfg_path = os.path.join(repo_root, 'models', 'config.json')
 
     cfg = pretrain_config.parse_pretrain_script(script)
     with open(cfg_path) as f:
@@ -280,10 +280,8 @@ def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root, moe_gr
         '--vocab-size', str(p['vocab_size']),
         '--num-experts', str(p['num_experts']),
         '--num-attention-heads', str(p['num_attention_heads']),
-        '--num-key-value-heads', str(p['num_attention_heads'] // p['num_query_groups']),
+        '--num-query-groups', str(p['num_query_groups']),
         '--qk-head-dim', str(p['qk_head_dim']),
-        '--v-head-dim', str(p['v_head_dim']),
-        '--qk-pos-emb-head-dim', str(p['qk_pos_emb_head_dim']),
         '--rotary-base', str(p['rotary_base']),
         '--pp-workers', str(pp_workers),
         '--io-threads', '2',
@@ -310,6 +308,16 @@ def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root, moe_gr
         '--target-expert-parallel-size', str(p['ep_size']),
         '--schedules-method', 'dualpipev',
         '--pp-workers', str(pp_workers),
+        '--num-experts', str(p['num_experts']),
+        '--num-attention-heads', str(p['num_attention_heads']),
+        '--num-query-groups', str(p['num_query_groups']),
+        '--hidden-size', str(p['hidden_size']),
+        '--ffn-hidden-size', str(p['ffn_hidden']),
+        '--moe-ffn-hidden-size', str(p['moe_ffn_hidden']),
+        '--vocab-size', str(p['vocab_size']),
+        '--qk-head-dim', str(p['qk_head_dim']),
+        '--v-head-dim', str(p['v_head_dim']),
+        '--rotary-base', str(p['rotary_base']),
     ]
     if moe_grouped_gemm:
         cmd_h2m.append('--moe-grouped-gemm')

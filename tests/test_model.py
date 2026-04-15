@@ -23,29 +23,29 @@ def test_configuration():
     
     config = DeepseekV3Config()
     
-    # Verify key parameters
+    # Verify key parameters for GQA architecture
     assert config.vocab_size == 163840
     assert config.hidden_size == 7168
     assert config.num_hidden_layers == 32
-    assert config.qk_nope_head_dim == 128
-    assert config.qk_rope_head_dim == 64
-    assert config.v_head_dim == 128
+    assert config.num_attention_heads == 64
+    assert config.num_query_groups == 2
+    assert config.kv_channels == 128
     assert config.n_routed_experts == 128
     assert config.n_shared_experts == 1
     
     print(f"✓ vocab_size: {config.vocab_size}")
     print(f"✓ hidden_size: {config.hidden_size}")
     print(f"✓ num_hidden_layers: {config.num_hidden_layers}")
-    print(f"✓ qk_nope_head_dim: {config.qk_nope_head_dim}")
-    print(f"✓ qk_rope_head_dim: {config.qk_rope_head_dim}")
-    print(f"✓ v_head_dim: {config.v_head_dim}")
+    print(f"✓ num_attention_heads: {config.num_attention_heads}")
+    print(f"✓ num_query_groups: {config.num_query_groups}")
+    print(f"✓ kv_channels: {config.kv_channels}")
     print(f"✓ n_routed_experts: {config.n_routed_experts}")
     print(f"✓ n_shared_experts: {config.n_shared_experts}")
     print("All configuration tests passed!\n")
 
 
 def test_attention():
-    """Test Attention module with Decoupled Head Dimensions."""
+    """Test Attention module with GQA architecture."""
     print("=" * 60)
     print("2. Attention Module Test")
     print("=" * 60)
@@ -64,9 +64,7 @@ def test_attention():
         first_k_dense_replace=2,
         ep_size=1,
         qk_layernorm=True,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
+        kv_channels=32,  # hidden_size / num_attention_heads = 256 / 8 = 32
     )
     
     attn = DeepseekV3Attention(config, layer_idx=0)
@@ -83,14 +81,12 @@ def test_attention():
     print(f"✓ k_layernorm type: {type(attn.k_layernorm).__name__}")
     print(f"✓ k_layernorm.bias shape: {attn.k_layernorm.bias.shape}")
     
-    # Verify Decoupled Head Dimensions
-    assert attn.q_head_dim == 192  # 128 + 64
-    assert attn.k_head_dim == 192
-    assert attn.v_head_dim == 128
+    # Verify GQA dimensions: all Q/K/V use the same head_dim
+    assert attn.head_dim == 32
+    assert attn.num_key_value_groups == 4  # 8 / 2
     
-    print(f"✓ q_head_dim: {attn.q_head_dim} (128 nope + 64 rope)")
-    print(f"✓ k_head_dim: {attn.k_head_dim}")
-    print(f"✓ v_head_dim: {attn.v_head_dim}")
+    print(f"✓ head_dim: {attn.head_dim}")
+    print(f"✓ num_key_value_groups: {attn.num_key_value_groups}")
     
     # Test forward pass
     batch_size, seq_len = 2, 10
