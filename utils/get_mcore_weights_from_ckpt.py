@@ -921,9 +921,12 @@ class MCoreCheckpointReader:
             # 默认每个 VPP stage 包含的层数
             if self.parallel.dualpipe:
                 vpp_stage = max(1, self.model.num_layers // (self.parallel.pp_size * 2))
+            elif self.parallel.vpp_size:
+                layers_per_pp = self.model.num_layers // self.parallel.pp_size
+                vpp_stage = max(1, layers_per_pp // self.parallel.vpp_size)
             else:
-                # 标准 VPP: layers_per_pp // vpp_size，这里假设 vpp_size=2
-                vpp_stage = max(1, self.model.num_layers // (self.parallel.pp_size * 2))
+                # 无 VPP: 每个 PP stage 视为一个 VPP stage
+                vpp_stage = max(1, self.model.num_layers // self.parallel.pp_size)
 
         self._layer2loc = self.layer_mapper.build_mapping(
             self.model.num_layers, self.parallel.pp_size, vpp_stage
