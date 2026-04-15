@@ -23,17 +23,18 @@ from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Set, Callable
+from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple
 
 import torch
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s',
+                    level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 # =============================================================================
 # Data Classes
 # =============================================================================
+
 
 @dataclass(frozen=True)
 class TensorInfo:
@@ -41,7 +42,7 @@ class TensorInfo:
     shape: Tuple[int, ...]
     dtype: str
     requires_grad: bool
-    
+
     @property
     def size_bytes(self) -> int:
         """计算张量字节大小"""
@@ -59,7 +60,7 @@ class WeightInfo:
     dtype: str
     requires_grad: bool
     size_bytes: int
-    source: str = ""
+    source: str = ''
 
 
 @dataclass
@@ -82,10 +83,11 @@ class ParallelConfig:
     vpp_size: Optional[int] = None
     vpp_stage: Optional[int] = None
     schedules_method: Optional[str] = None
-    
+
     @property
     def dualpipe(self) -> bool:
-        return self.schedules_method is not None and 'dualpipe' in self.schedules_method.lower()
+        return self.schedules_method is not None and 'dualpipe' in self.schedules_method.lower(
+        )
 
 
 @dataclass
@@ -101,12 +103,13 @@ class ModelConfig:
     moe_ffn_hidden_size: int = 12288
     first_k_dense_replace: int = 2
     vocab_size: int = 163840
-    
+
     @property
     def qkv_dim(self) -> int:
         """QKV 总维度"""
-        return (self.num_attention_heads + 2 * self.num_query_groups) * self.kv_channels
-    
+        return (self.num_attention_heads +
+                2 * self.num_query_groups) * self.kv_channels
+
     @property
     def attention_proj_dim(self) -> int:
         """Attention 输出投影维度"""
@@ -117,7 +120,9 @@ class ModelConfig:
 # Utility Functions
 # =============================================================================
 
-def _mp_prefix(tp_rank: int, pp_rank: int, ep_rank: int, tp: int, pp: int, ep: int) -> str:
+
+def _mp_prefix(tp_rank: int, pp_rank: int, ep_rank: int, tp: int, pp: int,
+               ep: int) -> str:
     """生成 mp_rank 目录前缀"""
     if ep == 1 and pp == 1:
         return f'mp_rank_{tp_rank:02}'
@@ -137,7 +142,8 @@ def _resolve_iter_dir(load_dir: str) -> str:
         try:
             it_num = int(it)
         except ValueError as e:
-            raise ValueError(f"latest_checkpointed_iteration.txt 内容无效: '{it}'") from e
+            raise ValueError(
+                f"latest_checkpointed_iteration.txt 内容无效: '{it}'") from e
         latest_dir = os.path.join(load_dir, f'iter_{it_num:07d}')
         if os.path.isdir(latest_dir):
             return latest_dir
@@ -152,8 +158,7 @@ def _resolve_iter_dir(load_dir: str) -> str:
 
     raise FileNotFoundError(
         f'无法定位迭代目录: {load_dir}\n'
-        f'请确保目录包含 latest_checkpointed_iteration.txt 或 iter_XXXXXXX 子目录'
-    )
+        f'请确保目录包含 latest_checkpointed_iteration.txt 或 iter_XXXXXXX 子目录')
 
 
 def _torch_load_compat(path: str, disable_mmap: bool = False) -> dict:
@@ -168,9 +173,17 @@ def _torch_load_compat(path: str, disable_mmap: bool = False) -> dict:
     support_mmap = bool(sig and 'mmap' in sig.parameters and not disable_mmap)
 
     candidates: List[dict] = [
-        {**base, 'weights_only': True, 'mmap': True} if support_weights_only and support_mmap else base,
-        {**base, 'weights_only': False, 'mmap': True} if support_mmap else base,
-        {**base, 'weights_only': False} if support_weights_only else base,
+        {
+            **base, 'weights_only': True,
+            'mmap': True
+        } if support_weights_only and support_mmap else base,
+        {
+            **base, 'weights_only': False,
+            'mmap': True
+        } if support_mmap else base,
+        {
+            **base, 'weights_only': False
+        } if support_weights_only else base,
         base,
     ]
 
@@ -207,7 +220,8 @@ def _dtype_to_elem_size(dtype: str) -> int:
         return 8
     if any(x in dtype_lower for x in ['float32', 'fp32', 'int32']):
         return 4
-    if any(x in dtype_lower for x in ['float16', 'fp16', 'bfloat16', 'bf16', 'int16']):
+    if any(x in dtype_lower
+           for x in ['float16', 'fp16', 'bfloat16', 'bf16', 'int16']):
         return 2
     if any(x in dtype_lower for x in ['int8', 'uint8']):
         return 1
@@ -227,7 +241,8 @@ def _natural_sort_key(name: str) -> Tuple:
     layer_match = re.search(r'layers\.(\d+)', name)
     if layer_match:
         layer_num = int(layer_match.group(1))
-        suffix = name.split('layers.')[1].split('.', 1)[1] if '.' in name.split('layers.')[1] else ''
+        suffix = name.split('layers.')[1].split(
+            '.', 1)[1] if '.' in name.split('layers.')[1] else ''
         return (1, layer_num, suffix)
     if 'embedding' in name:
         return (0, 0, name)
@@ -242,21 +257,22 @@ def _natural_sort_key(name: str) -> Tuple:
 # Checkpoint Cache
 # =============================================================================
 
+
 class CheckpointCache:
     """LRU 风格的 Checkpoint 文件缓存"""
-    
+
     def __init__(self, max_size: int = 8):
         self._cache: Dict[str, dict] = {}
         self._access_order: List[str] = []
         self._max_size = max_size
-    
+
     def get(self, path: str) -> Optional[dict]:
         if path not in self._cache:
             return None
         self._access_order.remove(path)
         self._access_order.append(path)
         return self._cache[path]
-    
+
     def put(self, path: str, state: dict) -> None:
         if path in self._cache:
             # 更新访问顺序，将当前 path 移到最新
@@ -274,11 +290,13 @@ class CheckpointCache:
 # Layer Mapping Strategy
 # =============================================================================
 
+
 class LayerMapper(ABC):
     """Layer 映射抽象基类"""
-    
+
     @abstractmethod
-    def build_mapping(self, num_layers: int, pp_size: int, vpp_stage: int) -> Dict[int, Tuple[int, int, int]]:
+    def build_mapping(self, num_layers: int, pp_size: int,
+                      vpp_stage: int) -> Dict[int, Tuple[int, int, int]]:
         """
         构建 layer 到 (pp_rank, vpp_rank, local_idx) 的映射
         返回: {global_layer_id: (pp_rank, vpp_rank, local_idx)}
@@ -289,16 +307,20 @@ class LayerMapper(ABC):
 class StandardVppMapper(LayerMapper):
     """标准 VPP Layer 映射"""
 
-    def build_mapping(self, num_layers: int, pp_size: int, vpp_stage: int) -> Dict[int, Tuple[int, int, int]]:
+    def build_mapping(self, num_layers: int, pp_size: int,
+                      vpp_stage: int) -> Dict[int, Tuple[int, int, int]]:
         layers_per_vpp = vpp_stage
         layers_per_pp = num_layers // pp_size
         num_vpp_stages = layers_per_pp // layers_per_vpp
 
         # 验证层数可被正确划分
         if num_layers % pp_size != 0:
-            raise ValueError(f"num_layers({num_layers}) 必须能被 pp_size({pp_size}) 整除")
+            raise ValueError(
+                f"num_layers({num_layers}) 必须能被 pp_size({pp_size}) 整除")
         if layers_per_pp % layers_per_vpp != 0:
-            raise ValueError(f"layers_per_pp({layers_per_pp}) 必须能被 vpp_stage({vpp_stage}) 整除")
+            raise ValueError(
+                f"layers_per_pp({layers_per_pp}) 必须能被 vpp_stage({vpp_stage}) 整除"
+            )
 
         mapping = {}
         for pp_rank in range(pp_size):
@@ -313,7 +335,8 @@ class StandardVppMapper(LayerMapper):
 class DualPipeMapper(LayerMapper):
     """DualPipe Layer 映射"""
 
-    def build_mapping(self, num_layers: int, pp_size: int, vpp_stage: int) -> Dict[int, Tuple[int, int, int]]:
+    def build_mapping(self, num_layers: int, pp_size: int,
+                      vpp_stage: int) -> Dict[int, Tuple[int, int, int]]:
         # DualPipe 要求层数能被 pp_size * 2 整除
         if num_layers % (pp_size * 2) != 0:
             raise ValueError(
@@ -349,7 +372,7 @@ class DualPipeMapper(LayerMapper):
 
 class LayerMapperFactory:
     """Layer Mapper 工厂"""
-    
+
     @staticmethod
     def create(dualpipe: bool) -> LayerMapper:
         return DualPipeMapper() if dualpipe else StandardVppMapper()
@@ -359,31 +382,34 @@ class LayerMapperFactory:
 # Parallel Strategy
 # =============================================================================
 
+
 class ParallelStrategy(ABC):
     """并行切分策略抽象基类"""
-    
+
     @abstractmethod
     def get_tp_parallel_dim(self, name: str) -> Optional[int]:
         """返回 TP 切分维度 (0=row-wise, 1=column-wise, None=不切分)"""
         pass
-    
+
     @abstractmethod
     def is_ep_sharded(self, name: str) -> bool:
         """判断是否在 EP 维度切分"""
         pass
-    
+
     @abstractmethod
-    def get_expected_shape(self, name: str, config: ModelConfig) -> Optional[Tuple[int, ...]]:
+    def get_expected_shape(self, name: str,
+                           config: ModelConfig) -> Optional[Tuple[int, ...]]:
         """获取期望的权重 shape"""
         pass
 
 
 class MoeParallelStrategy(ParallelStrategy):
     """MoE 模型的并行切分策略"""
-    
+
     # 预编译正则模式以提高性能
     PATTERNS = {
-        'expert_weights': re.compile(r'\.experts\.(?:weight[12]|local_experts)'),
+        'expert_weights':
+        re.compile(r'\.experts\.(?:weight[12]|local_experts)'),
         'shared_experts_fc1': re.compile(r'shared_experts\.linear_fc1'),
         'shared_experts_fc2': re.compile(r'shared_experts\.linear_fc2'),
         'embedding': re.compile(r'(?:embedding\.)?word_embeddings\.weight'),
@@ -396,7 +422,7 @@ class MoeParallelStrategy(ParallelStrategy):
         'router': re.compile(r'router\.(?:weight|expert_bias|score_bias)'),
         'qk_norm': re.compile(r'[qk]_layernorm'),
     }
-    
+
     def get_tp_parallel_dim(self, name: str) -> Optional[int]:
         """确定权重在哪个维度上进行张量并行切分
 
@@ -421,7 +447,8 @@ class MoeParallelStrategy(ParallelStrategy):
         # embedding: [vocab_size, hidden_size] -> 切分 vocab_size (dim=0)
         # qkv: [qkv_dim, hidden_size] -> 切分 qkv_dim (dim=0)
         # linear_fc1: [ffn_hidden_size, hidden_size] -> 切分 ffn_hidden_size (dim=0)
-        if any(self.PATTERNS[p].search(name) for p in ['embedding', 'output', 'qkv']):
+        if any(self.PATTERNS[p].search(name)
+               for p in ['embedding', 'output', 'qkv']):
             return 0
         if 'mlp.linear_fc1' in name and 'shared_experts' not in name:
             return 0
@@ -441,7 +468,7 @@ class MoeParallelStrategy(ParallelStrategy):
             return None
 
         return None
-    
+
     def is_ep_sharded(self, name: str) -> bool:
         """判断权重是否在 EP 维度上切分"""
         # grouped_gemm 格式的 experts
@@ -451,52 +478,58 @@ class MoeParallelStrategy(ParallelStrategy):
         if '.local_experts.' in name:
             return True
         return False
-    
-    def get_expected_shape(self, name: str, config: ModelConfig) -> Optional[Tuple[int, ...]]:
+
+    def get_expected_shape(self, name: str,
+                           config: ModelConfig) -> Optional[Tuple[int, ...]]:
         """根据模型配置计算期望的 shape"""
         h = config.hidden_size
 
         # Embedding / Output
-        if self.PATTERNS['embedding'].search(name) or self.PATTERNS['output'].search(name):
+        if self.PATTERNS['embedding'].search(
+                name) or self.PATTERNS['output'].search(name):
             return (config.vocab_size, h)
 
         # Q/K Layernorm (MLA)
         if self.PATTERNS['qk_norm'].search(name):
-            return (config.kv_channels,)
+            return (config.kv_channels, )
 
         # LayerNorm
         if self.PATTERNS['layernorm'].search(name):
-            return (h,)
+            return (h, )
 
         # Attention QKV
         if 'self_attention.linear_qkv.weight' in name:
             return (config.qkv_dim, h)
         if 'self_attention.linear_qkv.bias' in name:
-            return (config.qkv_dim,)
+            return (config.qkv_dim, )
 
         # Attention projection
         if 'self_attention.linear_proj.weight' in name:
             return (h, config.attention_proj_dim)
 
         # Dense MLP (first_k_dense_replace layers)
+        # 注意: linear_fc1 在 SwiGLU 下是 gate_proj + up_proj 的拼接，dim=0 是 2*ffn_hidden_size
         if self.PATTERNS['dense_mlp_fc1'].search(name):
-            return (config.ffn_hidden_size, h)
+            return (config.ffn_hidden_size * 2, h)
         if self.PATTERNS['dense_mlp_fc2'].search(name):
             return (h, config.ffn_hidden_size)
 
         # Shared experts
-        if self.PATTERNS['shared_experts_fc1'].search(name) and '.weight' in name:
-            return (config.moe_ffn_hidden_size, h)
-        if self.PATTERNS['shared_experts_fc2'].search(name) and '.weight' in name:
+        # 注意: shared_experts 的 linear_fc1 同样在 SwiGLU 下是 2*moe_ffn_hidden_size
+        if self.PATTERNS['shared_experts_fc1'].search(
+                name) and '.weight' in name:
+            return (config.moe_ffn_hidden_size * 2, h)
+        if self.PATTERNS['shared_experts_fc2'].search(
+                name) and '.weight' in name:
             return (h, config.moe_ffn_hidden_size)
 
         # Router
         if 'router.weight' in name:
             return (config.num_experts, h)
         if 'router.expert_bias' in name:
-            return (config.num_experts,)
+            return (config.num_experts, )
         if 'router.score_bias' in name:
-            return (config.num_experts,)
+            return (config.num_experts, )
 
         # Experts (grouped_gemm 格式)
         # weight1: [hidden_size, num_experts * ffn_hidden_size * 2] (gated activation)
@@ -518,55 +551,60 @@ class MoeParallelStrategy(ParallelStrategy):
 # Shape Merger
 # =============================================================================
 
+
 class ShapeMerger:
     """形状合并器"""
-    
+
     def __init__(self, strategy: ParallelStrategy):
         self.strategy = strategy
-    
-    def merge_tp_shapes(self, name: str, tp_shapes: List[Tuple[int, ...]], 
+
+    def merge_tp_shapes(self,
+                        name: str,
+                        tp_shapes: List[Tuple[int, ...]],
                         debug: bool = False) -> Tuple[int, ...]:
         """合并所有 TP rank 的形状"""
         if not tp_shapes or len(tp_shapes) == 1:
             return tp_shapes[0] if tp_shapes else ()
-        
+
         parallel_dim = self.strategy.get_tp_parallel_dim(name)
         if parallel_dim is None:
             return tp_shapes[0]
-        
+
         base_shape = list(tp_shapes[0])
         base_shape[parallel_dim] = sum(s[parallel_dim] for s in tp_shapes)
-        
+
         if debug:
-            logger.info('  TP merge %s: dim=%d, shapes=%s -> %s',
-                       name, parallel_dim, tp_shapes, tuple(base_shape))
-        
+            logger.info('  TP merge %s: dim=%d, shapes=%s -> %s', name,
+                        parallel_dim, tp_shapes, tuple(base_shape))
+
         return tuple(base_shape)
-    
-    def merge_ep_shapes(self, name: str, ep_shapes: List[Tuple[int, ...]]) -> Tuple[int, ...]:
+
+    def merge_ep_shapes(self, name: str,
+                        ep_shapes: List[Tuple[int, ...]]) -> Tuple[int, ...]:
         """合并所有 EP rank 的形状"""
         if not ep_shapes or len(ep_shapes) == 1:
             return ep_shapes[0] if ep_shapes else ()
-        
+
         # grouped_gemm 格式的 experts.weight1
         if '.experts.weight1' in name:
             base_shape = list(ep_shapes[0])
             base_shape[1] = sum(s[1] for s in ep_shapes)
             return tuple(base_shape)
-        
+
         # grouped_gemm 格式的 experts.weight2
         if '.experts.weight2' in name:
             base_shape = list(ep_shapes[0])
             base_shape[0] = sum(s[0] for s in ep_shapes)
             return tuple(base_shape)
-        
+
         return ep_shapes[0]
-    
-    def merge(self, name: str, tp_ep_shapes: Dict[Tuple[int, int], Tuple[int, ...]],
+
+    def merge(self, name: str, tp_ep_shapes: Dict[Tuple[int, int], Tuple[int,
+                                                                         ...]],
               is_ep_sharded: bool) -> Tuple[int, ...]:
         """
         合并所有 TP/EP rank 的形状
-        
+
         Args:
             name: 权重名称
             tp_ep_shapes: {(tp_rank, ep_rank): shape}
@@ -574,22 +612,26 @@ class ShapeMerger:
         """
         if not tp_ep_shapes:
             return ()
-        
+
         if is_ep_sharded:
             # EP sharded 权重 (如 experts): 按 EP 分组，组内合并 TP，然后跨 EP 合并
-            ep_groups: Dict[int, List[Tuple[int, Tuple[int, ...]]]] = defaultdict(list)
+            ep_groups: Dict[int, List[Tuple[int,
+                                            Tuple[int,
+                                                  ...]]]] = defaultdict(list)
             for (tp_rank, ep_rank), shape in tp_ep_shapes.items():
                 ep_groups[ep_rank].append((tp_rank, shape))
-            
+
             # 在每个 EP 组内合并 TP shapes
             ep_merged: Dict[int, Tuple[int, ...]] = {}
             for ep_rank, tp_list in ep_groups.items():
                 tp_shapes = [s for _, s in sorted(tp_list)]
                 ep_merged[ep_rank] = self.merge_tp_shapes(name, tp_shapes)
-            
+
             # 跨 EP 合并
             if len(ep_merged) > 1:
-                sorted_shapes = [ep_merged[ep] for ep in sorted(ep_merged.keys())]
+                sorted_shapes = [
+                    ep_merged[ep] for ep in sorted(ep_merged.keys())
+                ]
                 return self.merge_ep_shapes(name, sorted_shapes)
             else:
                 return list(ep_merged.values())[0]
@@ -597,16 +639,22 @@ class ShapeMerger:
             # 非 EP sharded 权重 (如 embedding, shared_experts, layernorm 等):
             # 直接按 TP rank 合并所有 shapes，忽略 EP 差异
             # 在这种格式中，TP=0 存在偶数 EP，TP=1 存在奇数 EP
-            tp_shapes_dict: Dict[int, List[Tuple[int, ...]]] = defaultdict(list)
+            tp_shapes_dict: Dict[int, List[Tuple[int,
+                                                 ...]]] = defaultdict(list)
             for (tp_rank, ep_rank), shape in tp_ep_shapes.items():
                 tp_shapes_dict[tp_rank].append(shape)
-            
+
             # 调试输出
-            if logger.isEnabledFor(logging.DEBUG) and ('embedding' in name or 'layers.0.self_attention' in name):
-                logger.debug("    merge (非EP): tp_shapes_dict keys=%s, shapes=%s", 
-                            sorted(tp_shapes_dict.keys()), 
-                            [tp_shapes_dict[tp][0] for tp in sorted(tp_shapes_dict.keys())])
-            
+            if logger.isEnabledFor(
+                    logging.DEBUG) and ('embedding' in name
+                                        or 'layers.0.self_attention' in name):
+                logger.debug(
+                    '    merge (非EP): tp_shapes_dict keys=%s, shapes=%s',
+                    sorted(tp_shapes_dict.keys()), [
+                        tp_shapes_dict[tp][0]
+                        for tp in sorted(tp_shapes_dict.keys())
+                    ])
+
             # 每个 TP rank 应该只有一个 shape（从任意一个 EP 加载即可，它们都相同）
             merged_by_tp: Dict[int, Tuple[int, ...]] = {}
             for tp_rank, shapes in tp_shapes_dict.items():
@@ -620,14 +668,18 @@ class ShapeMerger:
                                 f"EP 副本 0: {first_shape} vs EP 副本 {i}: {shape}"
                             )
                 merged_by_tp[tp_rank] = shapes[0]
-            
+
             # 按 TP rank 排序并合并
-            sorted_shapes = [merged_by_tp[tp] for tp in sorted(merged_by_tp.keys())]
+            sorted_shapes = [
+                merged_by_tp[tp] for tp in sorted(merged_by_tp.keys())
+            ]
             merged = self.merge_tp_shapes(name, sorted_shapes)
-            
-            if logger.isEnabledFor(logging.DEBUG) and ('embedding' in name or 'layers.0.self_attention' in name):
-                logger.debug("    merge result: %s", merged)
-            
+
+            if logger.isEnabledFor(
+                    logging.DEBUG) and ('embedding' in name
+                                        or 'layers.0.self_attention' in name):
+                logger.debug('    merge result: %s', merged)
+
             return merged
 
 
@@ -635,22 +687,28 @@ class ShapeMerger:
 # Checkpoint Reader
 # =============================================================================
 
+
 class CheckpointLoader:
     """Checkpoint 加载器"""
-    
-    def __init__(self, iter_dir: str, parallel: ParallelConfig, 
-                 cache: CheckpointCache, disable_mmap: bool = False):
+
+    def __init__(self,
+                 iter_dir: str,
+                 parallel: ParallelConfig,
+                 cache: CheckpointCache,
+                 disable_mmap: bool = False):
         self.iter_dir = iter_dir
         self.parallel = parallel
         self.cache = cache
         self.disable_mmap = disable_mmap
         self._rank_dir_map: Dict[Tuple[int, int], List[int]] = {}
-    
+
     def build_rank_map(self) -> None:
         """构建 rank 目录映射"""
-        mp_dirs = [d for d in os.listdir(self.iter_dir) if d.startswith('mp_rank_')]
+        mp_dirs = [
+            d for d in os.listdir(self.iter_dir) if d.startswith('mp_rank_')
+        ]
         rank_map: Dict[Tuple[int, int], Set[int]] = defaultdict(set)
-        
+
         for d in mp_dirs:
             parts = d.split('_')
             if len(parts) < 3:
@@ -659,25 +717,26 @@ class CheckpointLoader:
                 tp = int(parts[2])
             except ValueError:
                 continue
-            
+
             idxs = []
             for p in parts[3:]:
                 try:
                     idxs.append(int(p))
                 except ValueError:
                     idxs.append(None)
-            
+
             pp, ep = self._parse_pp_ep(idxs)
             rank_map[(tp, pp)].add(ep)
-        
+
         self._rank_dir_map = {k: sorted(list(v)) for k, v in rank_map.items()}
-        
+
         # 验证完整性
         expected = self.parallel.tp_size * self.parallel.pp_size
         actual = len(self._rank_dir_map)
         if actual < expected:
-            logger.warning('Rank map incomplete: %d/%d entries', actual, expected)
-    
+            logger.warning('Rank map incomplete: %d/%d entries', actual,
+                           expected)
+
     def _parse_pp_ep(self, idxs: List) -> Tuple[int, int]:
         """解析 PP 和 EP 索引"""
         if not idxs or idxs[0] is None:
@@ -695,34 +754,32 @@ class CheckpointLoader:
             # 但这里我们无法确定，抛出错误让用户检查
             raise ValueError(
                 f"无法从单索引 {v} 推断 PP/EP 位置 (PP={self.parallel.pp_size}, EP={self.parallel.ep_size}). "
-                f"请检查 mp_rank 目录命名格式是否为 mp_rank_XX_PP_EEE"
-            )
+                f"请检查 mp_rank 目录命名格式是否为 mp_rank_XX_PP_EEE")
         elif self.parallel.pp_size > 1:
             return v, 0
         elif self.parallel.ep_size > 1:
             return 0, v
         else:
             return 0, 0
-    
-    def get_ckpt_path(self, tp_rank: int, pp_rank: int, 
+
+    def get_ckpt_path(self, tp_rank: int, pp_rank: int,
                       ep_rank: Optional[int]) -> str:
         """获取 checkpoint 文件路径"""
         candidates = self._build_candidates(tp_rank, pp_rank, ep_rank)
-        
+
         for p in candidates:
             path = os.path.join(self.iter_dir, p, 'model_optim_rng.pt')
             if os.path.isfile(path):
                 return path
-        
+
         raise FileNotFoundError(
-            f'无法定位 rank 文件: tp={tp_rank}, pp={pp_rank}, ep={ep_rank}'
-        )
-    
-    def _build_candidates(self, tp_rank: int, pp_rank: int, 
+            f'无法定位 rank 文件: tp={tp_rank}, pp={pp_rank}, ep={ep_rank}')
+
+    def _build_candidates(self, tp_rank: int, pp_rank: int,
                           ep_rank: Optional[int]) -> List[str]:
         """构建候选路径列表"""
         tp, pp, ep = self.parallel.tp_size, self.parallel.pp_size, self.parallel.ep_size
-        
+
         if ep_rank is not None:
             return [
                 _mp_prefix(tp_rank, pp_rank, ep_rank, tp, pp, ep),
@@ -737,8 +794,11 @@ class CheckpointLoader:
                 f'mp_rank_{tp_rank:02}_{pp_rank:03}',
                 f'mp_rank_{tp_rank:02}',
             ]
-    
-    def load(self, tp_rank: int, pp_rank: int, ep_rank: Optional[int],
+
+    def load(self,
+             tp_rank: int,
+             pp_rank: int,
+             ep_rank: Optional[int],
              vpp_rank: Optional[int] = None) -> Dict[str, torch.Tensor]:
         """加载指定 rank 的 state"""
         path = self.get_ckpt_path(tp_rank, pp_rank, ep_rank)
@@ -771,38 +831,42 @@ class CheckpointLoader:
 
         # 如果以上都不匹配，返回整个 state（可能是扁平结构）
         return state
-    
-    def load_stage(self, pp_rank: int, vpp_rank: Optional[int], 
-                   io_threads: int) -> Dict[Tuple[int, int], Dict[str, torch.Tensor]]:
+
+    def load_stage(
+            self, pp_rank: int, vpp_rank: Optional[int],
+            io_threads: int) -> Dict[Tuple[int, int], Dict[str, torch.Tensor]]:
         """加载指定 stage 的所有 TP/EP rank"""
         models: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
-        
+
         # 收集需要加载的 ranks
         ranks_to_load: List[Tuple[int, int]] = []
         for tp_rank in range(self.parallel.tp_size):
             ep_ranks = self._rank_dir_map.get((tp_rank, pp_rank), [0])
             for ep_rank in ep_ranks:
                 ranks_to_load.append((tp_rank, ep_rank))
-        
+
         def load_one(tp: int, ep: int) -> Optional[Tuple[int, int, Dict]]:
             try:
                 return (tp, ep, self.load(tp, pp_rank, ep, vpp_rank))
-            except FileNotFoundError:
+            except (FileNotFoundError, RuntimeError):
                 return None
-        
+
         if io_threads <= 1 or len(ranks_to_load) <= 1:
             for tp, ep in ranks_to_load:
                 result = load_one(tp, ep)
                 if result:
                     models[(result[0], result[1])] = result[2]
         else:
-            with ThreadPoolExecutor(max_workers=min(io_threads, len(ranks_to_load))) as ex:
-                futures = [ex.submit(load_one, tp, ep) for tp, ep in ranks_to_load]
+            with ThreadPoolExecutor(
+                    max_workers=min(io_threads, len(ranks_to_load))) as ex:
+                futures = [
+                    ex.submit(load_one, tp, ep) for tp, ep in ranks_to_load
+                ]
                 for fut in as_completed(futures):
                     result = fut.result()
                     if result:
                         models[(result[0], result[1])] = result[2]
-        
+
         return models
 
 
@@ -810,13 +874,14 @@ class CheckpointLoader:
 # Main Reader Class
 # =============================================================================
 
+
 class MCoreCheckpointReader:
     """
     MCore Checkpoint 读取器
-    
+
     读取权重信息并保存为 JSON（输出格式与 model_param_mapping.json 对齐）
     """
-    
+
     def __init__(
         self,
         mcore_dir: str,
@@ -843,7 +908,7 @@ class MCoreCheckpointReader:
         self.verbose = verbose
         self.mcore_dir = mcore_dir
         self.iter_dir = _resolve_iter_dir(mcore_dir)
-        
+
         # 配置
         self.parallel = ParallelConfig(
             tp_size=tp_size,
@@ -864,54 +929,65 @@ class MCoreCheckpointReader:
             first_k_dense_replace=first_k_dense_replace,
             vocab_size=vocab_size or 163840,
         )
-        
+
         # 其他配置
         self.io_threads = max(1, io_threads)
         self.disable_mmap = disable_mmap
         self.validate_shapes = validate_shapes
-        
+
         # 组件
         self.cache = CheckpointCache(max_size=max(4, tp_size * 2))
         self.strategy = MoeParallelStrategy()
         self.merger = ShapeMerger(self.strategy)
-        self.loader = CheckpointLoader(self.iter_dir, self.parallel, self.cache, disable_mmap)
-        
+        self.loader = CheckpointLoader(self.iter_dir, self.parallel,
+                                       self.cache, disable_mmap)
+
         # 状态
         self.layer_mapper: Optional[LayerMapper] = None
         self._layer2loc: Dict[int, Tuple[int, int, int]] = {}
-    
+
     def _validate(self) -> None:
         """验证参数合法性"""
         if not os.path.isdir(self.mcore_dir):
             raise FileNotFoundError(f'加载目录不存在: {self.mcore_dir}')
         if self.parallel.tp_size <= 0 or self.parallel.pp_size <= 0 or self.parallel.ep_size <= 0:
             raise ValueError('并行度必须 > 0')
-    
+
     def _detect_vpp(self) -> Tuple[Optional[int], List[str]]:
         """检测 VPP 配置"""
         try:
             # 尝试加载第一个可用的 checkpoint
             for tp in range(self.parallel.tp_size):
                 for pp in range(self.parallel.pp_size):
-                    try:
-                        path = self.loader.get_ckpt_path(tp, pp, 0 if self.parallel.ep_size > 1 else None)
-                        state = _torch_load_compat(path, self.disable_mmap)
-                        # 检查 state 结构
-                        if 'state_dict' in state:
-                            state = state['state_dict']
-                        elif 'model' in state:
-                            state = state['model']
-                        # 查找 model{N} 格式的 key
-                        model_keys = [k for k in state.keys() if re.match(r'^model\d+$', k)]
-                        if len(model_keys) > 1:
-                            return len(model_keys), model_keys
-                        return None, []
-                    except FileNotFoundError:
+                    # EP>1 时，优先使用实际存在的 ep_rank，避免硬编码 ep=0
+                    ep_ranks = self.loader._rank_dir_map.get((tp, pp), [])
+                    if self.parallel.ep_size > 1 and not ep_ranks:
                         continue
+                    ep_candidates = ep_ranks if ep_ranks else (
+                        [0] if self.parallel.ep_size > 1 else [None])
+                    for ep in ep_candidates:
+                        try:
+                            path = self.loader.get_ckpt_path(tp, pp, ep)
+                            state = _torch_load_compat(path, self.disable_mmap)
+                            # 检查 state 结构
+                            if 'state_dict' in state:
+                                state = state['state_dict']
+                            elif 'model' in state:
+                                state = state['model']
+                            # 查找 model{N} 格式的 key
+                            model_keys = [
+                                k for k in state.keys()
+                                if re.match(r'^model\d+$', k)
+                            ]
+                            if len(model_keys) > 1:
+                                return len(model_keys), model_keys
+                            return None, []
+                        except FileNotFoundError:
+                            continue
         except Exception as e:
             logger.debug(f"VPP 检测失败: {e}")
         return None, []
-    
+
     def _build_layer_mapping(self) -> None:
         """构建 layer 映射"""
         self.layer_mapper = LayerMapperFactory.create(self.parallel.dualpipe)
@@ -920,22 +996,24 @@ class MCoreCheckpointReader:
         if vpp_stage is None:
             # 默认每个 VPP stage 包含的层数
             if self.parallel.dualpipe:
-                vpp_stage = max(1, self.model.num_layers // (self.parallel.pp_size * 2))
+                vpp_stage = max(
+                    1, self.model.num_layers // (self.parallel.pp_size * 2))
             elif self.parallel.vpp_size:
                 layers_per_pp = self.model.num_layers // self.parallel.pp_size
                 vpp_stage = max(1, layers_per_pp // self.parallel.vpp_size)
             else:
                 # 无 VPP: 每个 PP stage 视为一个 VPP stage
-                vpp_stage = max(1, self.model.num_layers // self.parallel.pp_size)
+                vpp_stage = max(1,
+                                self.model.num_layers // self.parallel.pp_size)
 
         self._layer2loc = self.layer_mapper.build_mapping(
-            self.model.num_layers, self.parallel.pp_size, vpp_stage
-        )
+            self.model.num_layers, self.parallel.pp_size, vpp_stage)
 
         if self.verbose:
-            logger.info('Layer mapping built: dualpipe=%s, vpp_stage=%d, total_mappings=%d',
-                       self.parallel.dualpipe, vpp_stage, len(self._layer2loc))
-    
+            logger.info(
+                'Layer mapping built: dualpipe=%s, vpp_stage=%d, total_mappings=%d',
+                self.parallel.dualpipe, vpp_stage, len(self._layer2loc))
+
     def _get_global_layer_id(self, local_idx: int, pp_rank: int,
                              vpp_rank: Optional[int]) -> int:
         """获取全局 layer id"""
@@ -946,24 +1024,21 @@ class MCoreCheckpointReader:
             return pp_rank * layers_per_pp + local_idx
 
         # 有 VPP 时，通过映射表查找
-        for global_id, (p, v, l) in self._layer2loc.items():
-            if p == pp_rank and v == vpp_rank and l == local_idx:
+        for global_id, (p, v, li) in self._layer2loc.items():
+            if p == pp_rank and v == vpp_rank and li == local_idx:
                 return global_id
 
         # 找不到时，使用启发式计算（更安全的 fallback）
         logger.warning(
             f"未找到 layer 映射: pp={pp_rank}, vpp={vpp_rank}, local={local_idx}, "
-            f"使用启发式计算"
-        )
+            f"使用启发式计算")
         # 启发式：pp_rank * layers_per_pp + vpp_rank * vpp_stage + local_idx
         fallback_id = pp_rank * layers_per_pp + vpp_rank * self.parallel.vpp_stage + local_idx
         if fallback_id >= self.model.num_layers:
-            raise ValueError(
-                f"计算的全局 layer id ({fallback_id}) 超出范围 "
-                f"[0, {self.model.num_layers}), 请检查 VPP 配置"
-            )
+            raise ValueError(f"计算的全局 layer id ({fallback_id}) 超出范围 "
+                             f"[0, {self.model.num_layers}), 请检查 VPP 配置")
         return fallback_id
-    
+
     def _convert_layer_index(self, name: str, pp_rank: int,
                              vpp_rank: Optional[int]) -> str:
         """转换 layer index 为全局索引"""
@@ -972,28 +1047,30 @@ class MCoreCheckpointReader:
         if not match:
             return name
 
-        prefix, local_idx, suffix = match.group(1), int(match.group(2)), match.group(3)
+        prefix, local_idx, suffix = match.group(1), int(
+            match.group(2)), match.group(3)
         global_idx = self._get_global_layer_id(local_idx, pp_rank, vpp_rank)
         return f'{prefix}{global_idx}{suffix}'
-    
+
     def _validate_shape(self, name: str, shape: Tuple[int, ...]) -> List[str]:
         """验证 shape 是否正确"""
         warnings = []
         expected = self.strategy.get_expected_shape(name, self.model)
-        
+
         if expected is None:
             return warnings
-        
+
         if len(shape) != len(expected):
-            warnings.append(f'{name}: 维度不匹配，期望 {len(expected)}D，实际 {len(shape)}D')
+            warnings.append(
+                f'{name}: 维度不匹配，期望 {len(expected)}D，实际 {len(shape)}D')
             return warnings
-        
+
         for i, (actual, exp) in enumerate(zip(shape, expected)):
             if actual != exp:
                 warnings.append(f'{name}: 维度 {i} 不匹配，期望 {exp}，实际 {actual}')
-        
+
         return warnings
-    
+
     def extract_weights(self) -> ExtractResult:
         """提取所有权重信息"""
         self._validate()
@@ -1004,133 +1081,149 @@ class MCoreCheckpointReader:
         if self.parallel.vpp_stage is None:
             if self.parallel.dualpipe:
                 # DualPipe: 默认每个 stage 包含的层数
-                self.parallel.vpp_stage = max(1, self.model.num_layers // (self.parallel.pp_size * 2))
+                self.parallel.vpp_stage = max(
+                    1, self.model.num_layers // (self.parallel.pp_size * 2))
             elif self.parallel.vpp_size:
                 # 标准 VPP: 根据检测到的 vpp_size 计算
                 layers_per_pp = self.model.num_layers // self.parallel.pp_size
-                self.parallel.vpp_stage = max(1, layers_per_pp // self.parallel.vpp_size)
+                self.parallel.vpp_stage = max(
+                    1, layers_per_pp // self.parallel.vpp_size)
             else:
                 # 无 VPP: 每个 PP stage 视为一个 VPP stage
-                self.parallel.vpp_stage = max(1, self.model.num_layers // self.parallel.pp_size)
+                self.parallel.vpp_stage = max(
+                    1, self.model.num_layers // self.parallel.pp_size)
 
         # 总是构建 layer mapping（支持 VPP 和非 VPP 场景）
         self._build_layer_mapping()
-        
+
         megatron_params: Dict[str, Dict[str, Any]] = {}
         total_params = 0
         total_size = 0
         errors: List[str] = []
         warnings: List[str] = []
-        
+
         if self.verbose:
-            logger.info("=" * 80)
-            logger.info("MCore 权重提取")
-            logger.info("=" * 80)
-            logger.info("目录: %s", self.mcore_dir)
-            logger.info("并行: TP=%d, PP=%d, EP=%d, VPP=%s",
-                       self.parallel.tp_size, self.parallel.pp_size, 
-                       self.parallel.ep_size, self.parallel.vpp_size)
-            logger.info("模型: layers=%d, hidden=%d, experts=%d",
-                       self.model.num_layers, self.model.hidden_size, self.model.num_experts)
-        
+            logger.info('=' * 80)
+            logger.info('MCore 权重提取')
+            logger.info('=' * 80)
+            logger.info('目录: %s', self.mcore_dir)
+            logger.info('并行: TP=%d, PP=%d, EP=%d, VPP=%s',
+                        self.parallel.tp_size, self.parallel.pp_size,
+                        self.parallel.ep_size, self.parallel.vpp_size)
+            logger.info('模型: layers=%d, hidden=%d, experts=%d',
+                        self.model.num_layers, self.model.hidden_size,
+                        self.model.num_experts)
+
         # 确定所有 stages
         if self.parallel.vpp_size is None or self.parallel.vpp_size == 1:
             stages = [(pp, None) for pp in range(self.parallel.pp_size)]
         else:
             stages = [(pp, vpp) for pp in range(self.parallel.pp_size)
-                     for vpp in range(self.parallel.vpp_size)]
-        
+                      for vpp in range(self.parallel.vpp_size)]
+
         # 处理每个 stage
         for pp_rank, vpp_rank in stages:
             if self.verbose:
-                logger.info("处理 PP=%d%s...", pp_rank, 
-                           f" VPP={vpp_rank}" if vpp_rank is not None else "")
-            
+                logger.info('处理 PP=%d%s...', pp_rank,
+                            f" VPP={vpp_rank}" if vpp_rank is not None else '')
+
             try:
-                models = self.loader.load_stage(pp_rank, vpp_rank, self.io_threads)
+                models = self.loader.load_stage(pp_rank, vpp_rank,
+                                                self.io_threads)
             except Exception as e:
                 errors.append(f"Stage pp={pp_rank}, vpp={vpp_rank}: {e}")
                 continue
-            
+
             if not models:
                 errors.append(f"Stage pp={pp_rank}, vpp={vpp_rank} 没有模型")
                 continue
-            
+
             # 收集所有权重
-            weight_tensors: Dict[str, Dict[Tuple[int, int], torch.Tensor]] = defaultdict(dict)
+            weight_tensors: Dict[str, Dict[Tuple[int, int],
+                                           torch.Tensor]] = defaultdict(dict)
             if self.verbose:
-                logger.info("  本 stage 加载的 TP/EP: %s", sorted(models.keys()))
+                logger.info('  本 stage 加载的 TP/EP: %s', sorted(models.keys()))
             for (tp_rank, ep_rank), state in models.items():
                 for name, tensor in state.items():
                     # 过滤非 Tensor 类型和内部状态（如 optimizer 状态）
                     if not isinstance(tensor, torch.Tensor):
                         continue
                     # 跳过 optimizer 状态（通常以 '_extra_state' 或特定前缀开头）
-                    if name.startswith('_extra_state') or name.startswith('optimizer'):
+                    if name.startswith('_extra_state') or name.startswith(
+                            'optimizer'):
                         continue
                     weight_tensors[name][(tp_rank, ep_rank)] = tensor
-            
+
             # 处理每个权重
             for name, tp_ep_tensors in weight_tensors.items():
                 # 跳过空的 tensor 集合
                 if not tp_ep_tensors:
                     continue
-                
+
                 # 调试：打印 embedding 和第一个 layer 的 tp_ep_tensors keys
-                if self.verbose and ('embedding' in name or 'layers.0.self_attention' in name):
-                    logger.info("  %s: tp_ep_tensors keys=%s", name, sorted(tp_ep_tensors.keys()))
+                if self.verbose and ('embedding' in name
+                                     or 'layers.0.self_attention' in name):
+                    logger.info('  %s: tp_ep_tensors keys=%s', name,
+                                sorted(tp_ep_tensors.keys()))
 
                 final_name = self._convert_layer_index(name, pp_rank, vpp_rank)
                 # 确保名称以 module. 开头（如果不以 module. 或 model. 开头）
-                if not (final_name.startswith('module.') or final_name.startswith('model.')):
+                if not (final_name.startswith('module.')
+                        or final_name.startswith('model.')):
                     mcore_full_name = f'module.{final_name}'
                 else:
                     mcore_full_name = final_name
-                
+
                 if mcore_full_name in megatron_params:
                     continue
-                
+
                 # 收集信息
                 is_ep_sharded = self.strategy.is_ep_sharded(name)
                 tp_ep_shapes = {
-                    key: tuple(tensor.shape) 
+                    key: tuple(tensor.shape)
                     for key, tensor in tp_ep_tensors.items()
                 }
-                
+
                 # 合并 shape
-                merged_shape = self.merger.merge(name, tp_ep_shapes, is_ep_sharded)
-                
+                merged_shape = self.merger.merge(name, tp_ep_shapes,
+                                                 is_ep_sharded)
+
                 # 验证
                 if self.validate_shapes:
-                    warnings.extend(self._validate_shape(mcore_full_name, merged_shape))
-                
+                    warnings.extend(
+                        self._validate_shape(mcore_full_name, merged_shape))
+
                 # 获取第一个 tensor 的 dtype 和 requires_grad
                 # 确保按 (tp_rank, ep_rank) 排序，保证确定性
                 first_key = sorted(tp_ep_tensors.keys())[0]
                 first_tensor = tp_ep_tensors[first_key]
                 dtype = _get_torch_dtype_name(first_tensor.dtype)
                 requires_grad = getattr(first_tensor, 'requires_grad', True)
-                
+
                 # 添加到结果
                 megatron_params[mcore_full_name] = {
                     'shape': list(merged_shape),
                     'dtype': dtype,
                     'requires_grad': requires_grad,
                 }
-                
+
                 # 统计
                 numel = 1
                 for dim in merged_shape:
                     numel *= dim
                 total_params += numel
                 total_size += _get_tensor_size(merged_shape, dtype)
-        
+
         # 构建元数据
         metadata = {
-            'total_params': total_params,
-            'total_size_bytes': total_size,
-            'total_size_gb': round(total_size / 1e9, 2),
-            'num_weights': len(megatron_params),
+            'total_params':
+            total_params,
+            'total_size_bytes':
+            total_size,
+            'total_size_gb':
+            round(total_size / 1e9, 2),
+            'num_weights':
+            len(megatron_params),
             'model_config': {
                 'num_layers': self.model.num_layers,
                 'hidden_size': self.model.hidden_size,
@@ -1153,18 +1246,20 @@ class MCoreCheckpointReader:
                 'mcore_dir': self.mcore_dir,
                 'iter_dir': self.iter_dir,
             },
-            'note': f'Weights merged from TP={self.parallel.tp_size}, EP={self.parallel.ep_size}',
+            'note':
+            f'Weights merged from TP={self.parallel.tp_size}, EP={self.parallel.ep_size}',
         }
-        
+
         if errors:
             metadata['errors'] = errors
         if warnings:
             metadata['warnings'] = warnings
-        
+
         # 打印统计
         if self.verbose:
-            self._print_stats(megatron_params, total_params, total_size, errors, warnings)
-        
+            self._print_stats(megatron_params, total_params, total_size,
+                              errors, warnings)
+
         return ExtractResult(
             megatron_params=megatron_params,
             metadata=metadata,
@@ -1173,17 +1268,17 @@ class MCoreCheckpointReader:
             errors=errors,
             warnings=warnings,
         )
-    
+
     def _print_stats(self, params: Dict, total_params: int, total_size: int,
                      errors: List[str], warnings: List[str]) -> None:
         """打印统计信息"""
-        logger.info("=" * 80)
-        logger.info("提取完成")
-        logger.info("=" * 80)
-        logger.info("总权重数量: %d", len(params))
-        logger.info("总参数量: %d (%.2f B)", total_params, total_params / 1e9)
-        logger.info("总大小: %.2f GB", total_size / 1e9)
-        
+        logger.info('=' * 80)
+        logger.info('提取完成')
+        logger.info('=' * 80)
+        logger.info('总权重数量: %d', len(params))
+        logger.info('总参数量: %d (%.2f B)', total_params, total_params / 1e9)
+        logger.info('总大小: %.2f GB', total_size / 1e9)
+
         # 按类型统计
         categories = {
             'Embedding': lambda n: 'embedding' in n,
@@ -1192,43 +1287,45 @@ class MCoreCheckpointReader:
             'Output Layer': lambda n: 'output_layer' in n,
             'Experts': lambda n: 'experts' in n,
         }
-        
-        logger.info("权重分布:")
+
+        logger.info('权重分布:')
         for cat, check in categories.items():
             count = sum(1 for n in params if check(n))
-            logger.info("  %s: %d", cat, count)
-        
+            logger.info('  %s: %d', cat, count)
+
         if warnings:
-            logger.warning("Shape 警告: %d 个", len(warnings))
+            logger.warning('Shape 警告: %d 个', len(warnings))
             for w in warnings[:10]:
-                logger.warning("  - %s", w)
+                logger.warning('  - %s', w)
             if len(warnings) > 10:
-                logger.warning("  ... 还有 %d 个", len(warnings) - 10)
-        
+                logger.warning('  ... 还有 %d 个', len(warnings) - 10)
+
         if errors:
-            logger.error("错误: %d 个", len(errors))
+            logger.error('错误: %d 个', len(errors))
             for e in errors[:5]:
-                logger.error("  - %s", e)
-    
+                logger.error('  - %s', e)
+
     def get_json_output(self) -> dict:
         """生成 JSON 格式的输出"""
         result = self.extract_weights()
-        sorted_params = dict(sorted(result.megatron_params.items(), key=lambda x: _natural_sort_key(x[0])))
-        
+        sorted_params = dict(
+            sorted(result.megatron_params.items(),
+                   key=lambda x: _natural_sort_key(x[0])))
+
         return {
             'megatron_params': sorted_params,
             'metadata': result.metadata,
         }
-    
+
     def save_json(self, output_path: str, indent: int = 2) -> None:
         """保存权重信息到 JSON 文件"""
         output = self.get_json_output()
-        
+
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(output, f, indent=indent, ensure_ascii=False)
-        
+
         if self.verbose:
-            logger.info("JSON 输出已保存到: %s", output_path)
+            logger.info('JSON 输出已保存到: %s', output_path)
 
 
 def main():
@@ -1247,29 +1344,55 @@ def main():
   # DualPipe 模式
   python get_mcore_weights_from_ckpt.py /path/to/mcore/ckpt \\
     --tp 2 --pp 8 --ep 64 --schedules-method dualpipev --output model.json
-        """
-    )
+        """)
 
     parser.add_argument('mcore_dir', help='MCore checkpoint 目录')
     parser.add_argument('--tp', type=int, default=1, help='Tensor 并行大小')
     parser.add_argument('--pp', type=int, default=1, help='Pipeline 并行大小')
     parser.add_argument('--ep', type=int, default=1, help='Expert 并行大小')
     parser.add_argument('--num-layers', type=int, default=32, help='模型层数')
-    parser.add_argument('--num-attention-heads', type=int, default=64, help='注意力头数')
-    parser.add_argument('--num-query-groups', type=int, default=2, help='KV Groups')
+    parser.add_argument('--num-attention-heads',
+                        type=int,
+                        default=64,
+                        help='注意力头数')
+    parser.add_argument('--num-query-groups',
+                        type=int,
+                        default=2,
+                        help='KV Groups')
     parser.add_argument('--hidden-size', type=int, default=7168, help='隐藏层维度')
     parser.add_argument('--kv-channels', type=int, default=128, help='KV 通道数')
-    parser.add_argument('--ffn-hidden-size', type=int, default=18432, help='FFN 隐藏层维度')
-    parser.add_argument('--moe-ffn-hidden-size', type=int, default=12288, help='MoE FFN 维度')
+    parser.add_argument('--ffn-hidden-size',
+                        type=int,
+                        default=18432,
+                        help='FFN 隐藏层维度')
+    parser.add_argument('--moe-ffn-hidden-size',
+                        type=int,
+                        default=12288,
+                        help='MoE FFN 维度')
     parser.add_argument('--num-experts', type=int, default=128, help='专家数')
     parser.add_argument('--vocab-size', type=int, default=163840, help='词表大小')
-    parser.add_argument('--first-k-dense-replace', type=int, default=2, help='前 K 层 Dense MLP')
-    parser.add_argument('--schedules-method', type=str, default=None, help='调度方法')
-    parser.add_argument('--vpp-stage', type=int, default=None, help='VPP stage 数')
+    parser.add_argument('--first-k-dense-replace',
+                        type=int,
+                        default=2,
+                        help='前 K 层 Dense MLP')
+    parser.add_argument('--schedules-method',
+                        type=str,
+                        default=None,
+                        help='调度方法')
+    parser.add_argument('--vpp-stage',
+                        type=int,
+                        default=None,
+                        help='VPP stage 数')
     parser.add_argument('--io-threads', type=int, default=4, help='IO 线程数')
     parser.add_argument('--disable-mmap', action='store_true', help='禁用 mmap')
-    parser.add_argument('--no-validate', action='store_true', help='禁用 shape 验证')
-    parser.add_argument('--output', '-o', type=str, required=True, help='输出 JSON 路径')
+    parser.add_argument('--no-validate',
+                        action='store_true',
+                        help='禁用 shape 验证')
+    parser.add_argument('--output',
+                        '-o',
+                        type=str,
+                        required=True,
+                        help='输出 JSON 路径')
     parser.add_argument('--quiet', action='store_true', help='静默模式')
 
     args = parser.parse_args()

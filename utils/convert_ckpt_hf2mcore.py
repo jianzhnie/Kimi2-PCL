@@ -30,7 +30,6 @@ from typing import Any, Optional, Union
 import torch
 from safetensors import safe_open
 
-
 logger.basicConfig(format='')
 logger.getLogger().setLevel(logger.INFO)
 
@@ -123,6 +122,7 @@ class CkptConvert:
         qk_head_dim: int,
         v_head_dim: int,
         moe_grouped_gemm: bool,
+        expert_tp_size: int = 1,
         schedules_method: str | None = None,
         vpp_stage: int | None = None,
         num_layer_list: str | None = None,
@@ -168,6 +168,10 @@ class CkptConvert:
         self.qk_head_dim = qk_head_dim
         self.v_head_dim = v_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
+        self.expert_tp_size = max(1, int(expert_tp_size))
+        if self.expert_tp_size > self.tp_size:
+            raise ValueError(f'expert_tp_size ({self.expert_tp_size}) '
+                             f'cannot exceed tp_size ({self.tp_size})')
         self.schedules_method = schedules_method
         self.dualpipe = schedules_method == 'dualpipev'
         self.vpp_stage = vpp_stage
@@ -385,13 +389,13 @@ class CkptConvert:
                 f'num_attention_heads ({self.num_attention_heads}) '
                 f'must be divisible by tp_size ({self.tp_size})')
         if self.num_query_groups % self.tp_size != 0:
-            raise ValueError(
-                f'num_query_groups ({self.num_query_groups}) '
-                f'must be divisible by tp_size ({self.tp_size})')
+            raise ValueError(f'num_query_groups ({self.num_query_groups}) '
+                             f'must be divisible by tp_size ({self.tp_size})')
         if self.num_attention_heads % self.num_query_groups != 0:
             raise ValueError(
                 f'num_attention_heads ({self.num_attention_heads}) '
-                f'must be divisible by num_query_groups ({self.num_query_groups})')
+                f'must be divisible by num_query_groups ({self.num_query_groups})'
+            )
 
     def _detect_moe_structure(self) -> None:
         """Detect MoE vs Dense layers from actual HF weight structure.
@@ -411,10 +415,11 @@ class CkptConvert:
         if not self.weight_map:
             return
 
-        for layer_id in sorted(set(
-                int(k.split('model.layers.')[1].split('.')[0])
-                for k in self.weight_map
-                if k.startswith('model.layers.'))):
+        for layer_id in sorted(
+                set(
+                    int(k.split('model.layers.')[1].split('.')[0])
+                    for k in self.weight_map
+                    if k.startswith('model.layers.'))):
             has_moe_router = (f'model.layers.{layer_id}.mlp.gate.weight'
                               in self.weight_map)
             has_dense_gate = (f'model.layers.{layer_id}.mlp.gate_proj.weight'
@@ -441,9 +446,9 @@ class CkptConvert:
 
         if expected_dense != actual_dense and actual_moe:
             # Check if the detected MoE layers match what we expect
-            expected_moe = set(range(self.first_k_dense_replace,
-                                     self.num_layers)) - set(
-                self.noop_layers_list)
+            expected_moe = set(
+                range(self.first_k_dense_replace, self.num_layers)) - set(
+                    self.noop_layers_list)
             wrong_dense = actual_moe & expected_dense
             wrong_moe = actual_dense & expected_moe
             if wrong_dense:
@@ -459,13 +464,11 @@ class CkptConvert:
 
         # Validate critical global weights
         if 'model.embed_tokens.weight' not in self.weight_map:
-            raise KeyError(
-                'HF model missing model.embed_tokens.weight')
+            raise KeyError('HF model missing model.embed_tokens.weight')
         if not self.tie_word_embeddings:
             if 'lm_head.weight' not in self.weight_map:
-                raise KeyError(
-                    'HF model missing lm_head.weight and '
-                    'tie_word_embeddings is not enabled')
+                raise KeyError('HF model missing lm_head.weight and '
+                               'tie_word_embeddings is not enabled')
         if 'model.norm.weight' not in self.weight_map:
             raise KeyError(
                 'HF model missing model.norm.weight (final layernorm)')
@@ -495,12 +498,12 @@ class CkptConvert:
 
     def _read_weight_map(self) -> dict[str, str]:
         """Read weight map from HF model directory.
-        
+
         Tries to load from index.json first, then falls back to single safetensors file.
-        
+
         Returns:
             Dictionary mapping tensor names to file names
-            
+
         Raises:
             FileNotFoundError: If neither index.json nor single safetensors file exists
             json.JSONDecodeError: If index.json is malformed
@@ -535,8 +538,7 @@ class CkptConvert:
                     return {k: 'model.safetensors' for k in f.keys()}
             except Exception as e:
                 raise RuntimeError(
-                    f'Error reading safetensors file {single}: {e}'
-                ) from e
+                    f'Error reading safetensors file {single}: {e}') from e
 
         raise FileNotFoundError(
             f'找不到 HF safetensors index 或单文件: {self.hf_model_path}')
@@ -657,14 +659,14 @@ class CkptConvert:
     def _load_safetensors_keys(self, filename: str,
                                keys: list[str]) -> dict[str, torch.Tensor]:
         """Load specified keys from a safetensors file with error handling.
-        
+
         Args:
             filename: Name of the safetensors file
             keys: List of tensor keys to load
-            
+
         Returns:
             Dictionary mapping keys to tensors
-            
+
         Raises:
             FileNotFoundError: If the file doesn't exist
             KeyError: If a requested key is not found in the file
@@ -673,7 +675,7 @@ class CkptConvert:
         path = os.path.join(self.hf_model_path, filename)
         if not os.path.isfile(path):
             raise FileNotFoundError(f'Safetensors file not found: {path}')
-        
+
         out: dict[str, torch.Tensor] = {}
         t0 = time.time()
         try:
@@ -683,16 +685,14 @@ class CkptConvert:
                     if k not in available_keys:
                         raise KeyError(
                             f'Tensor "{k}" not found in {filename}. '
-                            f'Available keys: {list(available_keys)[:10]}...'
-                        )
+                            f'Available keys: {list(available_keys)[:10]}...')
                     out[k] = f.get_tensor(k)
         except Exception as e:
             if isinstance(e, (FileNotFoundError, KeyError)):
                 raise
             raise RuntimeError(
-                f'Error reading safetensors file {filename}: {e}'
-            ) from e
-        
+                f'Error reading safetensors file {filename}: {e}') from e
+
         if self.log_file_load:
             dt = time.time() - t0
             logger.info('Loaded %d tensors from %s (%.2fs)', len(keys),
@@ -787,10 +787,10 @@ class CkptConvert:
             mg_model: dict[int, dict[int, dict[str, torch.Tensor]]]) -> None:
         """
         转换输入嵌入层权重。
-        
+
         权重映射:
             HF: model.embed_tokens.weight -> MCore: embedding.word_embeddings.weight
-        
+
         TP 切分策略:
             - dim=0 (在 vocab_size 维度切分)
         """
@@ -812,11 +812,11 @@ class CkptConvert:
             mg_model: dict[int, dict[int, dict[str, torch.Tensor]]]) -> None:
         """
         转换输出层权重 (Final LayerNorm 和 LM Head)。
-        
+
         权重映射:
             HF: model.norm.weight -> MCore: decoder.final_layernorm.weight
             HF: lm_head.weight -> MCore: output_layer.weight
-            
+
         注意:
             - 如果 tie_word_embeddings=True，lm_head 可能与 embed_tokens 共享权重
             - LM Head TP 切分策略: dim=0 (在 vocab_size 维度切分)
@@ -851,11 +851,11 @@ class CkptConvert:
     ) -> None:
         """
         转换层的 LayerNorm 权重。
-        
+
         权重映射:
             HF: input_layernorm.weight -> MCore: input_layernorm.weight
             HF: post_attention_layernorm.weight -> MCore: pre_mlp_layernorm.weight
-            
+
         注意:
             - LayerNorm 权重不参与 TP 切分 (所有 rank 相同)
         """
@@ -870,7 +870,6 @@ class CkptConvert:
                 mg_model[ep_rank][tp_rank][
                     f'decoder.layers.{local_layer_idx}.pre_mlp_layernorm.weight'] = post_norm
 
-
     def _set_layer_attn(
         self,
         hf_layer: int,
@@ -880,19 +879,19 @@ class CkptConvert:
     ) -> None:
         """
         转换 Attention 层权重从 HF 格式到 MCore 格式。
-        
+
         权重映射:
             HF: q_proj, k_proj, v_proj (分离) -> MCore: linear_qkv (融合)
             HF: o_proj -> MCore: linear_proj
             HF: q_layernorm, k_layernorm -> MCore: q_layernorm, k_layernorm (可选)
-        
+
         维度计算 (基于 GQA 配置):
             - q_head_dim = qk_head_dim = 128
             - Q projection rows = num_attention_heads * q_head_dim = 64 * 128 = 8192
             - K projection rows =  num_query_groups * q_head_dim = 2 * 128 = 256
             - V projection rows = num_query_groups * v_head_dim = 2 * 128 = 256
             - 融合 QKV rows = 8192 + 256 + 256 = 8704
-        
+
         TP 切分策略:
             - QKV: dim=0 (在 heads 维度切分)
             - O_proj: dim=1 (在 hidden_size 维度切分)
@@ -973,14 +972,14 @@ class CkptConvert:
         1. Dense MLP (前 first_k_dense_replace 层):
             - HF: gate_proj, up_proj (分离) -> MCore: linear_fc1 (融合)
             - HF: down_proj -> MCore: linear_fc2
-            
+
         2. MoE (剩余层):
             - HF: gate.weight -> MCore: router.weight
             - HF: gate.e_score_correction_bias -> MCore: router.expert_bias (可选)
             - HF: shared_experts.gate_proj/up_proj -> MCore: shared_experts.linear_fc1
             - HF: shared_experts.down_proj -> MCore: shared_experts.linear_fc2
             - HF: experts.{i}.{gate,up,down}_proj -> MCore: experts.local_experts.{i}.linear_fc{1,2}
-        
+
         TP 切分策略:
             - linear_fc1: dim=0 (在 intermediate_size 维度切分)
             - linear_fc2: dim=1 (在 hidden_size 维度切分)
@@ -997,8 +996,8 @@ class CkptConvert:
         if is_dense_layer and has_moe_key and not has_dense_key:
             logger.warning(
                 'layer %d: first_k_dense_replace=%d says dense, '
-                'but HF model has MoE structure. Using MoE path.',
-                hf_layer, self.first_k_dense_replace)
+                'but HF model has MoE structure. Using MoE path.', hf_layer,
+                self.first_k_dense_replace)
             is_dense_layer = False
         elif not is_dense_layer and has_dense_key and not has_moe_key:
             logger.warning(
@@ -1120,10 +1119,10 @@ class CkptConvert:
                 mg_model[ep_rank][tp_rank][router_key] = router_w
                 if router_b is not None:
                     mg_model[ep_rank][tp_rank][router_bias_key] = router_b
-                mg_model[ep_rank][tp_rank][
-                    shared_fc1_key] = shared_fc1_shards[tp_rank]
-                mg_model[ep_rank][tp_rank][
-                    shared_fc2_key] = shared_fc2_shards[tp_rank]
+                mg_model[ep_rank][tp_rank][shared_fc1_key] = shared_fc1_shards[
+                    tp_rank]
+                mg_model[ep_rank][tp_rank][shared_fc2_key] = shared_fc2_shards[
+                    tp_rank]
                 self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
                                       shared_fc1_key,
                                       shared_fc1_shards[tp_rank])
@@ -1145,35 +1144,33 @@ class CkptConvert:
                 raise ValueError(
                     f'moe grouped gemm hidden_size 不匹配: hidden_size={self.hidden_size} gemm_fc1={tuple(gemm_fc1.shape)} gemm_fc2={tuple(gemm_fc2.shape)}'
                 )
-            if gemm_fc1.shape[2] % self.tp_size != 0:
-                raise ValueError(
-                    f'moe grouped gemm 需要 intermediate*2 能整除 tp_size: gemm_fc1={tuple(gemm_fc1.shape)} tp={self.tp_size}'
-                )
-            if gemm_fc2.shape[1] % self.tp_size != 0:
-                raise ValueError(
-                    f'moe grouped gemm 需要 intermediate 能整除 tp_size: gemm_fc2={tuple(gemm_fc2.shape)} tp={self.tp_size}'
-                )
-            gemm_fc1_ep = torch.chunk(
-                gemm_fc1,
-                self.ep_size,
-                dim=0,
-            )
-            gemm_fc2_ep = torch.chunk(
-                gemm_fc2,
-                self.ep_size,
-                dim=0,
-            )
+            experts_per_ep = self.num_experts // self.ep_size
+            if self.expert_tp_size > 1:
+                if experts_per_ep % self.expert_tp_size != 0:
+                    raise ValueError(
+                        f'experts_per_ep ({experts_per_ep}) must be divisible by '
+                        f'expert_tp_size ({self.expert_tp_size})')
+            gemm_fc1_ep = torch.chunk(gemm_fc1, self.ep_size, dim=0)
+            gemm_fc2_ep = torch.chunk(gemm_fc2, self.ep_size, dim=0)
             for ep_rank in range(self.ep_size):
-                fc1_tp = torch.chunk(gemm_fc1_ep[ep_rank],
-                                     self.tp_size,
-                                     dim=2)
-                fc2_tp = torch.chunk(gemm_fc2_ep[ep_rank],
-                                     self.tp_size,
-                                     dim=1)
+                if self.expert_tp_size > 1:
+                    # TP 按专家维度切分，每个 TP rank 获得一部分专家的完整 gate+up
+                    fc1_tp = torch.chunk(gemm_fc1_ep[ep_rank],
+                                         self.expert_tp_size,
+                                         dim=0)
+                    fc2_tp = torch.chunk(gemm_fc2_ep[ep_rank],
+                                         self.expert_tp_size,
+                                         dim=0)
+                else:
+                    # expert_tp=1: 专家权重不做 TP 切分，所有 TP rank 获得相同权重
+                    fc1_tp = [gemm_fc1_ep[ep_rank]]
+                    fc2_tp = [gemm_fc2_ep[ep_rank]]
                 for tp_rank in range(self.tp_size):
-                    w1 = fc1_tp[tp_rank].reshape(self.hidden_size,
-                                                 -1).contiguous()
-                    w2 = fc2_tp[tp_rank].reshape(
+                    expert_tp_idx = (tp_rank * self.expert_tp_size //
+                                     self.tp_size)
+                    w1 = fc1_tp[expert_tp_idx].reshape(self.hidden_size,
+                                                       -1).contiguous()
+                    w2 = fc2_tp[expert_tp_idx].reshape(
                         -1, self.hidden_size).contiguous()
                     mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
                     mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
@@ -1190,35 +1187,40 @@ class CkptConvert:
                 local_fc1 = experts_linear_fc1_list[global_idx].t()
                 local_fc2 = experts_linear_fc2_list[global_idx].t()
                 local_prefix = f'{prefix}.experts.local_experts.{local_idx}'
-                local_fc1_tp = torch.chunk(local_fc1,
-                                           self.tp_size,
-                                           dim=0)
-                local_fc2_tp = torch.chunk(local_fc2,
-                                           self.tp_size,
-                                           dim=1)
-                local_fc1_shards = [
-                    t.contiguous() if not t.is_contiguous() else t
-                    for t in local_fc1_tp
-                ]
-                local_fc2_shards = [
-                    t.contiguous() if not t.is_contiguous() else t
-                    for t in local_fc2_tp
-                ]
+                if self.expert_tp_size > 1:
+                    local_fc1_tp = torch.chunk(local_fc1,
+                                               self.expert_tp_size,
+                                               dim=0)
+                    local_fc2_tp = torch.chunk(local_fc2,
+                                               self.expert_tp_size,
+                                               dim=1)
+                    local_fc1_shards = [
+                        t.contiguous() if not t.is_contiguous() else t
+                        for t in local_fc1_tp
+                    ]
+                    local_fc2_shards = [
+                        t.contiguous() if not t.is_contiguous() else t
+                        for t in local_fc2_tp
+                    ]
+                else:
+                    # expert_tp=1: 不切分，所有 TP rank 获得相同权重
+                    local_fc1_shards = [local_fc1]
+                    local_fc2_shards = [local_fc2]
                 for tp_rank in range(self.tp_size):
+                    expert_tp_idx = (tp_rank * self.expert_tp_size //
+                                     self.tp_size)
                     mg_model[ep_rank][tp_rank][
                         f'{local_prefix}.linear_fc1.weight'] = local_fc1_shards[
-                            tp_rank]
+                            expert_tp_idx]
                     mg_model[ep_rank][tp_rank][
                         f'{local_prefix}.linear_fc2.weight'] = local_fc2_shards[
-                            tp_rank]
-                    self._maybe_quant_nf4(
-                        mg_model[ep_rank][tp_rank],
-                        f'{local_prefix}.linear_fc1.weight',
-                        local_fc1_shards[tp_rank])
-                    self._maybe_quant_nf4(
-                        mg_model[ep_rank][tp_rank],
-                        f'{local_prefix}.linear_fc2.weight',
-                        local_fc2_shards[tp_rank])
+                            expert_tp_idx]
+                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
+                                          f'{local_prefix}.linear_fc1.weight',
+                                          local_fc1_shards[expert_tp_idx])
+                    self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
+                                          f'{local_prefix}.linear_fc2.weight',
+                                          local_fc2_shards[expert_tp_idx])
 
     def _maybe_cast(self, t: torch.Tensor) -> torch.Tensor:
         if self._target_dtype is None:
@@ -1233,7 +1235,11 @@ class CkptConvert:
             self, d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if self._target_dtype is None:
             return d
-        return {k: self._maybe_cast(v) for k, v in d.items()}
+        return {
+            k: (v if ('router.expert_bias' in k or 'router.score_bias' in k)
+                else self._maybe_cast(v))
+            for k, v in d.items()
+        }
 
     def _save_single_rank_file(
         self,
@@ -1241,7 +1247,8 @@ class CkptConvert:
         tp_rank: int,
         ep_rank: int,
         mg_model: Union[dict[int, dict[int, dict[str, torch.Tensor]]],
-                        dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]]],
+                        dict[int, dict[int, dict[int, dict[str,
+                                                           torch.Tensor]]]]],
         vpp: bool,
     ) -> None:
         """保存单个 rank 的文件（线程安全版本）"""
@@ -1254,7 +1261,8 @@ class CkptConvert:
             # 动态遍历所有 VPP stages，避免硬编码 model0/model1 导致 stage 丢失
             vpp_size = getattr(self, 'vpp_size', 2)
             payload: dict[str, Any] = {
-                f'model{i}': self._cast_model_dict(mg_model[i][ep_rank][tp_rank])
+                f'model{i}':
+                self._cast_model_dict(mg_model[i][ep_rank][tp_rank])
                 for i in range(vpp_size)
             }
             payload.update({
@@ -1266,8 +1274,7 @@ class CkptConvert:
             })
         else:
             payload = {
-                'model':
-                self._cast_model_dict(mg_model[ep_rank][tp_rank]),
+                'model': self._cast_model_dict(mg_model[ep_rank][tp_rank]),
                 'checkpoint_version': 3.0,
                 'iteration': 1,
                 'args': {
@@ -1284,7 +1291,8 @@ class CkptConvert:
         self,
         pp_rank: int,
         mg_model: Union[dict[int, dict[int, dict[str, torch.Tensor]]],
-                        dict[int, dict[int, dict[int, dict[str, torch.Tensor]]]]],
+                        dict[int, dict[int, dict[int, dict[str,
+                                                           torch.Tensor]]]]],
         vpp: bool,
     ) -> None:
         """保存一个 PP rank 的所有权重文件，使用线程池并行化 EP×TP 保存"""
@@ -1325,13 +1333,15 @@ class CkptConvert:
         else:
             save_workers = max_save_workers
         # 环境变量可覆盖上述决定（向后兼容）
-        save_workers = int(os.environ.get('CKPT_CONVERT_SAVE_WORKERS', str(save_workers)))
+        save_workers = int(
+            os.environ.get('CKPT_CONVERT_SAVE_WORKERS', str(save_workers)))
         save_workers = min(save_workers, max_save_workers)
 
         if save_workers <= 1:
             # 串行保存模式（向后兼容）
             for tp_rank, ep_rank in rank_tasks:
-                self._save_single_rank_file(pp_rank, tp_rank, ep_rank, mg_model, vpp)
+                self._save_single_rank_file(pp_rank, tp_rank, ep_rank,
+                                            mg_model, vpp)
                 completed += 1
                 if self.log_save_progress and completed % 10 == 0:
                     logger.info('Saved pp=%d progress: %d/%d', int(pp_rank),
@@ -1342,10 +1352,9 @@ class CkptConvert:
                 # 提交所有任务
                 future_to_rank = {}
                 for tp_rank, ep_rank in rank_tasks:
-                    future = executor.submit(
-                        self._save_single_rank_file,
-                        pp_rank, tp_rank, ep_rank, mg_model, vpp
-                    )
+                    future = executor.submit(self._save_single_rank_file,
+                                             pp_rank, tp_rank, ep_rank,
+                                             mg_model, vpp)
                     future_to_rank[future] = (tp_rank, ep_rank)
 
                 # 等待任务完成并更新进度
@@ -1355,18 +1364,21 @@ class CkptConvert:
                         future.result()
                     except Exception as e:
                         logger.error('Error saving pp=%d tp=%d ep=%d: %s',
-                                     int(pp_rank), int(tp_rank), int(ep_rank), str(e))
+                                     int(pp_rank), int(tp_rank), int(ep_rank),
+                                     str(e))
                         raise
 
                     completed += 1
                     if self.log_save_progress and completed % 10 == 0:
-                        logger.info('Saved pp=%d progress: %d/%d', int(pp_rank),
-                                    int(completed), int(total_tasks))
+                        logger.info('Saved pp=%d progress: %d/%d',
+                                    int(pp_rank), int(completed),
+                                    int(total_tasks))
 
         if self.log_save_progress:
             dt = time.time() - t0
             logger.info('Saved pp=%d done: %d files in %.2fs (%.2f files/s)',
-                        int(pp_rank), int(total_tasks), dt, total_tasks / max(dt, 0.01))
+                        int(pp_rank), int(total_tasks), dt,
+                        total_tasks / max(dt, 0.01))
 
     def run(self) -> None:
         self._log_expected_param_summary()
@@ -1396,6 +1408,7 @@ class CkptConvert:
             qk_head_dim=self.qk_head_dim,
             v_head_dim=self.v_head_dim,
             moe_grouped_gemm=self.moe_grouped_gemm,
+            expert_tp_size=self.expert_tp_size,
             schedules_method=self.schedules_method,
             vpp_stage=None if self.dualpipe else self.vpp_stage,
             num_layer_list=self.num_layer_list,
@@ -1468,6 +1481,11 @@ def get_args():
     parser.add_argument('--moe-grouped-gemm',
                         action='store_true',
                         help='Use moe grouped gemm.')
+    parser.add_argument('--expert-tensor-parallel-size',
+                        type=int,
+                        default=1,
+                        help='Expert tensor parallel size (default: 1, '
+                        'experts not split by TP).')
     parser.add_argument('--noop-layers',
                         type=str,
                         default='',
@@ -1556,10 +1574,11 @@ def get_args():
                         type=int,
                         default=1,
                         help='Parallelize by pp_rank with processes.')
-    parser.add_argument('--save-workers',
-                        type=int,
-                        default=0,
-                        help='Parallelize saving within each pp_rank with threads (0=auto).')
+    parser.add_argument(
+        '--save-workers',
+        type=int,
+        default=0,
+        help='Parallelize saving within each pp_rank with threads (0=auto).')
     parser.add_argument('--cast-dtype',
                         type=str,
                         default=None,
@@ -1598,6 +1617,7 @@ def main() -> None:
         qk_head_dim=args.qk_head_dim,
         v_head_dim=args.v_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
+        expert_tp_size=args.expert_tensor_parallel_size,
         schedules_method=args.schedules_method,
         vpp_stage=args.num_layers_per_virtual_pipeline_stage,
         num_layer_list=args.num_layer_list,
