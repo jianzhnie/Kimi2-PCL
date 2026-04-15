@@ -371,6 +371,9 @@ class MgCkptConvert:
                     return cfg_file
             except Exception:
                 pass
+            # Fallback: use the template even if dimensions don't match
+            # because _write_hf_artifacts will override key fields anyway
+            return cfg_file
         raise FileNotFoundError(f'找不到可用的 HF config 模板: {cfg_file}')
 
     def _write_hf_artifacts(self) -> None:
