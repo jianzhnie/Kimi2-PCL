@@ -19,8 +19,18 @@ rsync -avz vllm  k8s-130:/llm_workspace_1P/robin/
 rsync -avz vllm-pcl  k8s-130:/llm_workspace_1P/robin/
 rsync -avz vllm-ascend  k8s-130:/llm_workspace_1P/robin/
 
+rsync -avz ./utils k8s-130:/llm_workspace_1P/robin/Kimi2-PCL
+rsync -avz ./scripts k8s-130:/llm_workspace_1P/robin/Kimi2-PCL
+
 ## 远程文件下载到本地
 rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL.tar  /Users/jianzhengnie/work_dir/
+rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_mapping.json /Users/jianzhengnie/work_dir/Kimi2-PCL
+rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_mapping_2.json /Users/jianzhengnie/work_dir/Kimi2-PCL
+rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_mapping.json /Users/jianzhengnie/work_dir/Kimi2-PCL
+
+rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_hf.json /Users/jianzhengnie/work_dir/Kimi2-PCL
+
+
 ## 进入容器
 docker exec -it mindspeed-llm-env /bin/bash
 docker exec -it vllm-ascend-env-a3  /bin/bash
@@ -74,7 +84,7 @@ bash /llm_workspace_1P/robin/Kimi2-PCL/vllm-infer/run_vllm_test.sh
 
 
 model_path=/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2_L32_exp_4096_dies/b834d725-34df-47ca-ab07-4b93a36b9e87 
-python get_mcore_weights.py $model_path \
+python /llm_workspace_1P/robin/Kimi2-PCL/utils/get_mcore_weights.py $model_path \
   --tp 2 \
   --pp 8 \
   --ep 64 \
@@ -87,4 +97,4 @@ python get_mcore_weights.py $model_path \
   --hidden-size 7168 \
   --vocab-size 163840 \
   --num-experts 128 \
-  --output mcore_weights_info.json
+  --output /llm_workspace_1P/robin/Kimi2-PCL/mcore_weights_info.json
