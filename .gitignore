@@ -211,3 +211,4 @@ Kimi-K2-Base
 rebuild.md
 TODO.md
 models/k2_base.py
+*.json

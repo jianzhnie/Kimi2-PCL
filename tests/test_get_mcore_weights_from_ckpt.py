@@ -27,10 +27,17 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from utils.get_mcore_weights_from_ckpt import (  # noqa: E402
-    DualPipeMapper, MCoreCheckpointReader, ModelConfig, MoeParallelStrategy,
-    ShapeMerger, StandardVppMapper, _get_tensor_size, _get_torch_dtype_name,
-    _mp_prefix, _resolve_iter_dir)
+from utils.get_mcore_weights_from_ckpt import (
+    DualPipeMapper,  # noqa: E402
+    MCoreCheckpointReader,
+    ModelConfig,
+    MoeParallelStrategy,
+    ShapeMerger,
+    StandardVppMapper,
+    _get_tensor_size,
+    _get_torch_dtype_name,
+    _mp_prefix,
+    _resolve_iter_dir)
 
 
 class TestGetMCoreWeightsFromCkpt(unittest.TestCase):

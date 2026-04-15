@@ -23,12 +23,10 @@ rsync -avz ./utils k8s-130:/llm_workspace_1P/robin/Kimi2-PCL
 rsync -avz ./scripts k8s-130:/llm_workspace_1P/robin/Kimi2-PCL
 
 ## 远程文件下载到本地
-rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL.tar  /Users/jianzhengnie/work_dir/
-rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_mapping.json /Users/jianzhengnie/work_dir/Kimi2-PCL
-rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_mapping_2.json /Users/jianzhengnie/work_dir/Kimi2-PCL
-rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_mapping.json /Users/jianzhengnie/work_dir/Kimi2-PCL
-
-rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_hf.json /Users/jianzhengnie/work_dir/Kimi2-PCL
+rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL.tar  /Users/robin/work_dir/
+rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_mapping.json /Users/robin/work_dir/Kimi2-PCL
+rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_mapping_2.json /Users/robin/work_dir/Kimi2-PCL
+rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL/model_param_hf.json /Users/robin/work_dir/Kimi2-PCL
 
 
 ## 进入容器
@@ -83,7 +81,7 @@ bash copy_to_docker.sh -p 16 -r /remote/file.py /container/file.py
 bash /llm_workspace_1P/robin/Kimi2-PCL/vllm-infer/run_vllm_test.sh
 
 
-model_path=/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2_L32_exp_4096_dies/b834d725-34df-47ca-ab07-4b93a36b9e87 
+model_path=/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2_L32_exp_4096_dies/b834d725-34df-47ca-ab07-4b93a36b9e87
 python /llm_workspace_1P/robin/Kimi2-PCL/utils/get_mcore_weights.py $model_path \
   --tp 2 \
   --pp 8 \

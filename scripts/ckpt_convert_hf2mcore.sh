@@ -1,7 +1,7 @@
 #!/usr/bin/env -S env -u BASH_ENV bash
 # =============================================================================
 # Huggingface (HF) 到 Megatron-Core (MCore) 模型权重转换脚本
-# 
+#
 # 基于 Kimi2-1T 模型架构配置
 # 参考: scripts/pretrain_kimi2_1t_4k.sh
 #
@@ -41,7 +41,7 @@ if [[ ! -d "${REPO_ROOT}" ]]; then
 fi
 
 LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf}"
-SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf2mcore}"
+SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf2mcore3}"
 
 if [[ -z "${LOAD_DIR}" ]]; then
   echo "ERROR: LOAD_DIR must be set (source HuggingFace checkpoint directory)" >&2
@@ -61,12 +61,13 @@ fi
 # =============================================================================
 TP="${TP:-2}"                          # Tensor Parallel size
 PP="${PP:-8}"                          # Pipeline Parallel size
-EP="${EP:-8}"                        # Expert Parallel size
+EP="${EP:-8}"                       # Expert Parallel size
 VPP_STAGE="${VPP_STAGE:-}"             # VPP stage (dualpipev 下留空)
-PP_WORKERS="${PP_WORKERS:-1}"          # PP 并行工作进程数
-IO_THREADS="${IO_THREADS:-1}"          # HF 权重加载线程数
+PP_WORKERS="${PP_WORKERS:-2}"          # PP 并行工作进程数
+IO_THREADS="${IO_THREADS:-2}"          # HF 权重加载线程数
 SAVE_WORKERS="${SAVE_WORKERS:-1}"      # 保存权重线程数 (0=自动)
 CAST_DTYPE="${CAST_DTYPE:-bf16}"       # 输出数据类型
+EXPERT_TP="${EXPERT_TP:-1}"            # Expert tensor parallel size (训练使用 expert-tp=1)
 SCHEDULES_METHOD="${SCHEDULES_METHOD:-}"  # 调度算法 (与训练脚本一致，默认 dualpipev)
 
 # =============================================================================
@@ -148,6 +149,7 @@ echo "  SAVE_DIR: ${SAVE_DIR}"
 echo "  TP=${TP}, PP=${PP}, EP=${EP}"
 echo "  PP_WORKERS=${PP_WORKERS}, SAVE_WORKERS=${SAVE_WORKERS}"
 echo "  SCHEDULES_METHOD=${SCHEDULES_METHOD}"
+echo "  EXPERT_TP=${EXPERT_TP}"
 echo ""
 
 python "${CONVERT_SCRIPT}" \
@@ -162,6 +164,7 @@ python "${CONVERT_SCRIPT}" \
   --save-workers "${SAVE_WORKERS}" \
   --hf-io-threads "${IO_THREADS}" \
   --moe-grouped-gemm \
+  --expert-tensor-parallel-size "${EXPERT_TP}" \
   --rotary-base "${ROTARY_BASE}" \
   --noop-layers "${NOOP_LAYERS}" \
   --hidden-size "${HIDDEN_SIZE}" \
