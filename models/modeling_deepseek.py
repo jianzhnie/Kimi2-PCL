@@ -759,6 +759,7 @@ class DeepseekV3Attention(nn.Module):
         # GQA dimensions: head_dim = kv_channels = 128
         self.head_dim = config.kv_channels
         self.kv_channels = config.kv_channels
+        self.num_key_value_groups = self.num_heads // self.num_query_groups
 
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
@@ -1111,7 +1112,7 @@ class DeepseekV3FlashAttention2(DeepseekV3Attention):
         # Repeat K/V for GQA before flash attention
         if self.num_query_groups > 1:
             batch_size, seq_len, num_kv_heads, head_dim = key_states.shape
-            n_rep = self.num_query_groups
+            n_rep = self.num_key_value_groups
             # [b, s, 2, 128] -> [b, s, 64, 128]
             key_states = key_states[:, :, :, None, :].expand(
                 batch_size, seq_len, num_kv_heads, n_rep,

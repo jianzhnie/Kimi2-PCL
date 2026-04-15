@@ -49,7 +49,7 @@ class DeepseekV3Config(PretrainedConfig):
         pad_token_id=None,
         bos_token_id=163584,
         eos_token_id=163585,
-        pretraining_tp=1,
+        pretraining_tp=2,
         tie_word_embeddings=False,
         rope_theta=50000.0,
         rope_scaling={
@@ -104,6 +104,7 @@ class DeepseekV3Config(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.qk_layernorm = qk_layernorm
         self.fa_without_pad = fa_without_pad
         super().__init__(
             pad_token_id=pad_token_id,
