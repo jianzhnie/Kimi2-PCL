@@ -19,8 +19,20 @@
 
 set -euo pipefail
 
+if [[ -f "${HOME}/.bashrc" ]]; then
+  set +u
+  source "${HOME}/.bashrc"
+  set -u
+fi
+
+# 可选的昇腾环境设置（如果存在）
+if [[ -f "/usr/local/Ascend/ascend-toolkit/set_env.sh" ]]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 # 默认路径配置
-REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 ckpt_dir="/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2_L32_exp_4096_dies/b834d725-34df-47ca-ab07-4b93a36b9e87/"
 LOAD_DIR="${LOAD_DIR:-$ckpt_dir}"
 SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf}"
@@ -57,6 +69,7 @@ NUM_QUERY_GROUPS="${NUM_QUERY_GROUPS:-2}"           # GQA 分组数 (对应 --nu
 KV_CHANNELS="${KV_CHANNELS:-128}"                   # kv-channels
 QK_LAYERNORM="${QK_LAYERNORM:-true}"                # qk-layernorm 开关
 ROTARY_BASE="${ROTARY_BASE:-50000}"
+MAX_POSITION_EMBEDDINGS="${MAX_POSITION_EMBEDDINGS:-131072}"
 
 # MoE 配置 (与 MOE_ARGS 保持一致)
 FIRST_K_DENSE_REPLACE="${FIRST_K_DENSE_REPLACE:-2}"
@@ -128,6 +141,7 @@ echo "  NUM_QUERY_GROUPS: ${NUM_QUERY_GROUPS} (GQA groups)"
 echo "  KV_CHANNELS: ${KV_CHANNELS}"
 echo "  QK_LAYERNORM: ${QK_LAYERNORM}"
 echo "  ROTARY_BASE: ${ROTARY_BASE}"
+echo "  MAX_POSITION_EMBEDDINGS: ${MAX_POSITION_EMBEDDINGS}"
 echo ""
 echo "MoE 配置:"
 echo "  FIRST_K_DENSE_REPLACE: ${FIRST_K_DENSE_REPLACE}"
@@ -166,7 +180,7 @@ python "${CONVERT_SCRIPT}" \
   --moe-ffn-hidden-size "${MOE_FFN_HIDDEN_SIZE}" \
   --n-shared-experts "${N_SHARED_EXPERTS}" \
   --moe-router-topk "${MOE_ROUTER_TOPK}" \
-  --max-position-embeddings "131072" \
+  --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}" \
   "${EXTRA_ARGS[@]}"
 
 echo ""
