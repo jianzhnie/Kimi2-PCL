@@ -17,8 +17,10 @@ import inspect
 import json
 import logging
 import os
+import pickle
 import re
 import sys
+import zipfile
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -159,6 +161,42 @@ def _resolve_iter_dir(load_dir: str) -> str:
     raise FileNotFoundError(
         f'无法定位迭代目录: {load_dir}\n'
         f'请确保目录包含 latest_checkpointed_iteration.txt 或 iter_XXXXXXX 子目录')
+
+
+class _KeyOnlyUnpickler(pickle.Unpickler):
+    """自定义 Unpickler：跳过 tensor/storage 实例化，仅用于读取顶层 dict 的 keys。"""
+
+    _BUILTIN_TYPES = {'dict': dict, 'list': list, 'tuple': tuple, 'set': set}
+
+    def persistent_load(self, saved_id):
+        return None
+
+    def find_class(self, module, name):
+        if module == 'collections' and name == 'OrderedDict':
+            return dict
+        if name in self._BUILTIN_TYPES:
+            return self._BUILTIN_TYPES[name]
+        return lambda *args, **kwargs: None
+
+
+def _peek_checkpoint_keys(path: str) -> Optional[List[str]]:
+    """
+    轻量读取 checkpoint 文件的顶层 key 列表，避免加载整个 state dict。
+    优先尝试 zipfile 格式（PyTorch 1.6+ 默认），失败则返回 None。
+    """
+    try:
+        with zipfile.ZipFile(path, 'r') as zf:
+            data_pkls = [n for n in zf.namelist() if n.endswith('/data.pkl')]
+            if not data_pkls:
+                return None
+            with zf.open(data_pkls[0]) as f:
+                up = _KeyOnlyUnpickler(f)
+                obj = up.load()
+                if isinstance(obj, dict):
+                    return sorted(list(obj.keys()))
+                return None
+    except Exception:
+        return None
 
 
 def _torch_load_compat(path: str, disable_mmap: bool = False) -> dict:
@@ -738,20 +776,34 @@ class CheckpointLoader:
                            expected)
 
     def _parse_pp_ep(self, idxs: List) -> Tuple[int, int]:
-        """解析 PP 和 EP 索引"""
+        """解析 PP 和 EP 索引，增加边界校验与交换容错"""
         if not idxs or idxs[0] is None:
             return 0, 0
 
         if len(idxs) >= 2:
-            # 明确的 pp_ep 或 ep_pp 格式，优先解释为 pp_ep
-            return idxs[0], idxs[1]
+            pp, ep = idxs[0], idxs[1]
+            # 交叉验证：如果按 pp_ep 解释超出范围，而按 ep_pp 解释在范围内，则交换
+            pp_ok = 0 <= pp < self.parallel.pp_size
+            ep_ok = 0 <= ep < self.parallel.ep_size
+            if not (pp_ok and ep_ok):
+                pp_swapped, ep_swapped = ep, pp
+                pp_ok_swapped = 0 <= pp_swapped < self.parallel.pp_size
+                ep_ok_swapped = 0 <= ep_swapped < self.parallel.ep_size
+                if pp_ok_swapped and ep_ok_swapped:
+                    logger.warning(
+                        '检测到 mp_rank 目录格式可能为 ep_pp (交换后: pp=%d, ep=%d)，'
+                        '已自动修正', pp_swapped, ep_swapped)
+                    return pp_swapped, ep_swapped
+                raise ValueError(
+                    f"无法解析 PP/EP 索引: 原始 (pp={pp}, ep={ep}) 或交换后 "
+                    f"(pp={pp_swapped}, ep={ep_swapped}) 均超出并行范围 "
+                    f"(PP={self.parallel.pp_size}, EP={self.parallel.ep_size})"
+                )
+            return pp, ep
 
         # 单索引情况：根据并行配置推断
         v = idxs[0]
         if self.parallel.pp_size > 1 and self.parallel.ep_size > 1:
-            # PP 和 EP 都大于 1 时，无法从单索引安全推断
-            # 假设格式为 tp_rank_pp_ep，其中 pp_ep 部分为 pp_rank * ep_size + ep_rank
-            # 但这里我们无法确定，抛出错误让用户检查
             raise ValueError(
                 f"无法从单索引 {v} 推断 PP/EP 位置 (PP={self.parallel.pp_size}, EP={self.parallel.ep_size}). "
                 f"请检查 mp_rank 目录命名格式是否为 mp_rank_XX_PP_EEE")
@@ -848,7 +900,10 @@ class CheckpointLoader:
         def load_one(tp: int, ep: int) -> Optional[Tuple[int, int, Dict]]:
             try:
                 return (tp, ep, self.load(tp, pp_rank, ep, vpp_rank))
-            except (FileNotFoundError, RuntimeError):
+            except Exception as e:
+                logger.warning(
+                    '加载 checkpoint 失败: tp=%d, pp=%d, ep=%d, vpp=%s, 原因: %s',
+                    tp, pp_rank, ep, vpp_rank, e)
                 return None
 
         if io_threads <= 1 or len(ranks_to_load) <= 1:
@@ -954,12 +1009,10 @@ class MCoreCheckpointReader:
             raise ValueError('并行度必须 > 0')
 
     def _detect_vpp(self) -> Tuple[Optional[int], List[str]]:
-        """检测 VPP 配置"""
+        """检测 VPP 配置，优先轻量读取避免加载整个 checkpoint"""
         try:
-            # 尝试加载第一个可用的 checkpoint
             for tp in range(self.parallel.tp_size):
                 for pp in range(self.parallel.pp_size):
-                    # EP>1 时，优先使用实际存在的 ep_rank，避免硬编码 ep=0
                     ep_ranks = self.loader._rank_dir_map.get((tp, pp), [])
                     if self.parallel.ep_size > 1 and not ep_ranks:
                         continue
@@ -968,13 +1021,23 @@ class MCoreCheckpointReader:
                     for ep in ep_candidates:
                         try:
                             path = self.loader.get_ckpt_path(tp, pp, ep)
+                            # 优先轻量读取 key 列表
+                            keys = _peek_checkpoint_keys(path)
+                            if keys is not None:
+                                model_keys = [
+                                    k for k in keys
+                                    if re.match(r'^model\d+$', k)
+                                ]
+                                if len(model_keys) > 1:
+                                    return len(model_keys), model_keys
+                                # 轻量读取发现只有 model 或 state_dict，说明无 VPP
+                                return None, []
+                            # 回退：完整加载
                             state = _torch_load_compat(path, self.disable_mmap)
-                            # 检查 state 结构
                             if 'state_dict' in state:
                                 state = state['state_dict']
                             elif 'model' in state:
                                 state = state['model']
-                            # 查找 model{N} 格式的 key
                             model_keys = [
                                 k for k in state.keys()
                                 if re.match(r'^model\d+$', k)
@@ -1077,7 +1140,11 @@ class MCoreCheckpointReader:
         self.loader.build_rank_map()
 
         # 检测并配置 VPP
-        self.parallel.vpp_size, _ = self._detect_vpp()
+        if self.parallel.dualpipe:
+            # DualPipe 模式固定 vpp_size=2，无需依赖 checkpoint 文件检测
+            self.parallel.vpp_size = 2
+        else:
+            self.parallel.vpp_size, _ = self._detect_vpp()
         if self.parallel.vpp_stage is None:
             if self.parallel.dualpipe:
                 # DualPipe: 默认每个 stage 包含的层数
@@ -1175,6 +1242,10 @@ class MCoreCheckpointReader:
                     mcore_full_name = final_name
 
                 if mcore_full_name in megatron_params:
+                    logger.warning(
+                        '权重 %s 已存在，跳过重复项 (pp=%d, vpp=%s). '
+                        '请检查 layer mapping 或 checkpoint 是否有冗余 stage 权重。',
+                        mcore_full_name, pp_rank, vpp_rank)
                     continue
 
                 # 收集信息

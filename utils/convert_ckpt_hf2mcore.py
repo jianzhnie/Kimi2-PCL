@@ -21,6 +21,7 @@ import json
 import logging as logger
 import os
 import time
+import types
 from collections import defaultdict
 from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
                                 as_completed)
@@ -172,6 +173,9 @@ class CkptConvert:
         if self.expert_tp_size > self.tp_size:
             raise ValueError(f'expert_tp_size ({self.expert_tp_size}) '
                              f'cannot exceed tp_size ({self.tp_size})')
+        if self.tp_size % self.expert_tp_size != 0:
+            raise ValueError(f'tp_size ({self.tp_size}) must be divisible by '
+                             f'expert_tp_size ({self.expert_tp_size})')
         self.schedules_method = schedules_method
         self.dualpipe = schedules_method == 'dualpipev'
         self.vpp_stage = vpp_stage
@@ -325,7 +329,7 @@ class CkptConvert:
             weights = self._load_matched_hf_weights(pp_rank, vpp_rank)
             if pp_rank == 0 and vpp_rank == 0:
                 self._set_preprocess(weights, mg_model[vpp_rank])
-            if self.dualpipe and pp_rank == 0 and vpp_rank == 1:
+            if self.dualpipe and pp_rank == 0 and vpp_rank == self.vpp_size - 1:
                 self._set_postprocess(weights, mg_model[vpp_rank])
 
             layer_list = self.vpprank_layer_idxs[pp_rank][vpp_rank]
@@ -473,6 +477,72 @@ class CkptConvert:
             raise KeyError(
                 'HF model missing model.norm.weight (final layernorm)')
 
+    def _build_checkpoint_args(self) -> argparse.Namespace:
+        """Build checkpoint args namespace for Megatron's check_checkpoint_args.
+
+        Megatron's checkpoint loading validates that the checkpoint args match
+        the current training configuration via getattr(checkpoint_args, name).
+        A plain dict fails because dicts don't support attribute access.
+        """
+        ns = argparse.Namespace()
+
+        # Core model architecture
+        ns.num_layers = self.num_layers
+        ns.hidden_size = self.hidden_size
+        ns.ffn_hidden_size = self.ffn_hidden_size or self.hidden_size * 4
+        ns.num_attention_heads = self.num_attention_heads
+        ns.num_query_groups = self.num_query_groups
+        ns.kv_channels = self.qk_head_dim
+        ns.seq_length = 4096
+        ns.max_position_embeddings = 131072
+        ns.vocab_size = self.vocab_size
+        ns.padded_vocab_size = self.vocab_size
+        ns.make_vocab_size_divisible_by = 1
+
+        # Parallelism
+        ns.tensor_model_parallel_size = self.tp_size
+        ns.pipeline_model_parallel_size = self.pp_size
+        ns.expert_model_parallel_size = self.ep_size
+        ns.expert_tensor_parallel_size = self.expert_tp_size
+        ns.context_parallel_size = 1
+
+        # MoE
+        ns.num_experts = self.num_experts
+        ns.moe_grouped_gemm = self.moe_grouped_gemm
+        ns.moe_ffn_hidden_size = self.moe_ffn_hidden_size
+        ns.first_k_dense_replace = self.first_k_dense_replace
+
+        # Model format
+        ns.use_mcore_models = True
+        ns.use_legacy_models = False
+        ns.untie_embeddings_and_output_weights = not self.tie_word_embeddings
+        ns.swiglu = True
+        ns.position_embedding_type = 'rope'
+        ns.normalization = 'RMSNorm'
+        ns.add_bias_linear = False
+        ns.norm_epsilon = 1e-6
+
+        # Data type
+        target_dtype = self._target_dtype or torch.bfloat16
+        ns.bf16 = (target_dtype == torch.bfloat16)
+        ns.fp16 = (target_dtype == torch.float16)
+        ns.params_dtype = target_dtype
+
+        # Rotary
+        ns.rotary_base = self.rotary_base
+        ns.use_rotary_position_embeddings = True
+
+        # QK LayerNorm
+        ns.qk_layernorm = self.qk_layernorm
+
+        # VPP / DualPipe
+        if self.dualpipe:
+            ns.schedules_method = 'dualpipev'
+        if self.vpp_stage is not None:
+            ns.num_layers_per_virtual_pipeline_stage = self.vpp_stage
+
+        return ns
+
     def _log_expected_param_summary(self) -> None:
         """Log expected Megatron parameter names per (ep, tp) rank pair."""
         num_dense = min(self.first_k_dense_replace, self.num_layers)
@@ -590,11 +660,10 @@ class CkptConvert:
             layers_each_vpp = [[self.vpp_stage] * self.vpp_size
                                for _ in range(self.pp_size)]
             if self.noop_layers_list:
+                layers_per_pp = self.num_layers // self.pp_size
                 for layer in self.noop_layers_list:
-                    vpp_idx = layer // self.vpp_stage // self.pp_size
-                    pp_idx = (
-                        layer %
-                        (self.pp_size * self.vpp_stage)) // self.vpp_stage
+                    pp_idx = layer // layers_per_pp
+                    vpp_idx = (layer % layers_per_pp) // self.vpp_stage
                     layers_each_vpp[pp_idx][vpp_idx] -= 1
 
             num_noop = len(self.noop_layers_list)
@@ -799,9 +868,10 @@ class CkptConvert:
         else:
             emb = weights.pop('model.embed_tokens.weight')
         emb_tp = torch.chunk(emb, self.tp_size, dim=0)
-        emb_shards = [
-            t.contiguous() if not t.is_contiguous() else t for t in emb_tp
-        ]
+        # NOTE: torch.chunk on a contiguous tensor produces contiguous views.
+        # torch.save serializes the full underlying Storage, not just the view.
+        # Must use .clone() to create independent tensors with own Storage.
+        emb_shards = [t.contiguous().clone() for t in emb_tp]
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
                 mg_model[ep_rank][tp_rank][
@@ -829,9 +899,7 @@ class CkptConvert:
             else:
                 raise KeyError('缺少 lm_head.weight 且未启用 tie_word_embeddings')
         lm_head_tp = torch.chunk(lm_head, self.tp_size, dim=0)
-        lm_head_shards = [
-            t.contiguous() if not t.is_contiguous() else t for t in lm_head_tp
-        ]
+        lm_head_shards = [t.contiguous().clone() for t in lm_head_tp]
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
                 mg_model[ep_rank][tp_rank][
@@ -940,12 +1008,10 @@ class CkptConvert:
         v_tp = torch.chunk(v_weight, self.tp_size, dim=0)
         o_proj_tp = torch.chunk(o_proj, self.tp_size, dim=1)
         qkv_shards = [
-            torch.cat([q_tp[i], k_tp[i], v_tp[i]], dim=0)
+            torch.cat([q_tp[i], k_tp[i], v_tp[i]], dim=0).clone()
             for i in range(self.tp_size)
         ]
-        o_proj_shards = [
-            t.contiguous() if not t.is_contiguous() else t for t in o_proj_tp
-        ]
+        o_proj_shards = [t.contiguous().clone() for t in o_proj_tp]
 
         for ep_rank in range(self.ep_size):
             for tp_rank in range(self.tp_size):
@@ -1015,15 +1081,14 @@ class CkptConvert:
             up = weights.pop(f'model.layers.{hf_layer}.mlp.up_proj.weight')
             down = weights.pop(f'model.layers.{hf_layer}.mlp.down_proj.weight')
 
-            fc1 = torch.cat([gate, up], dim=0)
-            fc1_tp = torch.chunk(fc1, self.tp_size, dim=0)
-            fc2_tp = torch.chunk(down, self.tp_size, dim=1)
+            gate_tp = torch.chunk(gate, self.tp_size, dim=0)
+            up_tp = torch.chunk(up, self.tp_size, dim=0)
             fc1_shards = [
-                t.contiguous() if not t.is_contiguous() else t for t in fc1_tp
+                torch.cat([g, u], dim=0).contiguous().clone()
+                for g, u in zip(gate_tp, up_tp)
             ]
-            fc2_shards = [
-                t.contiguous() if not t.is_contiguous() else t for t in fc2_tp
-            ]
+            fc2_tp = torch.chunk(down, self.tp_size, dim=1)
+            fc2_shards = [t.contiguous().clone() for t in fc2_tp]
             for ep_rank in range(self.ep_size):
                 for tp_rank in range(self.tp_size):
                     mg_model[ep_rank][tp_rank][
@@ -1077,18 +1142,12 @@ class CkptConvert:
         shared_fc1 = torch.cat([shared_gate, shared_up], dim=0)
         shared_fc1_tp = torch.chunk(shared_fc1, self.tp_size, dim=0)
         shared_fc2_tp = torch.chunk(shared_down, self.tp_size, dim=1)
-        shared_fc1_shards = [
-            t.contiguous() if not t.is_contiguous() else t
-            for t in shared_fc1_tp
-        ]
-        shared_fc2_shards = [
-            t.contiguous() if not t.is_contiguous() else t
-            for t in shared_fc2_tp
-        ]
+        shared_fc1_shards = [t.contiguous().clone() for t in shared_fc1_tp]
+        shared_fc2_shards = [t.contiguous().clone() for t in shared_fc2_tp]
 
         experts_linear_fc1_list: list[torch.Tensor] = []
         experts_linear_fc2_list: list[torch.Tensor] = []
-        expert_tp_size = 1
+        expert_tp_size = self.expert_tp_size
         for expert in range(self.num_experts):
             gate = weights.pop(
                 f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'
@@ -1154,24 +1213,31 @@ class CkptConvert:
             gemm_fc2_ep = torch.chunk(gemm_fc2, self.ep_size, dim=0)
             for ep_rank in range(self.ep_size):
                 if self.expert_tp_size > 1:
-                    # TP 按专家维度切分，每个 TP rank 获得一部分专家的完整 gate+up
+                    num_tp_shards = self.tp_size // self.expert_tp_size
                     fc1_tp = torch.chunk(gemm_fc1_ep[ep_rank],
-                                         self.expert_tp_size,
+                                         num_tp_shards,
                                          dim=0)
                     fc2_tp = torch.chunk(gemm_fc2_ep[ep_rank],
-                                         self.expert_tp_size,
+                                         num_tp_shards,
                                          dim=0)
                 else:
                     # expert_tp=1: 专家权重不做 TP 切分，所有 TP rank 获得相同权重
                     fc1_tp = [gemm_fc1_ep[ep_rank]]
                     fc2_tp = [gemm_fc2_ep[ep_rank]]
                 for tp_rank in range(self.tp_size):
-                    expert_tp_idx = (tp_rank * self.expert_tp_size //
-                                     self.tp_size)
-                    w1 = fc1_tp[expert_tp_idx].reshape(self.hidden_size,
-                                                       -1).contiguous()
+                    expert_tp_idx = tp_rank * self.expert_tp_size // self.tp_size
+                    # NOTE: reshape on a contiguous chunk returns a VIEW
+                    # of the full (all-experts) storage.  torch.save
+                    # serializes the entire underlying Storage, not just
+                    # the viewed portion, causing ~EP× disk bloat.
+                    # .clone() creates an independent tensor with its own
+                    # Storage containing only the needed expert subset.
+                    w1 = fc1_tp[expert_tp_idx].permute(1, 0,
+                                                       2).contiguous().reshape(
+                                                           self.hidden_size,
+                                                           -1).clone()
                     w2 = fc2_tp[expert_tp_idx].reshape(
-                        -1, self.hidden_size).contiguous()
+                        -1, self.hidden_size).clone()
                     mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
                     mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
                     self._maybe_quant_nf4(mg_model[ep_rank][tp_rank],
@@ -1195,17 +1261,15 @@ class CkptConvert:
                                                self.expert_tp_size,
                                                dim=1)
                     local_fc1_shards = [
-                        t.contiguous() if not t.is_contiguous() else t
-                        for t in local_fc1_tp
+                        t.contiguous().clone() for t in local_fc1_tp
                     ]
                     local_fc2_shards = [
-                        t.contiguous() if not t.is_contiguous() else t
-                        for t in local_fc2_tp
+                        t.contiguous().clone() for t in local_fc2_tp
                     ]
                 else:
                     # expert_tp=1: 不切分，所有 TP rank 获得相同权重
-                    local_fc1_shards = [local_fc1]
-                    local_fc2_shards = [local_fc2]
+                    local_fc1_shards = [local_fc1.contiguous().clone()]
+                    local_fc2_shards = [local_fc2.contiguous().clone()]
                 for tp_rank in range(self.tp_size):
                     expert_tp_idx = (tp_rank * self.expert_tp_size //
                                      self.tp_size)
@@ -1257,6 +1321,11 @@ class CkptConvert:
         outdir = os.path.join(self.iter_path, prefix)
         outpath = os.path.join(outdir, 'model_optim_rng.pt')
 
+        # Lazy-build checkpoint args (cached after first call)
+        if not hasattr(self, '_cached_ckpt_args'):
+            self._cached_ckpt_args = self._build_checkpoint_args()
+        ckpt_args = self._cached_ckpt_args
+
         if vpp:
             # 动态遍历所有 VPP stages，避免硬编码 model0/model1 导致 stage 丢失
             vpp_size = getattr(self, 'vpp_size', 2)
@@ -1268,18 +1337,14 @@ class CkptConvert:
             payload.update({
                 'checkpoint_version': 3.0,
                 'iteration': 1,
-                'args': {
-                    'rotary_base': self.rotary_base
-                },
+                'args': ckpt_args,
             })
         else:
             payload = {
                 'model': self._cast_model_dict(mg_model[ep_rank][tp_rank]),
                 'checkpoint_version': 3.0,
                 'iteration': 1,
-                'args': {
-                    'rotary_base': self.rotary_base
-                },
+                'args': ckpt_args,
             }
 
         torch.save(payload,

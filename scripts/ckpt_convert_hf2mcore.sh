@@ -12,11 +12,26 @@
 #   - MoE: 128 experts, 前 2 层为 Dense
 #   - Vocab size: 163840
 #
-# 默认并行配置 (与训练脚本 pretrain_kimi2_1t_4k.sh 保持一致):
-#   - TP (Tensor Parallel): 2
-#   - PP (Pipeline Parallel): 8
-#   - EP (Expert Parallel): 64
-#   - 调度: DualPipeV
+# 支持 3 种并行模式:
+#   1. DualPipeV (默认): --schedules-method dualpipev
+#      层分配为交替前/后取，VPP=2 自动设置
+#   2. 标准 VPP: --vpp-stage N (不设 schedules-method)
+#      每个虚拟 pipeline stage 包含 N 层
+#   3. 纯 PP: 不设 schedules-method 和 vpp-stage
+#      每个 PP rank 平分所有层
+#
+# 使用示例:
+#   # 模式1: DualPipeV (与训练脚本一致)
+#   bash scripts/ckpt_convert_hf2mcore.sh
+#
+#   # 模式2: 标准 VPP (PP=4, 每 vpp stage 4 层, vpp_size=2)
+#   SCHEDULES_METHOD="" VPP_STAGE=4 PP=4 bash scripts/ckpt_convert_hf2mcore.sh
+#
+#   # 模式3: 纯 PP (PP=8, 无 VPP)
+#   SCHEDULES_METHOD="" bash scripts/ckpt_convert_hf2mcore.sh
+#
+#   # 自定义路径
+#   LOAD_DIR=/path/to/hf SAVE_DIR=/path/to/output bash scripts/ckpt_convert_hf2mcore.sh
 # =============================================================================
 
 set -euo pipefail
@@ -57,18 +72,25 @@ fi
 
 
 # =============================================================================
-# 并行配置 (与训练脚本 pretrain_kimi2_1t_4k.sh 保持一致)
+# 并行配置
+#
+# 根据并行模式设置不同默认值:
+#   DualPipeV: TP=2 PP=8 EP=64 SCHEDULES_METHOD=dualpipev
+#   标准 VPP:  TP=2 PP=4 EP=64 VPP_STAGE=4
+#   纯 PP:     TP=2 PP=8 EP=64
+#
+# 所有参数均可通过环境变量覆盖。
 # =============================================================================
 TP="${TP:-2}"                          # Tensor Parallel size
 PP="${PP:-8}"                          # Pipeline Parallel size
-EP="${EP:-8}"                       # Expert Parallel size
-VPP_STAGE="${VPP_STAGE:-}"             # VPP stage (dualpipev 下留空)
+EP="${EP:-8}"                         # Expert Parallel size
+VPP_STAGE="${VPP_STAGE:-}"             # VPP stage 层数 (仅标准 VPP 模式使用)
 PP_WORKERS="${PP_WORKERS:-2}"          # PP 并行工作进程数
 IO_THREADS="${IO_THREADS:-2}"          # HF 权重加载线程数
 SAVE_WORKERS="${SAVE_WORKERS:-1}"      # 保存权重线程数 (0=自动)
 CAST_DTYPE="${CAST_DTYPE:-bf16}"       # 输出数据类型
 EXPERT_TP="${EXPERT_TP:-1}"            # Expert tensor parallel size (训练使用 expert-tp=1)
-SCHEDULES_METHOD="${SCHEDULES_METHOD:-}"  # 调度算法 (与训练脚本一致，默认 dualpipev)
+SCHEDULES_METHOD="${SCHEDULES_METHOD:-}"  # 调度算法 (dualpipev | 留空)
 
 # =============================================================================
 # 模型架构配置 (与 models/config.json 保持一致)
@@ -121,15 +143,61 @@ if [[ ! -f "${CONVERT_SCRIPT}" ]]; then
   exit 4
 fi
 
-EXTRA_ARGS=()
+# =============================================================================
+# 确定并行模式并验证参数兼容性
+# =============================================================================
+MODE="pure_pp"  # 默认纯 PP
 if [[ -n "${SCHEDULES_METHOD}" ]]; then
+  MODE="dualpipe"
+  if [[ -n "${VPP_STAGE}" ]]; then
+    echo "ERROR: dualpipev 与 --vpp-stage 不兼容，请勿同时设置 SCHEDULES_METHOD 和 VPP_STAGE" >&2
+    exit 5
+  fi
+  if [[ -n "${NUM_LAYER_LIST}" ]]; then
+    echo "ERROR: dualpipev 与 --num-layer-list 不兼容" >&2
+    exit 5
+  fi
+elif [[ -n "${VPP_STAGE}" ]]; then
+  MODE="standard_vpp"
+  if [[ -n "${NUM_LAYER_LIST}" ]]; then
+    echo "ERROR: VPP 与 --num-layer-list 不兼容" >&2
+    exit 5
+  fi
+  # 验证 VPP_STAGE 参数: (NUM_LAYERS / PP) 必须能被 VPP_STAGE 整除
+  layers_per_pp=$((NUM_LAYERS / PP))
+  if [[ $((layers_per_pp % VPP_STAGE)) -ne 0 ]]; then
+    echo "ERROR: 每PP层数 (${layers_per_pp}) 必须能被 VPP_STAGE (${VPP_STAGE}) 整除" >&2
+    exit 5
+  fi
+fi
+
+echo "==========================================="
+echo " HF -> MCore 权重转换"
+echo "==========================================="
+echo "  模式: ${MODE}"
+echo "  LOAD_DIR:  ${LOAD_DIR}"
+echo "  SAVE_DIR:  ${SAVE_DIR}"
+echo "  TP=${TP}, PP=${PP}, EP=${EP}"
+if [[ "${MODE}" == "standard_vpp" ]]; then
+  echo "  VPP_STAGE=${VPP_STAGE} (vpp_size=$(( NUM_LAYERS / PP / VPP_STAGE )))"
+fi
+echo "  PP_WORKERS=${PP_WORKERS}, SAVE_WORKERS=${SAVE_WORKERS}"
+echo "  EXPERT_TP=${EXPERT_TP}, CAST_DTYPE=${CAST_DTYPE}"
+echo "==========================================="
+echo ""
+
+# =============================================================================
+# 构建转换参数
+# =============================================================================
+EXTRA_ARGS=()
+if [[ "${MODE}" == "dualpipe" ]]; then
   EXTRA_ARGS+=(--schedules-method "${SCHEDULES_METHOD}")
+fi
+if [[ "${MODE}" == "standard_vpp" ]]; then
+  EXTRA_ARGS+=(--vpp-stage "${VPP_STAGE}")
 fi
 if [[ -n "${NUM_LAYER_LIST}" ]]; then
   EXTRA_ARGS+=(--num-layer-list "${NUM_LAYER_LIST}")
-fi
-if [[ -n "${VPP_STAGE:-}" ]]; then
-  EXTRA_ARGS+=(--vpp-stage "${VPP_STAGE}")
 fi
 QK_LAYERNORM="${QK_LAYERNORM:-1}"   # Kimi2-1T 模型启用 QK LayerNorm，默认开启
 
@@ -142,15 +210,6 @@ fi
 if [[ "${TIE_WORD_EMBEDDINGS:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--tie-word-embeddings)
 fi
-
-echo "Starting conversion..."
-echo "  LOAD_DIR: ${LOAD_DIR}"
-echo "  SAVE_DIR: ${SAVE_DIR}"
-echo "  TP=${TP}, PP=${PP}, EP=${EP}"
-echo "  PP_WORKERS=${PP_WORKERS}, SAVE_WORKERS=${SAVE_WORKERS}"
-echo "  SCHEDULES_METHOD=${SCHEDULES_METHOD}"
-echo "  EXPERT_TP=${EXPERT_TP}"
-echo ""
 
 python "${CONVERT_SCRIPT}" \
   --load-dir "${LOAD_DIR}" \
