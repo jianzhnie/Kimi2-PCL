@@ -192,6 +192,7 @@ class MgCkptConvert:
         rotary_base: float,
         vocab_size: int | None = None,
         max_position_embeddings: int | None = None,
+        v_head_dim: int | None = None,
         tie_word_embeddings: bool = False,
         ffn_hidden_size: int | None = None,
         moe_ffn_hidden_size: int | None = None,
@@ -221,9 +222,8 @@ class MgCkptConvert:
         self.num_attention_heads = num_attention_heads
         self.num_query_groups = num_query_groups
         self.qk_head_dim = qk_head_dim
-        # GQA 配置: qk_head_dim=128 (kv_channels), v_head_dim=128
-        # 标准 GQA 使用统一的 head 维度，不需要 MLA 的 decoupled RoPE 处理
-        self.v_head_dim = qk_head_dim
+        # GQA: qk_head_dim = kv_channels, v_head_dim defaults to qk_head_dim
+        self.v_head_dim = v_head_dim if v_head_dim is not None else qk_head_dim
         self.moe_grouped_gemm = moe_grouped_gemm
         self.qk_layernorm = qk_layernorm
         self.schedules_method = schedules_method
@@ -278,7 +278,7 @@ class MgCkptConvert:
             self.layer2loc_vpp: dict[int, tuple[int, int, int]] = {}
             self._build_vpprank_layer_map()
 
-        # GQA 使用标准 RoPE，head_dim 为完整的 qk_head_dim
+        # GQA: RoPE uses full qk_head_dim
         self._head_dim_for_rope = qk_head_dim
         self._reset_inv_freq()
 
@@ -388,9 +388,7 @@ class MgCkptConvert:
         cfg['num_hidden_layers'] = self.num_real_layers
         cfg['num_attention_heads'] = self.num_attention_heads
         cfg['num_key_value_heads'] = self.num_query_groups
-        # GQA 配置
-        cfg['qk_head_dim'] = self.qk_head_dim
-        cfg['v_head_dim'] = self.v_head_dim
+        cfg['kv_channels'] = self.qk_head_dim
         cfg['qk_layernorm'] = self.qk_layernorm
         cfg['rope_theta'] = float(self.rotary_base)
         cfg['ep_size'] = self.ep_size
@@ -480,19 +478,21 @@ class MgCkptConvert:
                     idxs.append(int(p))
                 except ValueError:
                     idxs.append(None)
+            # Positional parsing: _mp_prefix always formats as
+            # mp_rank_{tp:02}_{pp:03}_{ep:03} (pp before ep)
             pp = None
             ep = None
-            for v in idxs:
-                if v is None:
-                    continue
-                if pp is None and v < self.pp_size:
-                    pp = v
-                    continue
-                if ep is None and v < self.ep_size:
-                    ep = v
-            if pp is None and self.pp_size == 1:
+            if self.pp_size > 1 and self.ep_size > 1 and len(idxs) >= 2:
+                pp = idxs[0]
+                ep = idxs[1]
+            elif self.pp_size > 1 and self.ep_size == 1:
+                pp = idxs[0] if idxs else None
+                ep = 0
+            elif self.pp_size == 1 and self.ep_size > 1:
                 pp = 0
-            if ep is None and self.ep_size == 1:
+                ep = idxs[0] if idxs else None
+            else:
+                pp = 0
                 ep = 0
             if pp is None or ep is None:
                 continue
@@ -845,7 +845,7 @@ class MgCkptConvert:
             raise ValueError(
                 f'num_attention_heads={self.num_attention_heads} 不能整除 tp_size={self.tp_size}'
             )
-        # GQA: 使用标准 head_dim，不需要 MLA 的 decoupled 维度
+        # GQA: Q/K share head_dim for RoPE compatibility
         q_head_dim = self._resolved_q_head_dim or self.qk_head_dim
         kv_heads_per_tp_fixed = self._resolved_kv_heads_per_tp
 
@@ -899,7 +899,13 @@ class MgCkptConvert:
             kv_heads_per_tp = kv_heads_per_tp_fixed or (rem // denom)
             if self.detected_num_kv_heads is None:
                 self.detected_num_kv_heads = kv_heads_per_tp * self.tp_size
-            # GQA: K 使用与 Q 相同的 head_dim
+                if self.detected_num_kv_heads != self.num_query_groups:
+                    raise ValueError(
+                        f'Detected num_kv_heads={self.detected_num_kv_heads} from checkpoint '
+                        f'does not match --num-query-groups={self.num_query_groups}. '
+                        f'Check your training config.'
+                    )
+            # GQA: K uses q_head_dim for RoPE compatibility
             k_per_tp = kv_heads_per_tp * q_head_dim
             v_per_tp = kv_heads_per_tp * self.v_head_dim
             q_r, k_r, v_r = torch.split(qkv_shard,
@@ -923,6 +929,9 @@ class MgCkptConvert:
         k_ln = models[(0, 0)].pop(k_norm_key, None)
         if k_ln is not None:
             hf[f'model.layers.{hf_layer}.self_attn.k_layernorm.weight'] = k_ln
+        # Note: inv_freq is registered with persistent=False in the HF model,
+        # so it is recomputed at load time. Written here for verification
+        # tooling (verify_mcore2hf.py) compatibility.
         hf[f'model.layers.{hf_layer}.self_attn.rotary_emb.inv_freq'] = self.inv_freq.clone(
         )
         return
@@ -1003,6 +1012,11 @@ class MgCkptConvert:
                     hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate
                     hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up
                     hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = down
+                # Evict processed EP rank from sparse cache
+                for tp_rank in owners:
+                    cache_key = (int(tp_rank), int(pp_rank), int(ep_rank),
+                                 None if vpp_rank is None else int(vpp_rank))
+                    self._sparse_cache.pop(cache_key, None)
         else:
             num_local = self.num_experts // self.ep_size
             for ep_rank in range(self.ep_size):
@@ -1044,6 +1058,11 @@ class MgCkptConvert:
 
                 for _, st in local_states.items():
                     del st
+                # Evict processed EP rank from sparse cache
+                for tp_rank in owners:
+                    cache_key = (int(tp_rank), int(pp_rank), int(ep_rank),
+                                 None if vpp_rank is None else int(vpp_rank))
+                    self._sparse_cache.pop(cache_key, None)
                 gc.collect()
 
     def _maybe_cast(self, t: torch.Tensor) -> torch.Tensor:
@@ -1321,6 +1340,10 @@ def get_args():
                         type=int,
                         default=128,
                         help='Q/K head dimension (kv-channels).')
+    parser.add_argument('--v-head-dim',
+                        type=int,
+                        default=None,
+                        help='V head dimension (default: same as qk-head-dim).')
     parser.add_argument('--max-position-embeddings',
                         type=int,
                         default=None,
@@ -1383,6 +1406,7 @@ def main() -> None:
         num_attention_heads=args.num_attention_heads,
         num_query_groups=args.num_query_groups,
         qk_head_dim=args.qk_head_dim,
+        v_head_dim=args.v_head_dim,
         moe_grouped_gemm=args.moe_grouped_gemm,
         schedules_method=args.schedules_method,
         vpp_stage=args.num_layers_per_virtual_pipeline_stage,
