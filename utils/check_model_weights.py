@@ -175,7 +175,9 @@ def main() -> int:
     # If no specific action requested, require checkpoint
     if not (args.estimate_params or args.verify_config or args.verify_all):
         if args.checkpoint is None:
-            parser.error("checkpoint is required unless using --estimate-params, --verify-config, or --verify-all")
+            parser.error(
+                'checkpoint is required unless using --estimate-params, --verify-config, or --verify-all'
+            )
         return _main_check_checkpoint(args)
 
     exit_code = 0
@@ -234,7 +236,8 @@ def estimate_model_params(
     o_proj = num_attention_heads * v_head_dim * hidden_size
     qk_layernorm = num_attention_heads * q_head_dim + num_key_value_heads * q_head_dim
 
-    per_layer_params['attention'] = q_proj + k_proj + v_proj + o_proj + qk_layernorm
+    per_layer_params[
+        'attention'] = q_proj + k_proj + v_proj + o_proj + qk_layernorm
 
     # LayerNorm 参数
     per_layer_params['layernorm'] = 2 * hidden_size  # input_ln + pre_mlp_ln
@@ -253,12 +256,17 @@ def estimate_model_params(
     # Shared experts
     shared_experts = hidden_size * moe_intermediate_size * 2 + moe_intermediate_size * hidden_size
     # Routed experts
-    routed_experts = num_experts * (hidden_size * moe_intermediate_size * 2 + moe_intermediate_size * hidden_size)
+    routed_experts = num_experts * (hidden_size * moe_intermediate_size * 2 +
+                                    moe_intermediate_size * hidden_size)
     per_layer_params['moe_mlp'] = router + shared_experts + routed_experts
 
     # 所有层总参数
-    dense_total = dense_layers * (per_layer_params['attention'] + per_layer_params['layernorm'] + per_layer_params['dense_mlp'])
-    moe_total = moe_layers * (per_layer_params['attention'] + per_layer_params['layernorm'] + per_layer_params['moe_mlp'])
+    dense_total = dense_layers * (per_layer_params['attention'] +
+                                  per_layer_params['layernorm'] +
+                                  per_layer_params['dense_mlp'])
+    moe_total = moe_layers * (per_layer_params['attention'] +
+                              per_layer_params['layernorm'] +
+                              per_layer_params['moe_mlp'])
     params['layers'] = dense_total + moe_total
 
     # 输出层
@@ -267,9 +275,7 @@ def estimate_model_params(
 
     # 总参数量
     params['total'] = sum([
-        params['embedding'],
-        params['layers'],
-        params['lm_head'],
+        params['embedding'], params['layers'], params['lm_head'],
         params['final_layernorm']
     ])
 
@@ -296,9 +302,9 @@ def verify_config_consistency(repo_root: Path) -> bool:
     with open(json_path) as f:
         json_cfg = json.load(f)
 
-    print("=" * 60)
-    print("配置文件一致性验证")
-    print("=" * 60)
+    print('=' * 60)
+    print('配置文件一致性验证')
+    print('=' * 60)
 
     mismatches = []
 
@@ -329,7 +335,7 @@ def verify_config_consistency(repo_root: Path) -> bool:
 
         if py_val != json_val:
             mismatches.append((py_attr, py_val, json_val))
-    
+
     # Check optional mappings only if they exist in both
     for py_attr, json_key in optional_mappings:
         if hasattr(cfg, py_attr) and json_key in json_cfg:
@@ -339,12 +345,12 @@ def verify_config_consistency(repo_root: Path) -> bool:
                 mismatches.append((py_attr, py_val, json_val))
 
     if mismatches:
-        print("❌ 发现配置不匹配:")
+        print('❌ 发现配置不匹配:')
         for attr, py_val, json_val in mismatches:
             print(f"  {attr}: Python={py_val}, JSON={json_val}")
         return False
     else:
-        print("✓ 所有配置参数一致")
+        print('✓ 所有配置参数一致')
         return True
 
 
@@ -356,10 +362,10 @@ def verify_pretrain_script_consistency(repo_root: Path) -> bool:
         print(f"Warning: {script_path} not found, skipping script check")
         return True
 
-    print("")
-    print("=" * 60)
-    print("预训练脚本与配置一致性验证")
-    print("=" * 60)
+    print('')
+    print('=' * 60)
+    print('预训练脚本与配置一致性验证')
+    print('=' * 60)
 
     # 读取脚本内容
     with open(script_path) as f:
@@ -387,19 +393,19 @@ def verify_pretrain_script_consistency(repo_root: Path) -> bool:
             all_found = False
 
     if all_found:
-        print("\n✓ 预训练脚本参数完整")
+        print('\n✓ 预训练脚本参数完整')
     else:
-        print("\n⚠ 部分参数可能需要手动检查")
+        print('\n⚠ 部分参数可能需要手动检查')
 
     return True
 
 
 def print_parameter_estimate():
     """打印参数量估算"""
-    print("")
-    print("=" * 60)
-    print("模型参数量估算 (Kimi2-1T)")
-    print("=" * 60)
+    print('')
+    print('=' * 60)
+    print('模型参数量估算 (Kimi2-1T)')
+    print('=' * 60)
 
     params = estimate_model_params()
     per_layer = params['per_layer']
@@ -409,18 +415,32 @@ def print_parameter_estimate():
     print(f"  MoE 层数:   {params['moe_layers']}")
 
     print(f"\n每层参数量:")
-    print(f"  Attention:   {per_layer['attention']:>15,} ({per_layer['attention']/1e9:.2f}B)")
+    print(
+        f"  Attention:   {per_layer['attention']:>15,} ({per_layer['attention']/1e9:.2f}B)"
+    )
     print(f"  LayerNorm:   {per_layer['layernorm']:>15,}")
-    print(f"  Dense MLP:   {per_layer['dense_mlp']:>15,} ({per_layer['dense_mlp']/1e9:.2f}B)")
-    print(f"  MoE MLP:     {per_layer['moe_mlp']:>15,} ({per_layer['moe_mlp']/1e9:.2f}B)")
+    print(
+        f"  Dense MLP:   {per_layer['dense_mlp']:>15,} ({per_layer['dense_mlp']/1e9:.2f}B)"
+    )
+    print(
+        f"  MoE MLP:     {per_layer['moe_mlp']:>15,} ({per_layer['moe_mlp']/1e9:.2f}B)"
+    )
 
     print(f"\n总参数量:")
-    print(f"  Embedding 层:       {params['embedding']:>15,} ({params['embedding']/1e9:.2f}B)")
-    print(f"  Transformer 层:     {params['layers']:>15,} ({params['layers']/1e9:.2f}B)")
-    print(f"  LM Head:            {params['lm_head']:>15,} ({params['lm_head']/1e9:.2f}B)")
+    print(
+        f"  Embedding 层:       {params['embedding']:>15,} ({params['embedding']/1e9:.2f}B)"
+    )
+    print(
+        f"  Transformer 层:     {params['layers']:>15,} ({params['layers']/1e9:.2f}B)"
+    )
+    print(
+        f"  LM Head:            {params['lm_head']:>15,} ({params['lm_head']/1e9:.2f}B)"
+    )
     print(f"  Final LayerNorm:    {params['final_layernorm']:>15,}")
-    print("-" * 60)
-    print(f"  总计:               {params['total']:>15,} ({params['total']/1e9:.2f}B)")
+    print('-' * 60)
+    print(
+        f"  总计:               {params['total']:>15,} ({params['total']/1e9:.2f}B)"
+    )
 
     # 计算 BF16 模型大小
     bf16_bytes = params['total'] * 2  # BF16 = 2 bytes
@@ -588,10 +608,11 @@ def _main_check_checkpoint(args):
         qk_nope_head_dim = getattr(config, 'qk_nope_head_dim', 128)
         qk_rope_head_dim = getattr(config, 'qk_rope_head_dim', 64)
         v_head_dim = getattr(config, 'v_head_dim', 128)
-        exp_q_out = config.num_attention_heads * (qk_nope_head_dim + qk_rope_head_dim)
+        exp_q_out = config.num_attention_heads * (qk_nope_head_dim +
+                                                  qk_rope_head_dim)
         exp_k_out = getattr(
-            config, 'num_key_value_heads', config.num_attention_heads) * (
-                qk_nope_head_dim + qk_rope_head_dim)
+            config, 'num_key_value_heads',
+            config.num_attention_heads) * (qk_nope_head_dim + qk_rope_head_dim)
         exp_v_out = getattr(config, 'num_key_value_heads',
                             config.num_attention_heads) * v_head_dim
         exp_o_in = config.num_attention_heads * v_head_dim

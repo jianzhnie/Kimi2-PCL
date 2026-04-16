@@ -669,7 +669,9 @@ class MgCkptConvert:
                 models[(tp, 0)] = st
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                futures = [ex.submit(load_one, tp) for tp in range(self.tp_size)]
+                futures = [
+                    ex.submit(load_one, tp) for tp in range(self.tp_size)
+                ]
                 for fut in as_completed(futures):
                     tp, base_ep, st = fut.result()
                     if st is None or base_ep is None:
@@ -1257,9 +1259,10 @@ def get_args():
         '--num-layer-list',
         type=str,
         help='a list of number of layers, separated by comma; e.g., 4,4,4,4')
-    parser.add_argument('--qk-layernorm',
-                        action='store_true',
-                        help='Enable QK LayerNorm (must match training config)')
+    parser.add_argument(
+        '--qk-layernorm',
+        action='store_true',
+        help='Enable QK LayerNorm (must match training config)')
     parser.add_argument(
         '--schedules-method',
         type=str,

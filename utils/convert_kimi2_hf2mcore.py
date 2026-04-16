@@ -95,7 +95,7 @@ class CkptConvert(object):
         if dualpipe:
             if vpp_stage:
                 raise ValueError(
-                    f"dualpipe is not compatible with virtual pipeline parallel."
+                    'dualpipe is not compatible with virtual pipeline parallel.'
                 )
             self.vpp_size = 2
             self.vpp_stage = self.num_layers // self.pp_size // self.vpp_size
