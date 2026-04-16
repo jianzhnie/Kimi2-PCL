@@ -313,6 +313,8 @@ class TestKimi2Mcore2Hf(unittest.TestCase):
 
     def test_get_pt_path(self):
         """测试 checkpoint 路径生成"""
+        self._create_mock_mcore_checkpoint(tp_size=2, pp_size=4, ep_size=8,
+                                           num_layers=4, first_k_dense_replace=2)
         converter = MgCkptConvert(
             mg_model_path=self.mcore_dir,
             hf_save_path=self.hf_dir,
@@ -329,25 +331,25 @@ class TestKimi2Mcore2Hf(unittest.TestCase):
             vocab_size=100,
         )
 
-        # TP only
-        converter.tp_size = 2
-        converter.pp_size = 1
-        converter.ep_size = 1
-        path = converter.get_pt_path_by_tpppep_rank('/tmp', 1, 0, 0)
-        self.assertIn('mp_rank_01', path)
+        iter_path = converter.iter_path
 
-        # TP + PP
-        converter.pp_size = 4
-        path = converter.get_pt_path_by_tpppep_rank('/tmp', 1, 2, 0)
-        self.assertIn('mp_rank_01_002', path)
+        # TP + PP + EP: 验证存在的文件能正确找到
+        path = converter.get_pt_path_by_tpppep_rank(iter_path, 0, 0, 0)
+        self.assertIn('mp_rank_00_000_000', path)
+        self.assertTrue(os.path.isfile(path))
 
-        # TP + PP + EP
-        converter.ep_size = 8
-        path = converter.get_pt_path_by_tpppep_rank('/tmp', 1, 2, 3)
-        self.assertIn('mp_rank_01_002_003', path)
+        path = converter.get_pt_path_by_tpppep_rank(iter_path, 1, 3, 7)
+        self.assertIn('mp_rank_01_003_007', path)
+        self.assertTrue(os.path.isfile(path))
+
+        # 不存在的文件应抛出 FileNotFoundError
+        with self.assertRaises(FileNotFoundError):
+            converter.get_pt_path_by_tpppep_rank(iter_path, 0, 99, 0)
 
     def test_parameter_validation(self):
         """测试参数验证"""
+        self._create_mock_mcore_checkpoint(tp_size=2, pp_size=2, ep_size=1,
+                                           num_layers=4, first_k_dense_replace=2)
         # 有效配置
         converter = MgCkptConvert(
             mg_model_path=self.mcore_dir,
@@ -383,6 +385,146 @@ class TestKimi2Mcore2Hf(unittest.TestCase):
                 kv_channels=8,
                 vocab_size=100,
             )
+
+    def test_qk_layernorm_and_rotary_base(self):
+        """测试 qk_layernorm 和 rotary_base 参数"""
+        self._create_mock_mcore_checkpoint(tp_size=1,
+                                           pp_size=1,
+                                           ep_size=1,
+                                           num_layers=4,
+                                           first_k_dense_replace=2)
+
+        converter = MgCkptConvert(
+            mg_model_path=self.mcore_dir,
+            hf_save_path=self.hf_dir,
+            num_layers=4,
+            tp_size=1,
+            pp_size=1,
+            ep_size=1,
+            num_dense_layers=2,
+            hidden_size=64,
+            num_experts=8,
+            num_attention_heads=8,
+            num_query_groups=2,
+            kv_channels=8,
+            vocab_size=100,
+            qk_layernorm=True,
+            rotary_base=50000.0,
+        )
+
+        self.assertTrue(converter.qk_layernorm)
+        self.assertEqual(converter.rotary_base, 50000.0)
+
+    def test_full_conversion_pp2(self):
+        """测试完整 PP=2 转换流程，验证输出 safetensors 文件"""
+        self._create_mock_mcore_checkpoint(tp_size=1,
+                                           pp_size=2,
+                                           ep_size=1,
+                                           num_layers=4,
+                                           first_k_dense_replace=2)
+
+        converter = MgCkptConvert(
+            mg_model_path=self.mcore_dir,
+            hf_save_path=self.hf_dir,
+            num_layers=4,
+            tp_size=1,
+            pp_size=2,
+            ep_size=1,
+            num_dense_layers=2,
+            hidden_size=64,
+            num_experts=8,
+            num_attention_heads=8,
+            num_query_groups=2,
+            kv_channels=8,
+            vocab_size=100,
+            moe_grouped_gemm=False,
+        )
+
+        converter.run()
+
+        # 验证输出文件存在
+        index_file = os.path.join(self.hf_dir,
+                                  'model.safetensors.index.json')
+        self.assertTrue(os.path.isfile(index_file))
+
+        # 验证 index 文件内容
+        with open(index_file) as f:
+            index = json.load(f)
+        self.assertIn('weight_map', index)
+        weight_map = index['weight_map']
+
+        # 验证关键权重存在
+        self.assertIn('model.embed_tokens.weight', weight_map)
+        self.assertIn('model.norm.weight', weight_map)
+        self.assertIn('lm_head.weight', weight_map)
+
+        # 验证每层都有注意力权重
+        for layer_idx in range(4):
+            self.assertIn(
+                f'model.layers.{layer_idx}.self_attn.q_proj.weight',
+                weight_map)
+            self.assertIn(
+                f'model.layers.{layer_idx}.self_attn.k_proj.weight',
+                weight_map)
+            self.assertIn(
+                f'model.layers.{layer_idx}.self_attn.v_proj.weight',
+                weight_map)
+
+    def test_gqa_with_tp2(self):
+        """测试 TP=2 时 GQA QKV 正确拆分 (per-shard split)"""
+        self._create_mock_mcore_checkpoint(tp_size=2,
+                                           pp_size=1,
+                                           ep_size=1,
+                                           num_layers=4,
+                                           first_k_dense_replace=2)
+
+        converter = MgCkptConvert(
+            mg_model_path=self.mcore_dir,
+            hf_save_path=self.hf_dir,
+            num_layers=4,
+            tp_size=2,
+            pp_size=1,
+            ep_size=1,
+            num_dense_layers=2,
+            hidden_size=64,
+            num_experts=8,
+            num_attention_heads=8,
+            num_query_groups=2,
+            kv_channels=8,
+            vocab_size=100,
+            moe_grouped_gemm=False,
+        )
+
+        converter.run()
+
+        # 验证 Q/K/V 维度正确
+        index_file = os.path.join(self.hf_dir,
+                                  'model.safetensors.index.json')
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index['weight_map']
+
+        # 读取一个 safetensors 文件并检查权重形状
+        import safetensors.torch
+        shard_file = os.path.join(self.hf_dir, weight_map[
+            'model.layers.0.self_attn.q_proj.weight'])
+        tensors = safetensors.torch.load_file(shard_file)
+
+        # Q: [num_heads * head_dim, hidden_size] = [64, 64]
+        q_shape = tensors['model.layers.0.self_attn.q_proj.weight'].shape
+        self.assertEqual(q_shape, (64, 64))
+
+        # K: [num_query_groups * head_dim, hidden_size] = [16, 64]
+        k_shape = tensors['model.layers.0.self_attn.k_proj.weight'].shape
+        self.assertEqual(k_shape, (16, 64))
+
+        # V: [num_query_groups * head_dim, hidden_size] = [16, 64]
+        v_shape = tensors['model.layers.0.self_attn.v_proj.weight'].shape
+        self.assertEqual(v_shape, (16, 64))
+
+        # O: [hidden_size, num_heads * head_dim] = [64, 64]
+        o_shape = tensors['model.layers.0.self_attn.o_proj.weight'].shape
+        self.assertEqual(o_shape, (64, 64))
 
 
 if __name__ == '__main__':
