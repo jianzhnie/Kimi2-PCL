@@ -21,14 +21,17 @@
 #      每个 PP rank 平分所有层
 #
 # 使用示例:
-#   # 模式1: DualPipeV (与训练脚本一致)
+#   # 模式1: DualPipeV (与训练脚本一致, TP=2 PP=8 EP=64)
 #   bash scripts/ckpt_convert_hf2mcore.sh
 #
 #   # 模式2: 标准 VPP (PP=4, 每 vpp stage 4 层, vpp_size=2)
-#   SCHEDULES_METHOD="" VPP_STAGE=4 PP=4 bash scripts/ckpt_convert_hf2mcore.sh
+#   SCHEDULES_METHOD="" VPP_STAGE=4 PP=4 EP=64 bash scripts/ckpt_convert_hf2mcore.sh
 #
 #   # 模式3: 纯 PP (PP=8, 无 VPP)
 #   SCHEDULES_METHOD="" bash scripts/ckpt_convert_hf2mcore.sh
+#
+#   # 模式4: 单卡转换 (无并行, TP=1 PP=1 EP=1)
+#   SCHEDULES_METHOD="" TP=1 PP=1 EP=1 bash scripts/ckpt_convert_hf2mcore.sh
 #
 #   # 自定义路径
 #   LOAD_DIR=/path/to/hf SAVE_DIR=/path/to/output bash scripts/ckpt_convert_hf2mcore.sh
