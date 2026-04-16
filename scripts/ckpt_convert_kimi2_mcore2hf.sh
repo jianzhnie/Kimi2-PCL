@@ -30,6 +30,18 @@
 
 set -euo pipefail
 
+if [[ -f "${HOME}/.bashrc" ]]; then
+  set +u
+  source "${HOME}/.bashrc"
+  set -u
+fi
+
+# 可选的昇腾环境设置（如果存在）
+if [[ -f "/usr/local/Ascend/ascend-toolkit/set_env.sh" ]]; then
+  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+fi
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 
 # 路径配置
@@ -71,6 +83,7 @@ MOE_GROUPED_GEMM="${MOE_GROUPED_GEMM:-1}"
 MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-0}"
 NOOP_LAYERS="${NOOP_LAYERS:-}"
 NUM_LAYER_LIST="${NUM_LAYER_LIST:-}"
+QK_LAYERNORM="${QK_LAYERNORM:-1}"
 
 # 检查源目录
 if [[ ! -d "${LOAD_DIR}" ]]; then
@@ -133,6 +146,9 @@ if [[ "${MOE_GROUPED_GEMM}" == "1" ]]; then
 fi
 if [[ "${MOE_TP_EXTEND_EP}" == "1" ]]; then
   EXTRA_ARGS+=(--moe-tp-extend-ep)
+fi
+if [[ "${QK_LAYERNORM}" == "1" ]]; then
+  EXTRA_ARGS+=(--qk-layernorm)
 fi
 
 python "${CONVERT_SCRIPT}" \

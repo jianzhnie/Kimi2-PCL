@@ -30,6 +30,8 @@ import os
 from collections import defaultdict
 from itertools import product
 
+import gc
+
 import numpy as np
 import safetensors.torch
 import torch
@@ -89,6 +91,8 @@ class MgCkptConvert(object):
         ffn_hidden_size: int = FFN_HIDDEN_SIZE,
         moe_ffn_hidden_size: int = MOE_FFN_HIDDEN_SIZE,
         vocab_size: int = VOCAB_SIZE,
+        qk_layernorm: bool = False,
+        rotary_base: float = 50000.0,
     ):
         self.tp_size = tp_size
         self.pp_size = pp_size
@@ -119,6 +123,8 @@ class MgCkptConvert(object):
         self.ffn_hidden_size = ffn_hidden_size
         self.moe_ffn_hidden_size = moe_ffn_hidden_size
         self.vocab_size = vocab_size
+        self.qk_layernorm = qk_layernorm
+        self.rotary_base = rotary_base
 
         # GQA 维度计算
         self.q_head_dim = kv_channels
@@ -151,10 +157,10 @@ class MgCkptConvert(object):
         self.num_real_layers = self.num_layers - num_noop_layers
 
         self.model_index = {}
-        self.pprank_layer_idxs = defaultdict()
+        self.pprank_layer_idxs = {}
         self.vpprank_layer_idxs = defaultdict(dict)
-        self.layeridx_vpprank = defaultdict()
-        self.layeridx_pprank = defaultdict()
+        self.layeridx_vpprank = {}
+        self.layeridx_pprank = {}
 
         if self.vpp_stage is not None:
             self.calc_vpprank_layeridxs()
@@ -225,7 +231,6 @@ class MgCkptConvert(object):
                 raise FileNotFoundError(f"can not find {latest_iter_file}")
 
         directory = os.path.join(ckpt_path, f'iter_{iteration:07d}')
-        os.makedirs(directory, exist_ok=True)
         return directory
 
     def get_last_hf_layer(self):
@@ -436,14 +441,33 @@ class MgCkptConvert(object):
                                    tp_rank,
                                    pp_rank=None,
                                    ep_rank=None):
-        """get megatron weight path"""
-        mp_rank_path = iter_path
-        mp_rank_path = os.path.join(mp_rank_path, f'mp_rank_{tp_rank:02d}')
-        if self.pp_size > 1:
+        """get megatron weight path with fallback path formats"""
+        candidates = []
+
+        # Standard format: mp_rank_{tp}_{pp}_{ep}
+        mp_rank_path = os.path.join(iter_path, f'mp_rank_{tp_rank:02d}')
+        if self.pp_size > 1 and pp_rank is not None:
             mp_rank_path = mp_rank_path + f'_{pp_rank:03d}'
-        if self.ep_size > 1:
+        if self.ep_size > 1 and ep_rank is not None:
             mp_rank_path = mp_rank_path + f'_{ep_rank:03d}'
-        return os.path.join(mp_rank_path, 'model_optim_rng.pt')
+        candidates.append(os.path.join(mp_rank_path, 'model_optim_rng.pt'))
+
+        # Fallback: always include both pp and ep if provided
+        if pp_rank is not None and ep_rank is not None and (self.pp_size > 1 or self.ep_size > 1):
+            alt = os.path.join(iter_path, f'mp_rank_{tp_rank:02d}')
+            if self.pp_size > 1:
+                alt += f'_{pp_rank:03d}'
+            if self.ep_size > 1:
+                alt += f'_{ep_rank:03d}'
+            candidates.append(os.path.join(alt, 'model_optim_rng.pt'))
+
+        for path in candidates:
+            if os.path.isfile(path):
+                return path
+
+        raise FileNotFoundError(
+            f'无法定位 rank 文件: tp={tp_rank}, pp={pp_rank}, ep={ep_rank}, '
+            f'iter_path={iter_path}')
 
     def set_model_preprocess(self, hf_dict, mg_models):
         """embedding"""
@@ -659,10 +683,14 @@ class MgCkptConvert(object):
                 )
 
             # Experts
-            local_expert_nums = self.num_experts // self.ep_size
             hf_local_gate_key = 'model.layers.{}.mlp.experts.{}.gate_proj.weight'
             hf_local_up_key = 'model.layers.{}.mlp.experts.{}.up_proj.weight'
             hf_local_down_key = 'model.layers.{}.mlp.experts.{}.down_proj.weight'
+
+            if self.moe_tp_extend_ep:
+                local_expert_nums = self.num_experts // (self.tp_size * self.ep_size)
+            else:
+                local_expert_nums = self.num_experts // self.ep_size
 
             if self.moe_grouped_gemm:
                 for ep_rank in self.ep_rank_list:
@@ -682,25 +710,23 @@ class MgCkptConvert(object):
 
                     if self.moe_tp_extend_ep:
                         # all experts cut into tp_size*ep_size
-                        bucket_num = self.tp_size * self.ep_size
-                        bucket_expert_num = self.num_experts // bucket_num
                         for tp_rank in self.tp_rank_list:
                             cur_weight1_bucket = ep_weight1_list[tp_rank]
                             cur_weight2_bucket = ep_weight2_list[tp_rank]
                             cur_w1_list = torch.chunk(cur_weight1_bucket,
-                                                      bucket_expert_num,
+                                                      local_expert_nums,
                                                       dim=0)
                             cur_w2_list = torch.chunk(cur_weight2_bucket,
-                                                      bucket_expert_num,
+                                                      local_expert_nums,
                                                       dim=0)
 
                             global_expert_idx = ep_rank * self.tp_size + tp_rank
-                            for idx in range(bucket_expert_num):
+                            for idx in range(local_expert_nums):
                                 local_w1 = cur_w1_list[idx].reshape(
                                     self.hidden_size, -1)
                                 local_w2 = cur_w2_list[idx].reshape(
                                     -1, self.hidden_size)
-                                expert_idx = global_expert_idx * bucket_expert_num + idx
+                                expert_idx = global_expert_idx * local_expert_nums + idx
                                 gate, up = torch.chunk(local_w1.t(), 2, dim=0)
                                 down = local_w2.t()
                                 hf_dict[hf_local_gate_key.format(
@@ -750,26 +776,49 @@ class MgCkptConvert(object):
                 # local_experts 格式
                 local_prefix = f"{prefix}.mlp.experts.local_experts"
 
-                for ep_rank in self.ep_rank_list:
-                    for local_idx in range(local_expert_nums):
-                        expert_idx = ep_rank * local_expert_nums + local_idx
-                        local_fc1_key = f"{local_prefix}.{local_idx}.linear_fc1.weight"
-                        local_fc2_key = f"{local_prefix}.{local_idx}.linear_fc2.weight"
+                if self.moe_tp_extend_ep:
+                    for ep_rank in self.ep_rank_list:
+                        for tp_rank in self.tp_rank_list:
+                            global_expert_base = (ep_rank * self.tp_size + tp_rank) * local_expert_nums
+                            for local_idx in range(local_expert_nums):
+                                expert_idx = global_expert_base + local_idx
+                                local_fc1_key = f"{local_prefix}.{local_idx}.linear_fc1.weight"
+                                local_fc2_key = f"{local_prefix}.{local_idx}.linear_fc2.weight"
 
-                        local_gate, local_up = self.linear_fc1_gather_from_tp(
-                            mg_models, local_fc1_key, ep_rank=ep_rank)
-                        local_down = self.linear_fc2_gather_from_tp(
-                            mg_models, local_fc2_key, ep_rank=ep_rank)
+                                cur_fc1 = mg_models[(tp_rank, ep_rank)].pop(local_fc1_key)
+                                cur_gate, cur_up = torch.chunk(cur_fc1, 2, dim=0)
+                                cur_down = mg_models[(tp_rank, ep_rank)].pop(local_fc2_key)
 
-                        hf_dict[hf_local_gate_key.format(
-                            hf_layer_idx,
-                            expert_idx)] = local_gate.contiguous().clone()
-                        hf_dict[hf_local_up_key.format(
-                            hf_layer_idx,
-                            expert_idx)] = local_up.contiguous().clone()
-                        hf_dict[hf_local_down_key.format(
-                            hf_layer_idx,
-                            expert_idx)] = local_down.contiguous().clone()
+                                hf_dict[hf_local_gate_key.format(
+                                    hf_layer_idx,
+                                    expert_idx)] = cur_gate.contiguous().clone()
+                                hf_dict[hf_local_up_key.format(
+                                    hf_layer_idx,
+                                    expert_idx)] = cur_up.contiguous().clone()
+                                hf_dict[hf_local_down_key.format(
+                                    hf_layer_idx,
+                                    expert_idx)] = cur_down.contiguous().clone()
+                else:
+                    for ep_rank in self.ep_rank_list:
+                        for local_idx in range(local_expert_nums):
+                            expert_idx = ep_rank * local_expert_nums + local_idx
+                            local_fc1_key = f"{local_prefix}.{local_idx}.linear_fc1.weight"
+                            local_fc2_key = f"{local_prefix}.{local_idx}.linear_fc2.weight"
+
+                            local_gate, local_up = self.linear_fc1_gather_from_tp(
+                                mg_models, local_fc1_key, ep_rank=ep_rank)
+                            local_down = self.linear_fc2_gather_from_tp(
+                                mg_models, local_fc2_key, ep_rank=ep_rank)
+
+                            hf_dict[hf_local_gate_key.format(
+                                hf_layer_idx,
+                                expert_idx)] = local_gate.contiguous().clone()
+                            hf_dict[hf_local_up_key.format(
+                                hf_layer_idx,
+                                expert_idx)] = local_up.contiguous().clone()
+                            hf_dict[hf_local_down_key.format(
+                                hf_layer_idx,
+                                expert_idx)] = local_down.contiguous().clone()
 
     def save_safetensors(self, hf_dict, cur_file_idx):
         """save safetensors file"""
@@ -867,6 +916,9 @@ class MgCkptConvert(object):
                         mg_weights[(tp_rank, ep_rank)] = tmp_model
 
                     self.read_vpp_rank_weights(pp_rank, vpp_rank, mg_weights)
+
+            del mg_weights
+            gc.collect()
 
         model_index_file_path = os.path.join(self.hf_save_path,
                                              'model.safetensors.index.json')
@@ -977,6 +1029,13 @@ def get_args():
                         type=int,
                         default=VOCAB_SIZE,
                         help='Vocabulary size.')
+    parser.add_argument('--qk-layernorm',
+                        action='store_true',
+                        help='Enable QK LayerNorm (must match training config)')
+    parser.add_argument('--rotary-base',
+                        type=float,
+                        default=50000.0,
+                        help='Rotary base for RoPE')
 
     args = parser.parse_args()
     return args
@@ -1008,6 +1067,8 @@ def main():
         ffn_hidden_size=args.ffn_hidden_size,
         moe_ffn_hidden_size=args.moe_ffn_hidden_size,
         vocab_size=args.vocab_size,
+        qk_layernorm=args.qk_layernorm,
+        rotary_base=args.rotary_base,
     )
     converter.run()
 
