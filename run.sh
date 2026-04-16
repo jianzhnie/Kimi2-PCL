@@ -14,6 +14,7 @@ docker push cis-pengcheng.cmecloud.cn/ascendhub/quay.io/ascend/vllm-ascend:main-
 ## 同步本地文件到服务器
 rsync -avz K8s-Cluster  root@10.42.29.130:/llm_workspace_1P/robin/
 rsync -avz Kimi2-PCL  k8s-130:/llm_workspace_1P/robin/
+rsync -avz Kimi2-PCL  k8s-131:/llm_workspace_1P/robin/
 rsync -avz kimi_pcl_eval k8s-130:/llm_workspace_1P/robin/
 rsync -avz vllm  k8s-130:/llm_workspace_1P/robin/
 rsync -avz vllm-pcl  k8s-130:/llm_workspace_1P/robin/
@@ -21,6 +22,8 @@ rsync -avz vllm-ascend  k8s-130:/llm_workspace_1P/robin/
 
 rsync -avz ./utils k8s-130:/llm_workspace_1P/robin/Kimi2-PCL
 rsync -avz ./scripts k8s-130:/llm_workspace_1P/robin/Kimi2-PCL
+rsync -avz ./models k8s-130:/llm_workspace_1P/robin/Kimi2-PCL
+
 
 ## 远程文件下载到本地
 rsync -avz  k8s-130:/llm_workspace_1P/robin/Kimi2-PCL.tar  /Users/robin/work_dir/
@@ -35,6 +38,8 @@ docker exec -it vllm-ascend-env-a3  /bin/bash
 
 # 转换模型
 nohup bash scripts/ckpt_convert_hf2mcore.sh > hf2mcore.log  2>&1 &
+nohup bash scripts/ckpt_convert_h2mcore_kimi2.sh > hf2mcore_kimi2.log 2>&1 &
+
 nohup bash scripts/ckpt_convert_mcore2hf.sh > mcore2hf.log  2>&1 &
 systemctl daemon-reload && systemctl start docker
 
