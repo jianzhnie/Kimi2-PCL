@@ -27,16 +27,11 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from utils.get_mcore_weights_from_ckpt import CheckpointCache  # noqa: E402
 from utils.get_mcore_weights_from_ckpt import (
-    DualPipeMapper,  # noqa: E402
-    MCoreCheckpointReader,
-    ModelConfig,
-    MoeParallelStrategy,
-    ShapeMerger,
-    StandardVppMapper,
-    _get_tensor_size,
-    _get_torch_dtype_name,
-    _mp_prefix,
+    CheckpointLoader, DualPipeMapper, MCoreCheckpointReader, ModelConfig,
+    MoeParallelStrategy, ParallelConfig, ShapeMerger, StandardVppMapper,
+    _get_tensor_size, _get_torch_dtype_name, _mp_prefix, _peek_checkpoint_keys,
     _resolve_iter_dir)
 
 
@@ -866,6 +861,150 @@ class TestGetMCoreWeightsFromCkpt(unittest.TestCase):
         # DualPipe 非法配置应抛出异常
         with self.assertRaises(ValueError):
             mapper.build_mapping(30, pp_size, vpp_stage)
+
+    def test_dualpipe_mapping_detailed(self):
+        """测试 DualPipe 具体的交错分布映射"""
+        num_layers = 32
+        pp_size = 4
+        vpp_stage = 4
+        mapper = DualPipeMapper()
+        mapping = mapper.build_mapping(num_layers, pp_size, vpp_stage)
+
+        # PP=0 应该包含最前和最后的 4 层
+        self.assertEqual(mapping[0], (0, 0, 0))
+        self.assertEqual(mapping[3], (0, 0, 3))
+        self.assertEqual(mapping[28], (0, 1, 0))
+        self.assertEqual(mapping[31], (0, 1, 3))
+
+        # PP=1 应该包含接下来向内收缩的 8 层
+        self.assertEqual(mapping[4], (1, 0, 0))
+        self.assertEqual(mapping[7], (1, 0, 3))
+        self.assertEqual(mapping[24], (1, 1, 0))
+        self.assertEqual(mapping[27], (1, 1, 3))
+
+        # 中间层在 PP=3
+        self.assertEqual(mapping[16], (3, 1, 0))
+        self.assertEqual(mapping[19], (3, 1, 3))
+
+        # 验证所有层号唯一且连续
+        self.assertEqual(sorted(mapping.keys()), list(range(num_layers)))
+
+    def test_parse_pp_ep_swap(self):
+        """测试 _parse_pp_ep 在目录格式为 ep_pp 时的自动交换容错"""
+        parallel = ParallelConfig(tp_size=2, pp_size=8, ep_size=64)
+        cache = CheckpointCache()
+        loader = CheckpointLoader(self.checkpoint_dir, parallel, cache)
+
+        # 正常 pp_ep 格式
+        self.assertEqual(loader._parse_pp_ep([3, 5]), (3, 5))
+
+        # ep_pp 格式（3 < pp_size=8, 5 >= ep_size=64? 不对，需要构造 ep < pp_size 且 pp >= ep_size）
+        # 假设 pp=5, ep=3，但目录写成 ep_pp -> [3, 5]
+        # 此时如果 PP=8, EP=64：3 在 pp 范围内，5 也在 pp 范围内，ep 不合法，不会触发交换
+        # 换一个场景：PP=2, EP=8，目录为 ep=5, pp=1 -> [5, 1]
+        # 按 pp_ep 解释：pp=5 超出 PP=2，ep=1 在 EP=8 内 -> 不合法
+        # 按 ep_pp 解释：pp=1 在 PP=2 内，ep=5 在 EP=8 内 -> 合法，应交换
+        loader2 = CheckpointLoader(
+            self.checkpoint_dir, ParallelConfig(tp_size=2,
+                                                pp_size=2,
+                                                ep_size=8), cache)
+        self.assertEqual(loader2._parse_pp_ep([5, 1]), (1, 5))
+
+        # 两个都合法时不交换
+        self.assertEqual(loader2._parse_pp_ep([1, 5]), (1, 5))
+
+        # 两边都不合法时抛出 ValueError
+        with self.assertRaises(ValueError):
+            loader2._parse_pp_ep([10, 20])
+
+    def test_load_stage_missing_file(self):
+        """测试 load_stage 在部分 rank 文件缺失时不会导致整个 stage 崩溃"""
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000001')
+        os.makedirs(iter_dir, exist_ok=True)
+        with open(
+                os.path.join(self.checkpoint_dir,
+                             'latest_checkpointed_iteration.txt'), 'w') as f:
+            f.write('1')
+
+        # 只创建 TP=0,PP=0 的 checkpoint，TP=1 缺失
+        rank_dir = os.path.join(iter_dir, 'mp_rank_00_000')
+        os.makedirs(rank_dir, exist_ok=True)
+        torch.save({'model': {
+            'test.weight': torch.randn(4, 4)
+        }}, os.path.join(rank_dir, 'model_optim_rng.pt'))
+
+        parallel = ParallelConfig(tp_size=2, pp_size=1, ep_size=1)
+        cache = CheckpointCache()
+        loader = CheckpointLoader(iter_dir, parallel, cache)
+        loader.build_rank_map()
+
+        models = loader.load_stage(pp_rank=0, vpp_rank=None, io_threads=1)
+        # TP=0 成功加载，TP=1 缺失但不应抛出异常
+        self.assertEqual(len(models), 1)
+        self.assertIn((0, 0), models)
+
+    def test_peek_checkpoint_keys(self):
+        """测试 _peek_checkpoint_keys 轻量读取 checkpoint key"""
+        ckpt_path = os.path.join(self.test_dir, 'test_ckpt.pt')
+        state = {
+            'model': {
+                'layer1.weight': torch.randn(4, 4)
+            },
+            'optimizer': {},
+            'model0': {
+                'layer0.weight': torch.randn(4, 4)
+            },
+            'model1': {
+                'layer1.weight': torch.randn(4, 4)
+            },
+        }
+        torch.save(state, ckpt_path)
+        keys = _peek_checkpoint_keys(ckpt_path)
+        self.assertIsNotNone(keys)
+        self.assertIn('model', keys)
+        self.assertIn('model0', keys)
+        self.assertIn('model1', keys)
+        self.assertIn('optimizer', keys)
+
+        # 对于不存在的文件应返回 None
+        self.assertIsNone(_peek_checkpoint_keys('non_existent_file.pt'))
+
+    def test_detect_vpp_lightweight(self):
+        """测试 _detect_vpp 优先使用轻量方式检测 VPP"""
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000001')
+        os.makedirs(iter_dir, exist_ok=True)
+        with open(
+                os.path.join(self.checkpoint_dir,
+                             'latest_checkpointed_iteration.txt'), 'w') as f:
+            f.write('1')
+
+        # 构造 VPP checkpoint
+        rank_dir = os.path.join(iter_dir, 'mp_rank_00')
+        os.makedirs(rank_dir, exist_ok=True)
+        torch.save(
+            {
+                'model0': {
+                    'w': torch.randn(2)
+                },
+                'model1': {
+                    'w': torch.randn(2)
+                },
+                'model2': {
+                    'w': torch.randn(2)
+                },
+            }, os.path.join(rank_dir, 'model_optim_rng.pt'))
+
+        reader = MCoreCheckpointReader(
+            mcore_dir=self.checkpoint_dir,
+            tp_size=1,
+            pp_size=1,
+            ep_size=1,
+            verbose=False,
+            validate_shapes=False,
+        )
+        vpp_size, keys = reader._detect_vpp()
+        self.assertEqual(vpp_size, 3)
+        self.assertEqual(sorted(keys), ['model0', 'model1', 'model2'])
 
 
 if __name__ == '__main__':

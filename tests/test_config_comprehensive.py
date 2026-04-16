@@ -7,26 +7,27 @@ Coverage targets:
 """
 
 import json
-import pytest
 from pathlib import Path
 
-from models.configuration_deepseek import DeepseekV3Config
+import pytest
 
+from models.configuration_deepseek import DeepseekV3Config
 
 # =============================================================================
 # Configuration Fixtures
 # =============================================================================
 
+
 @pytest.fixture
 def minimal_config_kwargs():
     """Minimal configuration for fast tests"""
     return {
-        "vocab_size": 128,
-        "hidden_size": 64,
-        "intermediate_size": 128,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "max_position_embeddings": 128,
+        'vocab_size': 128,
+        'hidden_size': 64,
+        'intermediate_size': 128,
+        'num_hidden_layers': 2,
+        'num_attention_heads': 4,
+        'max_position_embeddings': 128,
     }
 
 
@@ -34,26 +35,27 @@ def minimal_config_kwargs():
 def full_config_kwargs():
     """Full configuration with all optional parameters"""
     return {
-        "vocab_size": 1024,
-        "hidden_size": 256,
-        "intermediate_size": 512,
-        "num_hidden_layers": 4,
-        "num_attention_heads": 8,
-        "num_key_value_heads": 4,
-        "max_position_embeddings": 512,
-        "rope_theta": 10000.0,
-        "rms_norm_eps": 1e-6,
-        "hidden_act": "swiglu",
-        "attention_dropout": 0.0,
-        "rope_scaling": None,
-        "qk_layernorm": True,
-        "tie_word_embeddings": False,
+        'vocab_size': 1024,
+        'hidden_size': 256,
+        'intermediate_size': 512,
+        'num_hidden_layers': 4,
+        'num_attention_heads': 8,
+        'num_key_value_heads': 4,
+        'max_position_embeddings': 512,
+        'rope_theta': 10000.0,
+        'rms_norm_eps': 1e-6,
+        'hidden_act': 'swiglu',
+        'attention_dropout': 0.0,
+        'rope_scaling': None,
+        'qk_layernorm': True,
+        'tie_word_embeddings': False,
     }
 
 
 # =============================================================================
 # 1T Config Tests
 # =============================================================================
+
 
 class TestDeepseekV3Config:
     """Test DeepseekV3Config from 1T configuration"""
@@ -89,21 +91,21 @@ class TestDeepseekV3Config:
     def test_rope_scaling_initialization(self):
         """Test config with RoPE scaling"""
         rope_scaling = {
-            "type": "yarn",
-            "factor": 32.0,
-            "original_max_position_embeddings": 4096,
+            'type': 'yarn',
+            'factor': 32.0,
+            'original_max_position_embeddings': 4096,
         }
         config = DeepseekV3Config(rope_scaling=rope_scaling)
 
         assert config.rope_scaling == rope_scaling
 
-    @pytest.mark.parametrize("hidden_act", ["swiglu", "gelu", "relu", "silu"])
+    @pytest.mark.parametrize('hidden_act', ['swiglu', 'gelu', 'relu', 'silu'])
     def test_activation_functions(self, hidden_act):
         """Test various activation functions"""
         config = DeepseekV3Config(hidden_act=hidden_act)
         assert config.hidden_act == hidden_act
 
-    @pytest.mark.parametrize("dropout", [0.0, 0.1, 0.5])
+    @pytest.mark.parametrize('dropout', [0.0, 0.1, 0.5])
     def test_dropout_values(self, dropout):
         """Test various dropout values"""
         config = DeepseekV3Config(attention_dropout=dropout)
@@ -114,7 +116,8 @@ class TestDeepseekV3Config:
         # When group_query_attention=True, num_key_value_heads is calculated from num_query_groups
         config = DeepseekV3Config(
             num_attention_heads=64,
-            num_query_groups=4,  # This will set num_key_value_heads = 64 // 4 = 16
+            num_query_groups=
+            4,  # This will set num_key_value_heads = 64 // 4 = 16
         )
         assert config.num_attention_heads == 64
         assert config.num_key_value_heads == 16
@@ -124,7 +127,8 @@ class TestDeepseekV3Config:
         # When group_query_attention=True, num_key_value_heads is calculated from num_query_groups
         config = DeepseekV3Config(
             num_attention_heads=64,
-            num_query_groups=8,  # This will set num_key_value_heads = 64 // 8 = 8
+            num_query_groups=
+            8,  # This will set num_key_value_heads = 64 // 8 = 8
         )
         assert config.num_attention_heads == 64
         assert config.num_key_value_heads == 8
@@ -135,9 +139,9 @@ class TestDeepseekV3Config:
         config_dict = config.to_dict()
 
         assert isinstance(config_dict, dict)
-        assert "vocab_size" in config_dict
-        assert "hidden_size" in config_dict
-        assert config_dict["vocab_size"] == config.vocab_size
+        assert 'vocab_size' in config_dict
+        assert 'hidden_size' in config_dict
+        assert config_dict['vocab_size'] == config.vocab_size
 
     def test_config_to_json_string(self):
         """Test converting config to JSON string"""
@@ -147,7 +151,7 @@ class TestDeepseekV3Config:
         assert isinstance(json_str, str)
         # Verify it's valid JSON
         parsed = json.loads(json_str)
-        assert "vocab_size" in parsed
+        assert 'vocab_size' in parsed
 
     def test_config_save_and_load(self, tmp_path):
         """Test saving and loading config"""
@@ -158,7 +162,7 @@ class TestDeepseekV3Config:
         )
 
         # Save
-        config_path = tmp_path / "config.json"
+        config_path = tmp_path / 'config.json'
         config.save_pretrained(tmp_path)
 
         # Load
@@ -182,13 +186,13 @@ class TestDeepseekV3Config:
         config = DeepseekV3Config()
         repr_str = repr(config)
 
-        assert "DeepseekV3Config" in repr_str
-        assert "vocab_size" in repr_str
+        assert 'DeepseekV3Config' in repr_str
+        assert 'vocab_size' in repr_str
 
     def test_config_update(self):
         """Test updating config attributes"""
         config = DeepseekV3Config()
-        config.update({"vocab_size": 256, "hidden_size": 128})
+        config.update({'vocab_size': 256, 'hidden_size': 128})
 
         assert config.vocab_size == 256
         assert config.hidden_size == 128
@@ -207,6 +211,7 @@ class TestDeepseekV3Config:
 # =============================================================================
 # 100B Config Tests
 # =============================================================================
+
 
 class TestDeepseekV3Config:
     """Test DeepseekV3Config from 100B configuration"""
@@ -233,7 +238,8 @@ class TestDeepseekV3Config:
     def test_custom_vs_default_differences(self):
         """Test differences between custom and default configs"""
         config_default = DeepseekV3Config()
-        config_custom = DeepseekV3Config(hidden_size=4096, num_attention_heads=32)
+        config_custom = DeepseekV3Config(hidden_size=4096,
+                                         num_attention_heads=32)
 
         # Custom config has smaller hidden size than default
         assert config_custom.hidden_size < config_default.hidden_size
@@ -244,6 +250,7 @@ class TestDeepseekV3Config:
 # =============================================================================
 # MoE Config Tests
 # =============================================================================
+
 
 class TestMoEConfiguration:
     """Test MoE-specific configuration"""
@@ -300,6 +307,7 @@ class TestMoEConfiguration:
 # Attention Config Tests
 # =============================================================================
 
+
 class TestAttentionConfiguration:
     """Test attention-specific configuration"""
 
@@ -308,7 +316,8 @@ class TestAttentionConfiguration:
         # When group_query_attention=True, num_key_value_heads is calculated from num_query_groups
         config = DeepseekV3Config(
             num_attention_heads=64,
-            num_query_groups=8,  # This will set num_key_value_heads = 64 // 8 = 8
+            num_query_groups=
+            8,  # This will set num_key_value_heads = 64 // 8 = 8
         )
 
         assert config.num_attention_heads == 64
@@ -349,6 +358,7 @@ class TestAttentionConfiguration:
 # RoPE Scaling Config Tests
 # =============================================================================
 
+
 class TestRoPEScalingConfiguration:
     """Test RoPE scaling configuration"""
 
@@ -361,45 +371,46 @@ class TestRoPEScalingConfiguration:
     def test_yarn_scaling(self):
         """Test YaRN RoPE scaling configuration"""
         rope_scaling = {
-            "type": "yarn",
-            "factor": 32.0,
-            "original_max_position_embeddings": 4096,
-            "beta_fast": 32,
-            "beta_slow": 1,
-            "mscale": 1,
-            "mscale_all_dim": 0,
+            'type': 'yarn',
+            'factor': 32.0,
+            'original_max_position_embeddings': 4096,
+            'beta_fast': 32,
+            'beta_slow': 1,
+            'mscale': 1,
+            'mscale_all_dim': 0,
         }
         config = DeepseekV3Config(rope_scaling=rope_scaling)
 
-        assert config.rope_scaling["type"] == "yarn"
-        assert config.rope_scaling["factor"] == 32.0
+        assert config.rope_scaling['type'] == 'yarn'
+        assert config.rope_scaling['factor'] == 32.0
 
     def test_linear_scaling(self):
         """Test linear RoPE scaling configuration"""
         rope_scaling = {
-            "type": "linear",
-            "factor": 2.0,
+            'type': 'linear',
+            'factor': 2.0,
         }
         config = DeepseekV3Config(rope_scaling=rope_scaling)
 
-        assert config.rope_scaling["type"] == "linear"
-        assert config.rope_scaling["factor"] == 2.0
+        assert config.rope_scaling['type'] == 'linear'
+        assert config.rope_scaling['factor'] == 2.0
 
     def test_dynamic_scaling(self):
         """Test dynamic NTK RoPE scaling configuration"""
         rope_scaling = {
-            "type": "dynamic",
-            "factor": 4.0,
+            'type': 'dynamic',
+            'factor': 4.0,
         }
         config = DeepseekV3Config(rope_scaling=rope_scaling)
 
-        assert config.rope_scaling["type"] == "dynamic"
-        assert config.rope_scaling["factor"] == 4.0
+        assert config.rope_scaling['type'] == 'dynamic'
+        assert config.rope_scaling['factor'] == 4.0
 
 
 # =============================================================================
 # Edge Cases and Validation Tests
 # =============================================================================
+
 
 class TestConfigEdgeCases:
     """Test configuration edge cases"""
@@ -471,6 +482,7 @@ class TestConfigEdgeCases:
 # Config JSON Serialization Tests
 # =============================================================================
 
+
 class TestConfigSerialization:
     """Test configuration serialization"""
 
@@ -478,30 +490,30 @@ class TestConfigSerialization:
         """Test saving config to JSON file"""
         config = DeepseekV3Config(vocab_size=128, hidden_size=64)
 
-        json_path = tmp_path / "config.json"
+        json_path = tmp_path / 'config.json'
         config.to_json_file(json_path)
 
         assert json_path.exists()
 
         with open(json_path) as f:
             data = json.load(f)
-        assert data["vocab_size"] == 128
-        assert data["hidden_size"] == 64
+        assert data['vocab_size'] == 128
+        assert data['hidden_size'] == 64
 
     def test_config_from_json_file(self, tmp_path):
         """Test loading config from JSON file"""
         data = {
-            "vocab_size": 256,
-            "hidden_size": 128,
-            "num_hidden_layers": 4,
-            "num_attention_heads": 8,
-            "intermediate_size": 256,
-            "max_position_embeddings": 512,
-            "model_type": "kimi_k2",
+            'vocab_size': 256,
+            'hidden_size': 128,
+            'num_hidden_layers': 4,
+            'num_attention_heads': 8,
+            'intermediate_size': 256,
+            'max_position_embeddings': 512,
+            'model_type': 'kimi_k2',
         }
 
-        json_path = tmp_path / "config.json"
-        with open(json_path, "w") as f:
+        json_path = tmp_path / 'config.json'
+        with open(json_path, 'w') as f:
             json.dump(data, f)
 
         config = DeepseekV3Config.from_json_file(json_path)
@@ -512,21 +524,22 @@ class TestConfigSerialization:
     def test_rope_scaling_serialization(self, tmp_path):
         """Test RoPE scaling serialization"""
         rope_scaling = {
-            "type": "yarn",
-            "factor": 32.0,
-            "original_max_position_embeddings": 4096,
+            'type': 'yarn',
+            'factor': 32.0,
+            'original_max_position_embeddings': 4096,
         }
         config = DeepseekV3Config(rope_scaling=rope_scaling)
 
         json_str = config.to_json_string()
         parsed = json.loads(json_str)
 
-        assert parsed["rope_scaling"] == rope_scaling
+        assert parsed['rope_scaling'] == rope_scaling
 
 
 # =============================================================================
 # Integration with Repository Config Files
 # =============================================================================
+
 
 class TestRepositoryConfigFiles:
     """Test with actual repository config files"""
@@ -534,7 +547,7 @@ class TestRepositoryConfigFiles:
     def test_load_1t_config_file(self):
         """Test loading actual 1T config file"""
         repo_root = Path(__file__).parent.parent
-        config_path = repo_root / "models" / "config_1t.json"
+        config_path = repo_root / 'models' / 'config_1t.json'
 
         if config_path.exists():
             config = DeepseekV3Config.from_json_file(config_path)
@@ -545,7 +558,7 @@ class TestRepositoryConfigFiles:
     def test_load_100b_config_file(self):
         """Test loading actual 100B config file"""
         repo_root = Path(__file__).parent.parent
-        config_path = repo_root / "models" / "config_100b.json"
+        config_path = repo_root / 'models' / 'config_100b.json'
 
         if config_path.exists():
             config = DeepseekV3Config.from_json_file(config_path)
@@ -557,8 +570,8 @@ class TestRepositoryConfigFiles:
         """Test that configs are consistent with repository"""
         repo_root = Path(__file__).parent.parent
 
-        config_1t_path = repo_root / "models" / "config_1t.json"
-        config_100b_path = repo_root / "models" / "config_100b.json"
+        config_1t_path = repo_root / 'models' / 'config_1t.json'
+        config_100b_path = repo_root / 'models' / 'config_100b.json'
 
         if config_1t_path.exists() and config_100b_path.exists():
             config_1t = DeepseekV3Config.from_json_file(config_1t_path)
@@ -571,5 +584,5 @@ class TestRepositoryConfigFiles:
             assert config_1t.hidden_size > config_100b.hidden_size
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])

@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-UTILS_DIR = REPO_ROOT / "utils"
-MODELS_DIR = REPO_ROOT / "models"
+UTILS_DIR = REPO_ROOT / 'utils'
+MODELS_DIR = REPO_ROOT / 'models'
 
 # Keep imports stable and isolated from host PYTHONPATH.
 for path in (REPO_ROOT, UTILS_DIR, MODELS_DIR):
@@ -20,14 +20,14 @@ for path in (REPO_ROOT, UTILS_DIR, MODELS_DIR):
         sys.path.insert(0, path_str)
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope='session', autouse=True)
 def test_env_defaults() -> None:
     """Set deterministic, offline-friendly defaults for all test sessions."""
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("PYTHONHASHSEED", "0")
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
+    os.environ.setdefault('PYTHONHASHSEED', '0')
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope='session', autouse=True)
 def deterministic_seed() -> None:
     """Seed Python RNG to reduce flaky behavior in randomized tests."""
     random.seed(0)

@@ -8,42 +8,28 @@ Coverage targets:
 """
 
 import math
+from unittest.mock import MagicMock, Mock, patch
+
 import pytest
 import torch
 import torch.nn.functional as F
-from unittest.mock import Mock, patch, MagicMock
 
 from models.configuration_deepseek import DeepseekV3Config
 from models.modeling_deepseek import (
-    DeepseekV3RMSNorm,
-    DeepseekV3RotaryEmbedding,
-    DeepseekV3LinearScalingRotaryEmbedding,
-    DeepseekV3DynamicNTKScalingRotaryEmbedding,
-    DeepseekV3YarnRotaryEmbedding,
-    DeepseekV3MLP,
-    MoEGate,
-    DeepseekV3MoE,
-    DeepseekV3Attention,
-    DeepseekV3FlashAttention2,
-    DeepseekV3DecoderLayer,
-    DeepseekV3PreTrainedModel,
-    DeepseekV3Model,
-    DeepseekV3ForCausalLM,
-    DeepseekV3ForSequenceClassification,
-    rotate_half,
-    apply_rotary_pos_emb,
-    repeat_kv,
-    yarn_find_correction_dim,
-    yarn_find_correction_range,
-    yarn_get_mscale,
-    yarn_linear_ramp_mask,
-    _get_unpad_data,
-)
-
+    DeepseekV3Attention, DeepseekV3DecoderLayer,
+    DeepseekV3DynamicNTKScalingRotaryEmbedding, DeepseekV3FlashAttention2,
+    DeepseekV3ForCausalLM, DeepseekV3ForSequenceClassification,
+    DeepseekV3LinearScalingRotaryEmbedding, DeepseekV3MLP, DeepseekV3Model,
+    DeepseekV3MoE, DeepseekV3PreTrainedModel, DeepseekV3RMSNorm,
+    DeepseekV3RotaryEmbedding, DeepseekV3YarnRotaryEmbedding, MoEGate,
+    _get_unpad_data, apply_rotary_pos_emb, repeat_kv, rotate_half,
+    yarn_find_correction_dim, yarn_find_correction_range, yarn_get_mscale,
+    yarn_linear_ramp_mask)
 
 # =============================================================================
 # Fixtures
 # =============================================================================
+
 
 @pytest.fixture
 def base_config():
@@ -61,7 +47,7 @@ def base_config():
         max_position_embeddings=128,
         rope_theta=10000.0,
         rms_norm_eps=1e-6,
-        hidden_act="silu",
+        hidden_act='silu',
         n_routed_experts=4,
         num_experts_per_tok=2,
         moe_intermediate_size=64,
@@ -73,7 +59,7 @@ def base_config():
         pad_token_id=0,  # For SequenceClassification tests
     )
     # Set attention implementation for DecoderLayer
-    config._attn_implementation = "eager"
+    config._attn_implementation = 'eager'
     return config
 
 
@@ -92,13 +78,13 @@ def moe_config(base_config):
 def yarn_config(base_config):
     """Config with YaRN RoPE scaling"""
     base_config.rope_scaling = {
-        "type": "yarn",
-        "factor": 32.0,
-        "original_max_position_embeddings": 4096,
-        "beta_fast": 32,
-        "beta_slow": 1,
-        "mscale": 1,
-        "mscale_all_dim": 0,
+        'type': 'yarn',
+        'factor': 32.0,
+        'original_max_position_embeddings': 4096,
+        'beta_fast': 32,
+        'beta_slow': 1,
+        'mscale': 1,
+        'mscale_all_dim': 0,
     }
     return base_config
 
@@ -107,10 +93,11 @@ def yarn_config(base_config):
 # RMSNorm Tests
 # =============================================================================
 
+
 class TestRMSNorm:
     """Test DeepseekV3RMSNorm with boundary and edge cases"""
 
-    @pytest.mark.parametrize("hidden_size", [1, 16, 64, 512, 8192])
+    @pytest.mark.parametrize('hidden_size', [1, 16, 64, 512, 8192])
     def test_rmsnorm_various_sizes(self, hidden_size):
         """Test RMSNorm with various hidden sizes including edge cases"""
         norm = DeepseekV3RMSNorm(hidden_size)
@@ -120,7 +107,7 @@ class TestRMSNorm:
         assert not torch.isnan(out).any()
         assert not torch.isinf(out).any()
 
-    @pytest.mark.parametrize("eps", [1e-12, 1e-6, 1e-3, 1.0])
+    @pytest.mark.parametrize('eps', [1e-12, 1e-6, 1e-3, 1.0])
     def test_rmsnorm_eps_values(self, eps):
         """Test with various epsilon values"""
         norm = DeepseekV3RMSNorm(64, eps=eps)
@@ -166,14 +153,16 @@ class TestRMSNorm:
 # Rotary Embedding Tests
 # =============================================================================
 
+
 class TestRotaryEmbedding:
     """Test various Rotary Embedding implementations"""
 
-    @pytest.mark.parametrize("dim", [4, 8, 16, 64, 128])
-    @pytest.mark.parametrize("seq_len", [1, 16, 128, 2048])
+    @pytest.mark.parametrize('dim', [4, 8, 16, 64, 128])
+    @pytest.mark.parametrize('seq_len', [1, 16, 128, 2048])
     def test_rotary_embedding_shapes(self, dim, seq_len):
         """Test RoPE produces correct output shapes"""
-        rope = DeepseekV3RotaryEmbedding(dim, max_position_embeddings=seq_len * 2)
+        rope = DeepseekV3RotaryEmbedding(dim,
+                                         max_position_embeddings=seq_len * 2)
         x = torch.randn(2, 8, 4, dim)
         cos, sin = rope(x, seq_len=seq_len)
         assert cos.shape[0] == seq_len
@@ -181,7 +170,7 @@ class TestRotaryEmbedding:
         assert cos.shape[-1] == dim
         assert sin.shape[-1] == dim
 
-    @pytest.mark.parametrize("base", [500, 10000, 100000, 1000000])
+    @pytest.mark.parametrize('base', [500, 10000, 100000, 1000000])
     def test_rotary_embedding_different_bases(self, base):
         """Test with different RoPE theta bases"""
         rope = DeepseekV3RotaryEmbedding(64, base=base)
@@ -213,12 +202,11 @@ class TestRotaryEmbedding:
 class TestLinearScalingRotaryEmbedding:
     """Test Linear Scaling RoPE"""
 
-    @pytest.mark.parametrize("scaling_factor", [1.0, 2.0, 4.0, 8.0, 32.0])
+    @pytest.mark.parametrize('scaling_factor', [1.0, 2.0, 4.0, 8.0, 32.0])
     def test_linear_scaling(self, scaling_factor):
         """Test linear scaling produces correct results"""
         rope = DeepseekV3LinearScalingRotaryEmbedding(
-            64, max_position_embeddings=128, scaling_factor=scaling_factor
-        )
+            64, max_position_embeddings=128, scaling_factor=scaling_factor)
         x = torch.randn(2, 8, 4, 64)
         cos, sin = rope(x, seq_len=128)
         assert cos.shape[0] == 128
@@ -228,8 +216,7 @@ class TestLinearScalingRotaryEmbedding:
         """Compare linear scaling with scaling_factor=1 to base RoPE"""
         base_rope = DeepseekV3RotaryEmbedding(64, max_position_embeddings=128)
         linear_rope = DeepseekV3LinearScalingRotaryEmbedding(
-            64, max_position_embeddings=128, scaling_factor=1.0
-        )
+            64, max_position_embeddings=128, scaling_factor=1.0)
         x = torch.randn(2, 8, 4, 64)
         base_cos, base_sin = base_rope(x, seq_len=128)
         linear_cos, linear_sin = linear_rope(x, seq_len=128)
@@ -240,12 +227,11 @@ class TestLinearScalingRotaryEmbedding:
 class TestDynamicNTKScalingRotaryEmbedding:
     """Test Dynamic NTK Scaling RoPE"""
 
-    @pytest.mark.parametrize("scaling_factor", [1.0, 2.0, 4.0, 8.0])
+    @pytest.mark.parametrize('scaling_factor', [1.0, 2.0, 4.0, 8.0])
     def test_dynamic_ntk_scaling(self, scaling_factor):
         """Test dynamic NTK scaling"""
         rope = DeepseekV3DynamicNTKScalingRotaryEmbedding(
-            64, max_position_embeddings=128, scaling_factor=scaling_factor
-        )
+            64, max_position_embeddings=128, scaling_factor=scaling_factor)
         x = torch.randn(2, 8, 4, 64)
         cos, sin = rope(x, seq_len=256)  # Longer than max_position
         assert not torch.isnan(cos).any()
@@ -254,8 +240,10 @@ class TestDynamicNTKScalingRotaryEmbedding:
         """Test that base changes for long sequences"""
         max_pos = 128
         rope = DeepseekV3DynamicNTKScalingRotaryEmbedding(
-            64, max_position_embeddings=max_pos, base=10000, scaling_factor=2.0
-        )
+            64,
+            max_position_embeddings=max_pos,
+            base=10000,
+            scaling_factor=2.0)
         x = torch.randn(2, 8, 4, 64)
         # Short sequence - base should not change
         rope(x, seq_len=64)
@@ -268,7 +256,7 @@ class TestDynamicNTKScalingRotaryEmbedding:
 class TestYarnRotaryEmbedding:
     """Test YaRN RoPE"""
 
-    @pytest.mark.parametrize("factor", [1.0, 4.0, 8.0, 32.0])
+    @pytest.mark.parametrize('factor', [1.0, 4.0, 8.0, 32.0])
     def test_yarn_scaling(self, factor):
         """Test YaRN scaling with various factors"""
         rope = DeepseekV3YarnRotaryEmbedding(
@@ -301,8 +289,8 @@ class TestYarnRotaryEmbedding:
 class TestYarnHelperFunctions:
     """Test YaRN helper functions"""
 
-    @pytest.mark.parametrize("num_rotations", [1, 10, 100])
-    @pytest.mark.parametrize("dim", [32, 64, 128])
+    @pytest.mark.parametrize('num_rotations', [1, 10, 100])
+    @pytest.mark.parametrize('dim', [32, 64, 128])
     def test_yarn_find_correction_dim(self, num_rotations, dim):
         """Test correction dimension calculation"""
         result = yarn_find_correction_dim(num_rotations, dim)
@@ -314,7 +302,7 @@ class TestYarnHelperFunctions:
         low, high = yarn_find_correction_range(1, 32, 64)
         assert 0 <= low <= high < 64
 
-    @pytest.mark.parametrize("scale,mscale,expected", [
+    @pytest.mark.parametrize('scale,mscale,expected', [
         (1.0, 1.0, 1.0),
         (2.0, 1.0, 0.1 * 1.0 * math.log(2.0) + 1.0),
         (4.0, 0.5, 0.1 * 0.5 * math.log(4.0) + 1.0),
@@ -324,28 +312,31 @@ class TestYarnHelperFunctions:
         result = yarn_get_mscale(scale, mscale)
         assert pytest.approx(result, abs=1e-6) == expected
 
-    @pytest.mark.parametrize("min_val,max_val,dim", [
-        (0, 10, 64),
-        (5, 5, 32),  # Edge case: min == max
-        (0, 32, 128),
-    ])
+    @pytest.mark.parametrize(
+        'min_val,max_val,dim',
+        [
+            (0, 10, 64),
+            (5, 5, 32),  # Edge case: min == max
+            (0, 32, 128),
+        ])
     def test_yarn_linear_ramp_mask(self, min_val, max_val, dim):
         """Test linear ramp mask generation"""
         mask = yarn_linear_ramp_mask(min_val, max_val, dim)
-        assert mask.shape == (dim,)
+        assert mask.shape == (dim, )
         assert mask.min() >= 0
         assert mask.max() <= 1
 
     def test_yarn_linear_ramp_mask_singularity(self):
         """Test mask handles min == max (singularity case)"""
         mask = yarn_linear_ramp_mask(5, 5, 64)
-        assert mask.shape == (64,)
+        assert mask.shape == (64, )
         assert not torch.isnan(mask).any()
 
 
 # =============================================================================
 # Utility Functions Tests
 # =============================================================================
+
 
 class TestRotateHalf:
     """Test rotate_half function"""
@@ -390,14 +381,19 @@ class TestApplyRotaryPosEmb:
         sin = torch.randn(seq_len, head_dim)
         pos_ids = torch.arange(seq_len).unsqueeze(0).expand(batch, seq_len)
 
-        q_embed, k_embed = apply_rotary_pos_emb(q, k, cos, sin, pos_ids, unsqueeze_dim=1)
+        q_embed, k_embed = apply_rotary_pos_emb(q,
+                                                k,
+                                                cos,
+                                                sin,
+                                                pos_ids,
+                                                unsqueeze_dim=1)
         assert q_embed.shape == q.shape
 
 
 class TestRepeatKV:
     """Test repeat_kv function (GQA)"""
 
-    @pytest.mark.parametrize("n_rep", [1, 2, 4, 8])
+    @pytest.mark.parametrize('n_rep', [1, 2, 4, 8])
     def test_repeat_kv(self, n_rep):
         """Test key/value repetition for GQA"""
         batch, num_kv_heads, seq_len, head_dim = 2, 2, 8, 64
@@ -434,6 +430,7 @@ class TestGetUnpadData:
 # MLP Tests
 # =============================================================================
 
+
 class TestMLP:
     """Test DeepseekV3MLP"""
 
@@ -460,7 +457,7 @@ class TestMLP:
                 out = mlp(x)
                 assert out.shape == (batch, seq_len, base_config.hidden_size)
 
-    @pytest.mark.parametrize("activation", ["silu", "gelu", "relu"])
+    @pytest.mark.parametrize('activation', ['silu', 'gelu', 'relu'])
     def test_mlp_activations(self, base_config, activation):
         """Test MLP with different activations"""
         base_config.hidden_act = activation
@@ -473,6 +470,7 @@ class TestMLP:
 # =============================================================================
 # MoE Gate Tests
 # =============================================================================
+
 
 class TestMoEGate:
     """Test MoE Gate with various configurations"""
@@ -496,7 +494,7 @@ class TestMoEGate:
         assert aux_loss is not None
         assert aux_loss.requires_grad
 
-    @pytest.mark.parametrize("scoring_func", ["sigmoid"])
+    @pytest.mark.parametrize('scoring_func', ['sigmoid'])
     def test_moe_gate_scoring(self, moe_config, scoring_func):
         """Test different scoring functions"""
         moe_config.scoring_func = scoring_func
@@ -507,7 +505,7 @@ class TestMoEGate:
 
     def test_moe_gate_invalid_scoring(self, moe_config):
         """Test invalid scoring function raises error"""
-        moe_config.scoring_func = "invalid"
+        moe_config.scoring_func = 'invalid'
         gate = MoEGate(moe_config)
         hidden = torch.randn(2, 8, moe_config.hidden_size)
         with pytest.raises(NotImplementedError):
@@ -515,7 +513,7 @@ class TestMoEGate:
 
     def test_moe_gate_invalid_topk_method(self, moe_config):
         """Test invalid topk method raises error"""
-        moe_config.topk_method = "invalid"
+        moe_config.topk_method = 'invalid'
         gate = MoEGate(moe_config)
         hidden = torch.randn(2, 8, moe_config.hidden_size)
         with pytest.raises(NotImplementedError):
@@ -523,7 +521,9 @@ class TestMoEGate:
 
     def test_moe_gate_router_dtypes(self, moe_config):
         """Test router with different dtypes"""
-        for dtype_str, dtype in [("fp32", torch.float32), ("bf16", torch.bfloat16), ("fp16", torch.float16)]:
+        for dtype_str, dtype in [('fp32', torch.float32),
+                                 ('bf16', torch.bfloat16),
+                                 ('fp16', torch.float16)]:
             moe_config.moe_router_dtype = dtype_str
             gate = MoEGate(moe_config)
             hidden = torch.randn(2, 8, moe_config.hidden_size)
@@ -532,10 +532,10 @@ class TestMoEGate:
 
     def test_moe_gate_invalid_router_dtype(self, moe_config):
         """Test invalid router dtype raises error"""
-        moe_config.moe_router_dtype = "invalid"
+        moe_config.moe_router_dtype = 'invalid'
         gate = MoEGate(moe_config)
         hidden = torch.randn(2, 8, moe_config.hidden_size)
-        with pytest.raises(ValueError, match="Unsupported moe_router_dtype"):
+        with pytest.raises(ValueError, match='Unsupported moe_router_dtype'):
             gate(hidden)
 
     def test_moe_gate_norm_topk_prob(self, moe_config):
@@ -548,7 +548,9 @@ class TestMoEGate:
         # So weights should sum to approximately routed_scaling_factor per token
         weight_sums = topk_weight.sum(dim=-1)
         expected_sum = gate.routed_scaling_factor
-        assert torch.allclose(weight_sums, torch.full_like(weight_sums, expected_sum), atol=1e-4)
+        assert torch.allclose(weight_sums,
+                              torch.full_like(weight_sums, expected_sum),
+                              atol=1e-4)
 
     def test_moe_gate_expert_bias(self, moe_config):
         """Test gating with expert bias enabled"""
@@ -563,6 +565,7 @@ class TestMoEGate:
 # =============================================================================
 # MoE Tests
 # =============================================================================
+
 
 class TestMoE:
     """Test DeepseekV3MoE"""
@@ -600,8 +603,11 @@ class TestMoE:
         moe.eval()
         x = torch.randn(16, moe_config.hidden_size)
         # Create dummy topk indices and weights
-        topk_idx = torch.randint(0, moe_config.n_routed_experts, (16, moe_config.num_experts_per_tok))
-        topk_weight = torch.ones(16, moe_config.num_experts_per_tok) / moe_config.num_experts_per_tok
+        topk_idx = torch.randint(0, moe_config.n_routed_experts,
+                                 (16, moe_config.num_experts_per_tok))
+        topk_weight = torch.ones(
+            16,
+            moe_config.num_experts_per_tok) / moe_config.num_experts_per_tok
         out = moe.moe_forward(x, topk_idx, topk_weight)
         assert out.shape == x.shape
 
@@ -618,6 +624,7 @@ class TestMoE:
 # =============================================================================
 # Attention Tests
 # =============================================================================
+
 
 class TestAttention:
     """Test DeepseekV3Attention"""
@@ -639,12 +646,18 @@ class TestAttention:
         # First forward pass
         x1 = torch.randn(2, 4, base_config.hidden_size)
         pos_ids1 = torch.arange(4).unsqueeze(0).expand(2, 4)
-        out1, _, cache = attn(x1, position_ids=pos_ids1, past_key_value=cache, use_cache=True)
+        out1, _, cache = attn(x1,
+                              position_ids=pos_ids1,
+                              past_key_value=cache,
+                              use_cache=True)
 
         # Second forward pass (autoregressive)
         x2 = torch.randn(2, 1, base_config.hidden_size)
         pos_ids2 = torch.tensor([[4], [4]])
-        out2, _, cache = attn(x2, position_ids=pos_ids2, past_key_value=cache, use_cache=True)
+        out2, _, cache = attn(x2,
+                              position_ids=pos_ids2,
+                              past_key_value=cache,
+                              use_cache=True)
 
         assert out2.shape == (2, 1, base_config.hidden_size)
 
@@ -653,7 +666,9 @@ class TestAttention:
         attn = DeepseekV3Attention(base_config, layer_idx=0)
         x = torch.randn(2, 8, base_config.hidden_size)
         pos_ids = torch.arange(8).unsqueeze(0).expand(2, 8)
-        out, attn_weights, _ = attn(x, position_ids=pos_ids, output_attentions=True)
+        out, attn_weights, _ = attn(x,
+                                    position_ids=pos_ids,
+                                    output_attentions=True)
         assert attn_weights is not None
         expected_shape = (2, base_config.num_attention_heads, 8, 8)
         assert attn_weights.shape == expected_shape
@@ -672,7 +687,7 @@ class TestAttention:
     def test_attention_invalid_head_config(self, base_config):
         """Test invalid head configuration raises error"""
         base_config.num_key_value_heads = 3  # Not divisible by num_heads (4)
-        with pytest.raises(ValueError, match="must be divisible by"):
+        with pytest.raises(ValueError, match='must be divisible by'):
             DeepseekV3Attention(base_config, layer_idx=0)
 
     def test_attention_without_layer_idx_warning(self, base_config, caplog):
@@ -680,11 +695,11 @@ class TestAttention:
         import logging
         with caplog.at_level(logging.WARNING):
             _ = DeepseekV3Attention(base_config, layer_idx=None)
-            assert "without passing `layer_idx`" in caplog.text
+            assert 'without passing `layer_idx`' in caplog.text
 
     def test_attention_qk_layernorm(self, base_config):
         """Test attention with Q/K layernorm enabled - model uses standard GQA"""
-        # Note: Current model uses standard GQA (not MLA), so qk_layernorm 
+        # Note: Current model uses standard GQA (not MLA), so qk_layernorm
         # config is accepted but q_layernorm/k_layernorm attributes may not exist
         base_config.qk_layernorm = True
         attn = DeepseekV3Attention(base_config, layer_idx=0)
@@ -698,18 +713,18 @@ class TestAttention:
         if hasattr(attn, 'q_layernorm') and attn.q_layernorm is not None:
             assert attn.k_layernorm is not None
 
-    @pytest.mark.parametrize("scaling_type", ["linear", "dynamic", "yarn"])
+    @pytest.mark.parametrize('scaling_type', ['linear', 'dynamic', 'yarn'])
     def test_attention_rope_scaling(self, base_config, scaling_type):
         """Test attention with different RoPE scaling"""
-        if scaling_type == "linear":
-            base_config.rope_scaling = {"type": "linear", "factor": 2.0}
-        elif scaling_type == "dynamic":
-            base_config.rope_scaling = {"type": "dynamic", "factor": 2.0}
-        elif scaling_type == "yarn":
+        if scaling_type == 'linear':
+            base_config.rope_scaling = {'type': 'linear', 'factor': 2.0}
+        elif scaling_type == 'dynamic':
+            base_config.rope_scaling = {'type': 'dynamic', 'factor': 2.0}
+        elif scaling_type == 'yarn':
             base_config.rope_scaling = {
-                "type": "yarn",
-                "factor": 4.0,
-                "original_max_position_embeddings": 4096,
+                'type': 'yarn',
+                'factor': 4.0,
+                'original_max_position_embeddings': 4096,
             }
 
         attn = DeepseekV3Attention(base_config, layer_idx=0)
@@ -720,14 +735,15 @@ class TestAttention:
 
     def test_attention_invalid_rope_scaling(self, base_config):
         """Test invalid RoPE scaling type raises error"""
-        base_config.rope_scaling = {"type": "invalid", "factor": 2.0}
-        with pytest.raises(ValueError, match="Unknown RoPE scaling type"):
+        base_config.rope_scaling = {'type': 'invalid', 'factor': 2.0}
+        with pytest.raises(ValueError, match='Unknown RoPE scaling type'):
             DeepseekV3Attention(base_config, layer_idx=0)
 
 
 # =============================================================================
 # Decoder Layer Tests
 # =============================================================================
+
 
 class TestDecoderLayer:
     """Test DeepseekV3DecoderLayer"""
@@ -749,7 +765,10 @@ class TestDecoderLayer:
 
         x = torch.randn(2, 4, base_config.hidden_size)
         pos_ids = torch.arange(4).unsqueeze(0).expand(2, 4)
-        out, _, cache = layer(x, position_ids=pos_ids, past_key_value=cache, use_cache=True)
+        out, _, cache = layer(x,
+                              position_ids=pos_ids,
+                              past_key_value=cache,
+                              use_cache=True)
         assert cache is not None
 
     def test_decoder_layer_output_attentions(self, base_config):
@@ -780,13 +799,14 @@ class TestDecoderLayer:
         x = torch.randn(2, 8, base_config.hidden_size)
         pos_ids = torch.arange(8).unsqueeze(0).expand(2, 8)
 
-        with pytest.warns(UserWarning, match="padding_mask.*deprecated"):
+        with pytest.warns(UserWarning, match='padding_mask.*deprecated'):
             layer(x, position_ids=pos_ids, padding_mask=torch.ones(2, 8))
 
 
 # =============================================================================
 # Model Tests
 # =============================================================================
+
 
 class TestDeepseekV3Model:
     """Test DeepseekV3Model"""
@@ -810,13 +830,13 @@ class TestDeepseekV3Model:
         model = DeepseekV3Model(base_config)
         input_ids = torch.randint(0, base_config.vocab_size, (2, 8))
         inputs_embeds = torch.randn(2, 8, base_config.hidden_size)
-        with pytest.raises(ValueError, match="cannot specify both"):
+        with pytest.raises(ValueError, match='cannot specify both'):
             model(input_ids=input_ids, inputs_embeds=inputs_embeds)
 
     def test_model_forward_no_inputs_error(self, base_config):
         """Test error when neither input_ids nor inputs_embeds provided"""
         model = DeepseekV3Model(base_config)
-        with pytest.raises(ValueError, match="specify either"):
+        with pytest.raises(ValueError, match='specify either'):
             model()
 
     def test_model_output_hidden_states(self, base_config):
@@ -855,7 +875,9 @@ class TestDeepseekV3Model:
 
         # Second call with single token
         new_ids = torch.randint(0, base_config.vocab_size, (2, 1))
-        out2 = model(new_ids, past_key_values=out1.past_key_values, use_cache=True)
+        out2 = model(new_ids,
+                     past_key_values=out1.past_key_values,
+                     use_cache=True)
         assert out2.last_hidden_state.shape == (2, 1, base_config.hidden_size)
 
     def test_model_get_set_embeddings(self, base_config):
@@ -864,7 +886,8 @@ class TestDeepseekV3Model:
         embeds = model.get_input_embeddings()
         assert embeds is model.embed_tokens
 
-        new_embeds = torch.nn.Embedding(base_config.vocab_size, base_config.hidden_size)
+        new_embeds = torch.nn.Embedding(base_config.vocab_size,
+                                        base_config.hidden_size)
         model.set_input_embeddings(new_embeds)
         assert model.get_input_embeddings() is new_embeds
 
@@ -911,7 +934,7 @@ class TestDeepseekV3ForCausalLM:
         model = DeepseekV3ForCausalLM(base_config)
         input_ids = torch.randint(0, base_config.vocab_size, (2, 8))
         model_inputs = model.prepare_inputs_for_generation(input_ids)
-        assert "input_ids" in model_inputs
+        assert 'input_ids' in model_inputs
 
     def test_causallm_prepare_inputs_with_cache(self, base_config):
         """Test prepare_inputs_for_generation with past_key_values"""
@@ -922,13 +945,13 @@ class TestDeepseekV3ForCausalLM:
         # Format: tuple of (key, value) pairs for each layer
         past_key_values = tuple(
             (torch.randn(2, 4, 4, 16), torch.randn(2, 4, 4, 16))
-            for _ in range(base_config.num_hidden_layers)
-        )
+            for _ in range(base_config.num_hidden_layers))
 
-        model_inputs = model.prepare_inputs_for_generation(input_ids, past_key_values=past_key_values)
+        model_inputs = model.prepare_inputs_for_generation(
+            input_ids, past_key_values=past_key_values)
         # With cache containing 4 tokens and input_ids of length 8,
         # it should slice to keep only unprocessed tokens (8-4=4)
-        assert model_inputs["input_ids"].shape[1] == 4
+        assert model_inputs['input_ids'].shape[1] == 4
 
     def test_causallm_get_set_output_embeddings(self, base_config):
         """Test get_output_embeddings and set_output_embeddings"""
@@ -936,7 +959,9 @@ class TestDeepseekV3ForCausalLM:
         out_embeds = model.get_output_embeddings()
         assert out_embeds is model.lm_head
 
-        new_out_embeds = torch.nn.Linear(base_config.hidden_size, base_config.vocab_size, bias=False)
+        new_out_embeds = torch.nn.Linear(base_config.hidden_size,
+                                         base_config.vocab_size,
+                                         bias=False)
         model.set_output_embeddings(new_out_embeds)
         assert model.get_output_embeddings() is new_out_embeds
 
@@ -945,10 +970,8 @@ class TestDeepseekV3ForCausalLM:
         model = DeepseekV3ForCausalLM(base_config)
 
         # Create dummy cache
-        cache = tuple(
-            (torch.randn(2, 4, 8, 16), torch.randn(2, 4, 8, 16))
-            for _ in range(base_config.num_hidden_layers)
-        )
+        cache = tuple((torch.randn(2, 4, 8, 16), torch.randn(2, 4, 8, 16))
+                      for _ in range(base_config.num_hidden_layers))
         beam_idx = torch.tensor([1, 0])
 
         reordered = model._reorder_cache(cache, beam_idx)
@@ -978,8 +1001,9 @@ class TestDeepseekV3ForSequenceClassification:
         out = model(input_ids, labels=labels)
         assert out.loss is not None
 
-    @pytest.mark.parametrize("num_labels", [1, 2, 5])
-    def test_sequence_classification_various_labels(self, base_config, num_labels):
+    @pytest.mark.parametrize('num_labels', [1, 2, 5])
+    def test_sequence_classification_various_labels(self, base_config,
+                                                    num_labels):
         """Test with various number of labels"""
         base_config.num_labels = num_labels
         model = DeepseekV3ForSequenceClassification(base_config)
@@ -987,7 +1011,7 @@ class TestDeepseekV3ForSequenceClassification:
         if num_labels == 1:
             labels = torch.randn(2)  # Regression
         else:
-            labels = torch.randint(0, num_labels, (2,))
+            labels = torch.randint(0, num_labels, (2, ))
         out = model(input_ids, labels=labels)
         assert out.loss is not None
 
@@ -997,13 +1021,14 @@ class TestDeepseekV3ForSequenceClassification:
         base_config.pad_token_id = None
         model = DeepseekV3ForSequenceClassification(base_config)
         input_ids = torch.randint(0, base_config.vocab_size, (2, 8))
-        with pytest.raises(ValueError, match="batch sizes > 1"):
+        with pytest.raises(ValueError, match='batch sizes > 1'):
             model(input_ids)
 
 
 # =============================================================================
 # PreTrainedModel Tests
 # =============================================================================
+
 
 class TestPreTrainedModel:
     """Test DeepseekV3PreTrainedModel base class"""
@@ -1020,6 +1045,7 @@ class TestPreTrainedModel:
 # =============================================================================
 # Benchmark Tests
 # =============================================================================
+
 
 @pytest.mark.benchmark
 class TestPerformanceBenchmarks:
@@ -1055,6 +1081,7 @@ class TestPerformanceBenchmarks:
 # =============================================================================
 # Edge Cases and Robustness Tests
 # =============================================================================
+
 
 class TestEdgeCases:
     """Test edge cases and robustness"""
@@ -1108,5 +1135,5 @@ class TestEdgeCases:
             assert out.logits.dtype == torch.float32  # Logits always float32
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])

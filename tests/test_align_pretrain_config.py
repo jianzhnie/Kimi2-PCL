@@ -3,8 +3,8 @@ import json
 import os
 import subprocess
 import sys
-import pytest
 
+import pytest
 import torch
 
 
@@ -75,7 +75,8 @@ def _write_rank_ckpt(base_dir: str, tp_rank: int, pp_rank: int, ep_rank: int,
                _use_new_zipfile_serialization=True)
 
 
-def _build_dummy_mcore_ckpt(base_dir: str, moe_grouped_gemm: bool = True) -> dict[str, int]:
+def _build_dummy_mcore_ckpt(base_dir: str,
+                            moe_grouped_gemm: bool = True) -> dict[str, int]:
     """Build a minimal yet structurally complete synthetic mcore checkpoint tree."""
     tp_size = 2
     pp_size = 2
@@ -173,7 +174,8 @@ def _build_dummy_mcore_ckpt(base_dir: str, moe_grouped_gemm: bool = True) -> dic
                     num_local = num_experts // ep_size
                     dst[f'{mlp_prefix}.router.weight'] = rand(
                         (num_local, hidden_size))
-                    dst[f'{mlp_prefix}.router.expert_bias'] = rand((num_local, ))
+                    dst[f'{mlp_prefix}.router.expert_bias'] = rand(
+                        (num_local, ))
                     dst[f'{mlp_prefix}.shared_experts.linear_fc1.weight'] = rand(
                         (2 * moe_ffn_hidden // tp_size, hidden_size))
                     dst[f'{mlp_prefix}.shared_experts.linear_fc2.weight'] = rand(
@@ -191,7 +193,8 @@ def _build_dummy_mcore_ckpt(base_dir: str, moe_grouped_gemm: bool = True) -> dic
                             dst[f'{mlp_prefix}.experts.local_experts.{li}.linear_fc2.weight'] = rand(
                                 (hidden_size, moe_ffn_hidden // tp_size))
 
-            _write_rank_ckpt(base_dir, tp_rank, pp_rank, ep_rank, model0, model1)
+            _write_rank_ckpt(base_dir, tp_rank, pp_rank, ep_rank, model0,
+                             model1)
 
     latest = os.path.join(base_dir, 'latest_checkpointed_iteration.txt')
     with open(latest, 'w') as f:
@@ -231,11 +234,16 @@ def test_pretrain_config_matches_1t_success(repo_root):
     with open(cfg_path) as f:
         hf_cfg = json.load(f)
 
-    assert int(pretrain_config.get_int(cfg, '--num-layers')) == int(hf_cfg['num_hidden_layers'])
-    assert int(pretrain_config.get_int(cfg, '--hidden-size')) == int(hf_cfg['hidden_size'])
-    assert int(pretrain_config.get_int(cfg, '--num-attention-heads')) == int(hf_cfg['num_attention_heads'])
-    assert int(pretrain_config.get_int(cfg, '--vocab-size')) == int(hf_cfg['vocab_size'])
-    assert float(pretrain_config.get_float(cfg, '--rotary-base')) == float(hf_cfg['rope_theta'])
+    assert int(pretrain_config.get_int(cfg, '--num-layers')) == int(
+        hf_cfg['num_hidden_layers'])
+    assert int(pretrain_config.get_int(cfg, '--hidden-size')) == int(
+        hf_cfg['hidden_size'])
+    assert int(pretrain_config.get_int(cfg, '--num-attention-heads')) == int(
+        hf_cfg['num_attention_heads'])
+    assert int(pretrain_config.get_int(cfg, '--vocab-size')) == int(
+        hf_cfg['vocab_size'])
+    assert float(pretrain_config.get_float(cfg, '--rotary-base')) == float(
+        hf_cfg['rope_theta'])
     assert pretrain_config.get_bool(cfg, '--use-flash-attn') is True
     assert pretrain_config.get_bool(cfg, '--bf16') is True
     assert pretrain_config.get_bool(cfg, '--moe-grouped-gemm') is True
@@ -248,10 +256,12 @@ def test_pretrain_config_matches_1t_success(repo_root):
     assert int(rope['original_max_position_embeddings']) == 4096
 
 
-@pytest.mark.parametrize("moe_grouped_gemm", [True, False])
-@pytest.mark.parametrize("pp_workers", [1, 2])
+@pytest.mark.parametrize('moe_grouped_gemm', [True, False])
+@pytest.mark.parametrize('pp_workers', [1, 2])
 @pytest.mark.benchmark
-def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root, moe_grouped_gemm, pp_workers):
+def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root,
+                                                     moe_grouped_gemm,
+                                                     pp_workers):
     """
     Test purpose: Verify that dummy mcore checkpoint can be converted to HF and back to mcore without data loss.
     Inputs: tmp_path fixture.
@@ -266,25 +276,44 @@ def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root, moe_gr
 
     cmd_m2h = [
         'convert_ckpt_mcore2hf.py',
-        '--load-dir', mcore_in,
-        '--save-dir', hf_mid,
-        '--num-layers', str(p['num_layers']),
-        '--first-k-dense-replace', str(p['first_k_dense_replace']),
-        '--source-tensor-parallel-size', str(p['tp_size']),
-        '--source-pipeline-parallel-size', str(p['pp_size']),
-        '--source-expert-parallel-size', str(p['ep_size']),
-        '--schedules-method', 'dualpipev',
-        '--hidden-size', str(p['hidden_size']),
-        '--ffn-hidden-size', str(p['ffn_hidden']),
-        '--moe-ffn-hidden-size', str(p['moe_ffn_hidden']),
-        '--vocab-size', str(p['vocab_size']),
-        '--num-experts', str(p['num_experts']),
-        '--num-attention-heads', str(p['num_attention_heads']),
-        '--num-query-groups', str(p['num_query_groups']),
-        '--qk-head-dim', str(p['qk_head_dim']),
-        '--rotary-base', str(p['rotary_base']),
-        '--pp-workers', str(pp_workers),
-        '--io-threads', '2',
+        '--load-dir',
+        mcore_in,
+        '--save-dir',
+        hf_mid,
+        '--num-layers',
+        str(p['num_layers']),
+        '--first-k-dense-replace',
+        str(p['first_k_dense_replace']),
+        '--source-tensor-parallel-size',
+        str(p['tp_size']),
+        '--source-pipeline-parallel-size',
+        str(p['pp_size']),
+        '--source-expert-parallel-size',
+        str(p['ep_size']),
+        '--schedules-method',
+        'dualpipev',
+        '--hidden-size',
+        str(p['hidden_size']),
+        '--ffn-hidden-size',
+        str(p['ffn_hidden']),
+        '--moe-ffn-hidden-size',
+        str(p['moe_ffn_hidden']),
+        '--vocab-size',
+        str(p['vocab_size']),
+        '--num-experts',
+        str(p['num_experts']),
+        '--num-attention-heads',
+        str(p['num_attention_heads']),
+        '--num-query-groups',
+        str(p['num_query_groups']),
+        '--qk-head-dim',
+        str(p['qk_head_dim']),
+        '--rotary-base',
+        str(p['rotary_base']),
+        '--pp-workers',
+        str(pp_workers),
+        '--io-threads',
+        '2',
     ]
     if moe_grouped_gemm:
         cmd_m2h.append('--moe-grouped-gemm')
@@ -299,25 +328,44 @@ def test_conversion_roundtrip_mcore_hf_mcore_success(tmp_path, repo_root, moe_gr
 
     cmd_h2m = [
         'convert_ckpt_hf2mcore.py',
-        '--load-dir', hf_mid,
-        '--save-dir', mcore_out,
-        '--num-layers', str(p['num_layers']),
-        '--first-k-dense-replace', str(p['first_k_dense_replace']),
-        '--target-tensor-parallel-size', str(p['tp_size']),
-        '--target-pipeline-parallel-size', str(p['pp_size']),
-        '--target-expert-parallel-size', str(p['ep_size']),
-        '--schedules-method', 'dualpipev',
-        '--pp-workers', str(pp_workers),
-        '--num-experts', str(p['num_experts']),
-        '--num-attention-heads', str(p['num_attention_heads']),
-        '--num-query-groups', str(p['num_query_groups']),
-        '--hidden-size', str(p['hidden_size']),
-        '--ffn-hidden-size', str(p['ffn_hidden']),
-        '--moe-ffn-hidden-size', str(p['moe_ffn_hidden']),
-        '--vocab-size', str(p['vocab_size']),
-        '--qk-head-dim', str(p['qk_head_dim']),
-        '--v-head-dim', str(p['v_head_dim']),
-        '--rotary-base', str(p['rotary_base']),
+        '--load-dir',
+        hf_mid,
+        '--save-dir',
+        mcore_out,
+        '--num-layers',
+        str(p['num_layers']),
+        '--first-k-dense-replace',
+        str(p['first_k_dense_replace']),
+        '--target-tensor-parallel-size',
+        str(p['tp_size']),
+        '--target-pipeline-parallel-size',
+        str(p['pp_size']),
+        '--target-expert-parallel-size',
+        str(p['ep_size']),
+        '--schedules-method',
+        'dualpipev',
+        '--pp-workers',
+        str(pp_workers),
+        '--num-experts',
+        str(p['num_experts']),
+        '--num-attention-heads',
+        str(p['num_attention_heads']),
+        '--num-query-groups',
+        str(p['num_query_groups']),
+        '--hidden-size',
+        str(p['hidden_size']),
+        '--ffn-hidden-size',
+        str(p['ffn_hidden']),
+        '--moe-ffn-hidden-size',
+        str(p['moe_ffn_hidden']),
+        '--vocab-size',
+        str(p['vocab_size']),
+        '--qk-head-dim',
+        str(p['qk_head_dim']),
+        '--v-head-dim',
+        str(p['v_head_dim']),
+        '--rotary-base',
+        str(p['rotary_base']),
     ]
     if moe_grouped_gemm:
         cmd_h2m.append('--moe-grouped-gemm')
