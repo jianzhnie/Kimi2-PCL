@@ -493,6 +493,8 @@ class CkptConvert:
         ns.num_attention_heads = self.num_attention_heads
         ns.num_query_groups = self.num_query_groups
         ns.kv_channels = self.qk_head_dim
+        ns.qk_head_dim = self.qk_head_dim
+        ns.v_head_dim = self.v_head_dim
         ns.seq_length = 4096
         ns.max_position_embeddings = 131072
         ns.vocab_size = self.vocab_size
@@ -511,6 +513,21 @@ class CkptConvert:
         ns.moe_grouped_gemm = self.moe_grouped_gemm
         ns.moe_ffn_hidden_size = self.moe_ffn_hidden_size
         ns.first_k_dense_replace = self.first_k_dense_replace
+        ns.n_shared_experts = 1
+        ns.moe_router_topk = 2
+        ns.moe_router_num_groups = 8
+        ns.moe_router_group_topk = 2
+        ns.moe_router_topk_scaling_factor = 2.827
+        ns.moe_router_enable_expert_bias = True
+        ns.moe_token_dispatcher_type = 'alltoall'
+        ns.seq_aux = True
+        ns.norm_topk_prob = True
+
+        # Optimizer
+        ns.use_distributed_optimizer = True
+
+        # MTP (Multi-Token Prediction)
+        ns.mtp_num_layers = 0
 
         # Model format
         ns.use_mcore_models = True
@@ -1558,7 +1575,8 @@ def get_args():
     parser.add_argument('--mtp-num-layers',
                         type=int,
                         default=0,
-                        help='Multi-Token prediction layer num')
+                        help='Multi-Token prediction layer num '
+                        '(reserved, not yet implemented in converter)')
     parser.add_argument(
         '--num-layer-list',
         type=str,
