@@ -77,6 +77,7 @@ NUM_EXPERTS="${NUM_EXPERTS:-128}"
 N_SHARED_EXPERTS="${N_SHARED_EXPERTS:-1}"
 MOE_ROUTER_TOPK="${MOE_ROUTER_TOPK:-2}"
 MOE_FFN_HIDDEN_SIZE="${MOE_FFN_HIDDEN_SIZE:-12288}"
+EXPERT_TP="${EXPERT_TP:-1}"                  # Expert tensor parallel size (训练使用 expert-tp=1)
 
 # VPP / DualPipe 配置 (与训练脚本保持一致)
 SCHEDULES_METHOD="${SCHEDULES_METHOD:-dualpipev}"
@@ -150,6 +151,7 @@ echo "  N_SHARED_EXPERTS: ${N_SHARED_EXPERTS}"
 echo "  MOE_ROUTER_TOPK: ${MOE_ROUTER_TOPK}"
 echo "  MOE_FFN_HIDDEN_SIZE: ${MOE_FFN_HIDDEN_SIZE}"
 echo "  MOE_GROUPED_GEMM: enabled"
+echo "  EXPERT_TP: ${EXPERT_TP}"
 echo ""
 echo "VPP / DualPipe 配置:"
 echo "  SCHEDULES_METHOD: ${SCHEDULES_METHOD}"
@@ -181,6 +183,7 @@ python "${CONVERT_SCRIPT}" \
   --n-shared-experts "${N_SHARED_EXPERTS}" \
   --moe-router-topk "${MOE_ROUTER_TOPK}" \
   --max-position-embeddings "${MAX_POSITION_EMBEDDINGS}" \
+  --expert-tensor-parallel-size "${EXPERT_TP}" \
   "${EXTRA_ARGS[@]}"
 
 echo ""

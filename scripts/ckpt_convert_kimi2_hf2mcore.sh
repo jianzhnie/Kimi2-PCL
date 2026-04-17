@@ -71,6 +71,7 @@ QK_LAYERNORM="${QK_LAYERNORM:-1}"
 
 # 可选配置
 MOE_GROUPED_GEMM="${MOE_GROUPED_GEMM:-1}"
+MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-0}"
 NOOP_LAYERS="${NOOP_LAYERS:-}"
 NUM_LAYER_LIST="${NUM_LAYER_LIST:-}"
 QLORA_NF4="${QLORA_NF4:-0}"
@@ -135,6 +136,9 @@ fi
 if [[ "${MOE_GROUPED_GEMM}" == "1" ]]; then
   EXTRA_ARGS+=(--moe-grouped-gemm)
 fi
+if [[ "${MOE_TP_EXTEND_EP}" == "1" ]]; then
+  EXTRA_ARGS+=(--moe-tp-extend-ep)
+fi
 if [[ "${QLORA_NF4}" == "1" ]]; then
   EXTRA_ARGS+=(--qlora-nf4)
 fi
@@ -152,6 +156,13 @@ python "${CONVERT_SCRIPT}" \
   --target-expert-parallel-size "${EP}" \
   --expert-tensor-parallel-size "${EXPERT_TP}" \
   --num-experts "${NUM_EXPERTS}" \
+  --hidden-size "${HIDDEN_SIZE}" \
+  --num-attention-heads "${NUM_ATTENTION_HEADS}" \
+  --num-query-groups "${NUM_QUERY_GROUPS}" \
+  --kv-channels "${KV_CHANNELS}" \
+  --ffn-hidden-size "${FFN_HIDDEN_SIZE}" \
+  --moe-ffn-hidden-size "${MOE_FFN_HIDDEN_SIZE}" \
+  --vocab-size "${VOCAB_SIZE}" \
   "${EXTRA_ARGS[@]}"
 
 echo ""
