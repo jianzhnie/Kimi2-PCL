@@ -81,6 +81,7 @@ class MgCkptConvert(object):
         noop_layers: str = None,
         moe_grouped_gemm: bool = True,
         moe_tp_extend_ep: bool = False,
+        expert_tp_size: int = 1,
         dualpipe: bool = False,
         hidden_size: int = HIDDEN_SIZE,
         num_experts: int = NUM_EXPERTS,
@@ -109,6 +110,7 @@ class MgCkptConvert(object):
         self.noop_layers = noop_layers
         self.moe_grouped_gemm = moe_grouped_gemm
         self.moe_tp_extend_ep = moe_tp_extend_ep
+        self.expert_tp_size = expert_tp_size
         self.dualpipe = True if dualpipe == 'dualpipev' else False
         self.first_k_dense_replace = num_dense_layers
         self.num_layer_list_cmd = num_layer_list
@@ -213,6 +215,21 @@ class MgCkptConvert(object):
             raise ValueError(
                 'Does not contain a valid model layer. Please check the parameters!'
             )
+
+        if self.num_attention_heads % self.tp_size != 0:
+            raise ValueError(
+                'num_attention_heads should be divisible by tp_size')
+
+        if self.num_query_groups % self.tp_size != 0:
+            raise ValueError(
+                'num_query_groups should be divisible by tp_size')
+
+        if self.expert_tp_size > self.tp_size:
+            raise ValueError(
+                'expert_tp_size cannot exceed tp_size')
+        if self.tp_size % self.expert_tp_size != 0:
+            raise ValueError(
+                'tp_size must be divisible by expert_tp_size')
 
     @staticmethod
     def get_iter_path(ckpt_path, iteration=None):
@@ -448,34 +465,13 @@ class MgCkptConvert(object):
                                    tp_rank,
                                    pp_rank=None,
                                    ep_rank=None):
-        """get megatron weight path with fallback path formats"""
-        candidates = []
-
-        # Standard format: mp_rank_{tp}_{pp}_{ep}
+        """get megatron weight path"""
         mp_rank_path = os.path.join(iter_path, f'mp_rank_{tp_rank:02d}')
-        if self.pp_size > 1 and pp_rank is not None:
+        if self.pp_size > 1:
             mp_rank_path = mp_rank_path + f'_{pp_rank:03d}'
-        if self.ep_size > 1 and ep_rank is not None:
+        if self.ep_size > 1:
             mp_rank_path = mp_rank_path + f'_{ep_rank:03d}'
-        candidates.append(os.path.join(mp_rank_path, 'model_optim_rng.pt'))
-
-        # Fallback: always include both pp and ep if provided
-        if pp_rank is not None and ep_rank is not None and (self.pp_size > 1 or
-                                                            self.ep_size > 1):
-            alt = os.path.join(iter_path, f'mp_rank_{tp_rank:02d}')
-            if self.pp_size > 1:
-                alt += f'_{pp_rank:03d}'
-            if self.ep_size > 1:
-                alt += f'_{ep_rank:03d}'
-            candidates.append(os.path.join(alt, 'model_optim_rng.pt'))
-
-        for path in candidates:
-            if os.path.isfile(path):
-                return path
-
-        raise FileNotFoundError(
-            f'无法定位 rank 文件: tp={tp_rank}, pp={pp_rank}, ep={ep_rank}, '
-            f'iter_path={iter_path}')
+        return os.path.join(mp_rank_path, 'model_optim_rng.pt')
 
     def set_model_preprocess(self, hf_dict, mg_models):
         """embedding"""
@@ -483,7 +479,7 @@ class MgCkptConvert(object):
         for tp_rank in self.tp_rank_list:
             cur_tp_emb = mg_models[(
                 tp_rank,
-                self.ep_rank_list[0])].get('embedding.word_embeddings.weight')
+                self.ep_rank_list[0])].pop('embedding.word_embeddings.weight')
             emb_list.append(cur_tp_emb.clone())
         emb_weights = torch.cat(emb_list, dim=0)
         hf_dict['model.embed_tokens.weight'] = emb_weights
@@ -755,29 +751,80 @@ class MgCkptConvert(object):
                                     hf_layer_idx,
                                     expert_idx)] = down.contiguous().clone()
                     else:
-                        # moe_tp_extend_ep=False: 所有 TP rank 持有相同的专家权重
-                        # 只需使用 tp_rank=0 的数据即可
-                        ep_weight1 = ep_weight1_list[0]
-                        ep_weight2 = ep_weight2_list[0]
+                        # moe_tp_extend_ep=False: experts split by expert_tp_size across TP ranks
+                        if self.expert_tp_size > 1:
+                            # Select one TP rank per unique shard and concatenate
+                            step = self.tp_size // self.expert_tp_size
+                            unique_tp_indices = [
+                                i * step for i in range(self.expert_tp_size)
+                            ]
+                            ep_weight1 = torch.cat(
+                                [ep_weight1_list[i] for i in unique_tp_indices],
+                                dim=2)
+                            ep_weight2 = torch.cat(
+                                [ep_weight2_list[i] for i in unique_tp_indices],
+                                dim=1)
 
-                        for local_idx in range(local_expert_nums):
-                            expert_idx = ep_rank * local_expert_nums + local_idx
-                            ep_weight1_expert = ep_weight1[local_idx].reshape(
-                                self.hidden_size, -1).t()
-                            gate, up = torch.chunk(ep_weight1_expert, 2, dim=0)
-                            local_gate = gate.reshape(-1, self.hidden_size)
-                            local_up = up.reshape(-1, self.hidden_size)
-                            local_down = ep_weight2[local_idx].t()
+                            for local_idx in range(local_expert_nums):
+                                expert_idx = ep_rank * local_expert_nums + local_idx
+                                ep_w1_expert = ep_weight1[local_idx].reshape(
+                                    self.hidden_size, -1).t()
+                                # gate/up are interleaved per expert_tp shard
+                                chunks = torch.chunk(ep_w1_expert,
+                                                     self.expert_tp_size,
+                                                     dim=0)
+                                gate_list, up_list = [], []
+                                for chunk in chunks:
+                                    g, u = torch.chunk(chunk, 2, dim=0)
+                                    gate_list.append(
+                                        g.reshape(-1, self.hidden_size))
+                                    up_list.append(
+                                        u.reshape(-1, self.hidden_size))
+                                local_gate = torch.cat(gate_list, dim=0)
+                                local_up = torch.cat(up_list, dim=0)
+                                local_down = ep_weight2[local_idx].t()
 
-                            hf_dict[hf_local_gate_key.format(
-                                hf_layer_idx,
-                                expert_idx)] = local_gate.contiguous().clone()
-                            hf_dict[hf_local_up_key.format(
-                                hf_layer_idx,
-                                expert_idx)] = local_up.contiguous().clone()
-                            hf_dict[hf_local_down_key.format(
-                                hf_layer_idx,
-                                expert_idx)] = local_down.contiguous().clone()
+                                hf_dict[hf_local_gate_key.format(
+                                    hf_layer_idx,
+                                    expert_idx)] = local_gate.contiguous(
+                                    ).clone()
+                                hf_dict[hf_local_up_key.format(
+                                    hf_layer_idx,
+                                    expert_idx)] = local_up.contiguous().clone(
+                                    )
+                                hf_dict[hf_local_down_key.format(
+                                    hf_layer_idx,
+                                    expert_idx)] = local_down.contiguous(
+                                    ).clone()
+                        else:
+                            # expert_tp_size=1: all TP ranks hold identical expert weights
+                            ep_weight1 = ep_weight1_list[0]
+                            ep_weight2 = ep_weight2_list[0]
+
+                            for local_idx in range(local_expert_nums):
+                                expert_idx = ep_rank * local_expert_nums + local_idx
+                                ep_weight1_expert = ep_weight1[local_idx].reshape(
+                                    self.hidden_size, -1).t()
+                                gate, up = torch.chunk(ep_weight1_expert,
+                                                       2,
+                                                       dim=0)
+                                local_gate = gate.reshape(-1,
+                                                          self.hidden_size)
+                                local_up = up.reshape(-1, self.hidden_size)
+                                local_down = ep_weight2[local_idx].t()
+
+                                hf_dict[hf_local_gate_key.format(
+                                    hf_layer_idx,
+                                    expert_idx)] = local_gate.contiguous(
+                                    ).clone()
+                                hf_dict[hf_local_up_key.format(
+                                    hf_layer_idx,
+                                    expert_idx)] = local_up.contiguous().clone(
+                                    )
+                                hf_dict[hf_local_down_key.format(
+                                    hf_layer_idx,
+                                    expert_idx)] = local_down.contiguous(
+                                    ).clone()
             else:
                 # local_experts 格式
                 local_prefix = f"{prefix}.mlp.experts.local_experts"
@@ -1010,6 +1057,13 @@ def get_args():
         'use tp group to extend experts parallelism instead of sharding weight tensor of experts in tp group'
     )
     parser.add_argument(
+        '--expert-tensor-parallel-size',
+        type=int,
+        default=1,
+        help=
+        'Expert tensor parallel size (default: 1, experts not split by TP).'
+    )
+    parser.add_argument(
         '--schedules-method',
         type=str,
         default=None,
@@ -1085,6 +1139,7 @@ def main():
         noop_layers=args.noop_layers,
         moe_grouped_gemm=args.moe_grouped_gemm,
         moe_tp_extend_ep=args.moe_tp_extend_ep,
+        expert_tp_size=args.expert_tensor_parallel_size,
         dualpipe=args.schedules_method,
         hidden_size=args.hidden_size,
         num_experts=args.num_experts,
