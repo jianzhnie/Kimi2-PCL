@@ -903,8 +903,7 @@ class MgCkptConvert:
                     raise ValueError(
                         f'Detected num_kv_heads={self.detected_num_kv_heads} from checkpoint '
                         f'does not match --num-query-groups={self.num_query_groups}. '
-                        f'Check your training config.'
-                    )
+                        f'Check your training config.')
             # GQA: K uses q_head_dim for RoPE compatibility
             k_per_tp = kv_heads_per_tp * q_head_dim
             v_per_tp = kv_heads_per_tp * self.v_head_dim
@@ -1340,10 +1339,11 @@ def get_args():
                         type=int,
                         default=128,
                         help='Q/K head dimension (kv-channels).')
-    parser.add_argument('--v-head-dim',
-                        type=int,
-                        default=None,
-                        help='V head dimension (default: same as qk-head-dim).')
+    parser.add_argument(
+        '--v-head-dim',
+        type=int,
+        default=None,
+        help='V head dimension (default: same as qk-head-dim).')
     parser.add_argument('--max-position-embeddings',
                         type=int,
                         default=None,
