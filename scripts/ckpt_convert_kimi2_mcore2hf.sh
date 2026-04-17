@@ -81,6 +81,7 @@ VOCAB_SIZE="${VOCAB_SIZE:-163840}"
 # 可选配置
 MOE_GROUPED_GEMM="${MOE_GROUPED_GEMM:-1}"
 MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-0}"
+EXPERT_TP="${EXPERT_TP:-1}"
 NOOP_LAYERS="${NOOP_LAYERS:-}"
 NUM_LAYER_LIST="${NUM_LAYER_LIST:-}"
 QK_LAYERNORM="${QK_LAYERNORM:-1}"
@@ -146,6 +147,9 @@ if [[ "${MOE_GROUPED_GEMM}" == "1" ]]; then
 fi
 if [[ "${MOE_TP_EXTEND_EP}" == "1" ]]; then
   EXTRA_ARGS+=(--moe-tp-extend-ep)
+fi
+if [[ "${EXPERT_TP}" != "1" ]]; then
+  EXTRA_ARGS+=(--expert-tensor-parallel-size "${EXPERT_TP}")
 fi
 if [[ "${QK_LAYERNORM}" == "1" ]]; then
   EXTRA_ARGS+=(--qk-layernorm)
