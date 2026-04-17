@@ -137,7 +137,13 @@ class MgCkptConvert(object):
         self.qkv_proj_rows = self.q_proj_rows + self.k_proj_rows + self.v_proj_rows
 
         self.tp_rank_list = list(range(self.tp_size))
-        self.ep_rank_list = list(range(self.ep_size))
+        if self.moe_tp_extend_ep and self.tp_size > 1:
+            # With moe_tp_extend_ep, EP directories are interleaved across TP ranks.
+            # Each TP rank handles ep_size/tp_size local EP ranks.
+            # Global EP index = tp_rank + ep_rank * tp_size
+            self.ep_rank_list = list(range(self.ep_size // self.tp_size))
+        else:
+            self.ep_rank_list = list(range(self.ep_size))
         self.pp_rank_list = list(range(self.pp_size))
 
         if vpp_stage is not None:
@@ -470,7 +476,12 @@ class MgCkptConvert(object):
         if self.pp_size > 1:
             mp_rank_path = mp_rank_path + f'_{pp_rank:03d}'
         if self.ep_size > 1:
-            mp_rank_path = mp_rank_path + f'_{ep_rank:03d}'
+            if self.moe_tp_extend_ep and self.tp_size > 1:
+                # Interleaved EP naming: global_ep = tp_rank + ep_rank * tp_size
+                global_ep = tp_rank + ep_rank * self.tp_size
+                mp_rank_path = mp_rank_path + f'_{global_ep:03d}'
+            else:
+                mp_rank_path = mp_rank_path + f'_{ep_rank:03d}'
         return os.path.join(mp_rank_path, 'model_optim_rng.pt')
 
     def set_model_preprocess(self, hf_dict, mg_models):
@@ -698,11 +709,7 @@ class MgCkptConvert(object):
             hf_local_up_key = 'model.layers.{}.mlp.experts.{}.up_proj.weight'
             hf_local_down_key = 'model.layers.{}.mlp.experts.{}.down_proj.weight'
 
-            if self.moe_tp_extend_ep:
-                local_expert_nums = self.num_experts // (self.tp_size *
-                                                         self.ep_size)
-            else:
-                local_expert_nums = self.num_experts // self.ep_size
+            local_expert_nums = self.num_experts // self.ep_size
 
             if self.moe_grouped_gemm:
                 for ep_rank in self.ep_rank_list:
