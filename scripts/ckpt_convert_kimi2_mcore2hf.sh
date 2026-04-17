@@ -62,7 +62,7 @@ fi
 # 并行配置 (来自 pretrain_kimi2_1t_4k.sh)
 TP="${TP:-2}"
 PP="${PP:-8}"
-EP="${EP:-32}"
+EP="${EP:-64}"
 VPP_STAGE="${VPP_STAGE:-}"
 SCHEDULES_METHOD="${SCHEDULES_METHOD:-dualpipev}"
 
