@@ -18,6 +18,7 @@ MCore Checkpoint Reader 完整测试套件
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -29,9 +30,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from utils.get_mcore_weights_from_ckpt import CheckpointCache  # noqa: E402
 from utils.get_mcore_weights_from_ckpt import (
-    CheckpointLoader, DualPipeMapper, MCoreCheckpointReader, ModelConfig,
-    MoeParallelStrategy, ParallelConfig, ShapeMerger, StandardVppMapper,
-    _get_tensor_size, _get_torch_dtype_name, _mp_prefix, _peek_checkpoint_keys,
+    CheckpointLoader, DualPipeMapper, LayerMapperFactory,
+    MCoreCheckpointReader, ModelConfig, MoeParallelStrategy, ParallelConfig,
+    ShapeMerger, StandardVppMapper, _dtype_to_elem_size, _get_tensor_size,
+    _get_torch_dtype_name, _mp_prefix, _natural_sort_key, _peek_checkpoint_keys,
     _resolve_iter_dir)
 
 
@@ -482,7 +484,6 @@ class TestGetMCoreWeightsFromCkpt(unittest.TestCase):
         megatron_params = output['megatron_params']
 
         layer_ids = set()
-        import re
         for name in megatron_params.keys():
             match = re.match(r'module\.decoder\.layers\.(\d+)\.', name)
             if match:
@@ -537,7 +538,6 @@ class TestGetMCoreWeightsFromCkpt(unittest.TestCase):
         megatron_params = output['megatron_params']
 
         layer_ids = set()
-        import re
         for name in megatron_params.keys():
             match = re.match(r'module\.decoder\.layers\.(\d+)\.', name)
             if match:
@@ -1005,6 +1005,557 @@ class TestGetMCoreWeightsFromCkpt(unittest.TestCase):
         vpp_size, keys = reader._detect_vpp()
         self.assertEqual(vpp_size, 3)
         self.assertEqual(sorted(keys), ['model0', 'model1', 'model2'])
+
+    # ------------------------------------------------------------------
+    # 新增测试: 覆盖更多场景
+    # ------------------------------------------------------------------
+
+    def test_resolve_iter_dir_direct_iter(self):
+        """测试 _resolve_iter_dir 直接指向 iter_ 目录"""
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000001')
+        os.makedirs(iter_dir)
+        resolved = _resolve_iter_dir(iter_dir)
+        self.assertEqual(resolved, iter_dir)
+
+    def test_resolve_iter_dir_default_iter(self):
+        """测试 _resolve_iter_dir 无 latest 文件时回退到默认迭代目录"""
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000001')
+        os.makedirs(iter_dir)
+        # 不创建 latest_checkpointed_iteration.txt
+        resolved = _resolve_iter_dir(self.checkpoint_dir)
+        self.assertEqual(resolved, iter_dir)
+
+    def test_resolve_iter_dir_not_found(self):
+        """测试 _resolve_iter_dir 无有效目录时抛出异常"""
+        with self.assertRaises(FileNotFoundError):
+            _resolve_iter_dir(self.checkpoint_dir)
+
+    def test_checkpoint_cache_lru(self):
+        """测试 CheckpointCache LRU 淘汰行为"""
+        cache = CheckpointCache(max_size=2)
+        d1 = {'a': 1}
+        d2 = {'b': 2}
+        d3 = {'c': 3}
+
+        cache.put('p1', d1)
+        cache.put('p2', d2)
+        # 只访问 p1，使其变为最近使用（p2 变为最久未使用）
+        self.assertIsNotNone(cache.get('p1'))
+
+        # 添加第三个，淘汰最久未使用的 p2
+        cache.put('p3', d3)
+        self.assertIsNone(cache.get('p2'))
+        self.assertIsNotNone(cache.get('p1'))
+        self.assertIsNotNone(cache.get('p3'))
+
+    def test_checkpoint_cache_update_existing(self):
+        """测试 CheckpointCache 更新已有条目"""
+        cache = CheckpointCache(max_size=2)
+        cache.put('p1', {'old': 1})
+        cache.put('p1', {'new': 2})
+        self.assertEqual(cache.get('p1'), {'old': 1})  # put 不覆盖已存在的
+
+    def test_router_bias_shape(self):
+        """测试 router.bias 的 shape 验证"""
+        strategy = MoeParallelStrategy()
+        config = ModelConfig(num_experts=128)
+        self.assertEqual(strategy.get_expected_shape('router.bias', config),
+                         (128, ))
+
+    def test_shared_experts_tp_merging(self):
+        """测试 shared_experts 的 TP 维度合并"""
+        cfg = self.create_mock_moe_checkpoint(tp_size=2,
+                                              pp_size=1,
+                                              ep_size=4,
+                                              num_layers=4)
+        # 在已有 mock 上追加 shared_experts 权重
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000001')
+        hidden = cfg['hidden_size']
+        moe_ffn = cfg['moe_ffn_hidden_size']
+        tp = 2
+
+        for tp_rank in range(tp):
+            for ep_rank in range(4):
+                rank_dir = os.path.join(iter_dir,
+                                        f'mp_rank_{tp_rank:02}_{ep_rank:03}')
+                ckpt_path = os.path.join(rank_dir, 'model_optim_rng.pt')
+                state = torch.load(ckpt_path, map_location='cpu',
+                                   weights_only=False)
+                model = state['model']
+                # shared_experts: fc1 TP 切分 dim=0, fc2 TP 切分 dim=1
+                model['decoder.layers.2.mlp.shared_experts.linear_fc1.weight'] = \
+                    torch.randn(moe_ffn * 2 // tp, hidden)
+                model['decoder.layers.2.mlp.shared_experts.linear_fc2.weight'] = \
+                    torch.randn(hidden, moe_ffn // tp)
+                torch.save(state, ckpt_path)
+
+        reader = MCoreCheckpointReader(
+            mcore_dir=self.checkpoint_dir,
+            tp_size=2,
+            pp_size=1,
+            ep_size=4,
+            num_layers=4,
+            num_attention_heads=cfg['num_attention_heads'],
+            num_query_groups=cfg['num_query_groups'],
+            hidden_size=cfg['hidden_size'],
+            kv_channels=cfg['kv_channels'],
+            ffn_hidden_size=cfg['ffn_hidden_size'],
+            moe_ffn_hidden_size=cfg['moe_ffn_hidden_size'],
+            num_experts=cfg['num_experts'],
+            vocab_size=cfg['vocab_size'],
+            verbose=False,
+            validate_shapes=True,
+            io_threads=2,
+        )
+        result = reader.extract_weights()
+        self.assertEqual(len(result.warnings), 0,
+                         f"不应有 shape warnings: {result.warnings}")
+
+        params = result.megatron_params
+        # shared_experts 合并后: fc1 [moe_ffn*2, hidden], fc2 [hidden, moe_ffn]
+        self.assertEqual(
+            params[
+                'module.decoder.layers.2.mlp.shared_experts.linear_fc1.weight']
+            ['shape'], [moe_ffn * 2, hidden])
+        self.assertEqual(
+            params[
+                'module.decoder.layers.2.mlp.shared_experts.linear_fc2.weight']
+            ['shape'], [hidden, moe_ffn])
+
+    def test_balanced_ep_distribution(self):
+        """
+        测试 balanced EP 分布（模拟 --balanced-moe-experts 场景）
+        tp_rank=0 获得 even EP ranks, tp_rank=1 获得 odd EP ranks
+        """
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000001')
+        os.makedirs(iter_dir, exist_ok=True)
+        with open(
+                os.path.join(self.checkpoint_dir,
+                             'latest_checkpointed_iteration.txt'), 'w') as f:
+            f.write('1')
+
+        tp_size = 2
+        pp_size = 2
+        ep_size = 8
+        num_layers = 4
+        hidden = 64
+        vocab = 128
+        num_experts = 8
+        moe_ffn = 32
+
+        with open(
+                os.path.join(self.checkpoint_dir,
+                             'latest_checkpointed_iteration.txt'), 'w') as f:
+            f.write('1')
+
+        layers_per_pp = num_layers // pp_size
+
+        for tp_rank in range(tp_size):
+            for pp_rank in range(pp_size):
+                # balanced: tp=0 gets even EP, tp=1 gets odd EP
+                ep_ranks = list(range(tp_rank, ep_size, tp_size))
+                for ep_rank in ep_ranks:
+                    prefix = f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_rank:03}'
+                    rank_dir = os.path.join(iter_dir, prefix)
+                    os.makedirs(rank_dir, exist_ok=True)
+
+                    experts_per_ep = num_experts // ep_size
+                    state = {'model': {}}
+                    m = state['model']
+
+                    if pp_rank == 0:
+                        m['embedding.word_embeddings.weight'] = torch.randn(
+                            vocab // tp_size, hidden, dtype=torch.float16)
+
+                    start_layer = pp_rank * layers_per_pp
+                    for local_idx in range(layers_per_pp):
+                        # Dense layer (layer 0)
+                        m[f'decoder.layers.{local_idx}.input_layernorm.weight'] = \
+                            torch.randn(hidden, dtype=torch.float16)
+                        m[f'decoder.layers.{local_idx}.self_attention.linear_qkv.weight'] = \
+                            torch.randn(96 // tp_size, hidden, dtype=torch.float16)
+                        m[f'decoder.layers.{local_idx}.self_attention.linear_proj.weight'] = \
+                            torch.randn(hidden, 64 // tp_size, dtype=torch.float16)
+
+                        # MoE layer (layer >= 1): use global layer 2
+                        global_layer = start_layer + local_idx
+                        if global_layer == 2:
+                            m[f'decoder.layers.{local_idx}.mlp.experts.weight1'] = \
+                                torch.randn(hidden, experts_per_ep * moe_ffn * 2,
+                                            dtype=torch.float16)
+                            m[f'decoder.layers.{local_idx}.mlp.experts.weight2'] = \
+                                torch.randn(experts_per_ep * moe_ffn, hidden,
+                                            dtype=torch.float16)
+                            m[f'decoder.layers.{local_idx}.mlp.router.weight'] = \
+                                torch.randn(num_experts, hidden, dtype=torch.float16)
+
+                    if pp_rank == pp_size - 1:
+                        m['decoder.final_layernorm.weight'] = torch.randn(
+                            hidden, dtype=torch.float16)
+                        m['output_layer.weight'] = torch.randn(
+                            vocab // tp_size, hidden, dtype=torch.float16)
+
+                    torch.save(
+                        state,
+                        os.path.join(rank_dir, 'model_optim_rng.pt'))
+
+        reader = MCoreCheckpointReader(
+            mcore_dir=self.checkpoint_dir,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+            num_layers=num_layers,
+            num_attention_heads=4,
+            num_query_groups=2,
+            hidden_size=hidden,
+            kv_channels=16,
+            ffn_hidden_size=48,
+            moe_ffn_hidden_size=moe_ffn,
+            num_experts=num_experts,
+            vocab_size=vocab,
+            verbose=False,
+            validate_shapes=False,
+        )
+        result = reader.extract_weights()
+        params = result.megatron_params
+
+        # 非 EP 权重应正确 TP 合并
+        self.assertEqual(
+            params['module.embedding.word_embeddings.weight']['shape'],
+            [vocab, hidden])
+        self.assertEqual(
+            params['module.output_layer.weight']['shape'], [vocab, hidden])
+
+        # EP 权重应正确跨 EP 合并
+        self.assertEqual(
+            params['module.decoder.layers.2.mlp.experts.weight1']['shape'],
+            [hidden, num_experts * moe_ffn * 2])
+        self.assertEqual(
+            params['module.decoder.layers.2.mlp.experts.weight2']['shape'],
+            [num_experts * moe_ffn, hidden])
+
+    def test_dualpipe_integration(self):
+        """测试 DualPipe 模式的完整集成"""
+        tp_size = 1
+        pp_size = 2
+        ep_size = 1
+        num_layers = 4
+        hidden = 64
+
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000001')
+        os.makedirs(iter_dir, exist_ok=True)
+        with open(
+                os.path.join(self.checkpoint_dir,
+                             'latest_checkpointed_iteration.txt'), 'w') as f:
+            f.write('1')
+
+        # DualPipe 交错分布: 4 层, pp=2
+        # PP=0: layers [0, 3], PP=1: layers [1, 2]
+        # DualPipe 自动设置 vpp_size=2, vpp_stage=1
+        layers_per_pp = num_layers // pp_size  # = 2
+
+        for tp_rank in range(tp_size):
+            for pp_rank in range(pp_size):
+                prefix = _mp_prefix(tp_rank, pp_rank, 0, tp_size, pp_size,
+                                    ep_size)
+                rank_dir = os.path.join(iter_dir, prefix)
+                os.makedirs(rank_dir, exist_ok=True)
+
+                # DualPipe 使用 VPP 格式 (model0, model1, ...)
+                model0 = {}
+                model1 = {}
+
+                if pp_rank == 0:
+                    model0['embedding.word_embeddings.weight'] = torch.randn(
+                        100, hidden, dtype=torch.float16)
+
+                # VPP stage 0: local_idx 0
+                model0[f'decoder.layers.0.input_layernorm.weight'] = \
+                    torch.randn(hidden, dtype=torch.float16)
+                model0[f'decoder.layers.0.self_attention.linear_proj.weight'] = \
+                    torch.randn(hidden, hidden, dtype=torch.float16)
+
+                # VPP stage 1: local_idx 0
+                model1[f'decoder.layers.0.input_layernorm.weight'] = \
+                    torch.randn(hidden, dtype=torch.float16)
+                model1[f'decoder.layers.0.self_attention.linear_proj.weight'] = \
+                    torch.randn(hidden, hidden, dtype=torch.float16)
+
+                if pp_rank == pp_size - 1:
+                    model1['decoder.final_layernorm.weight'] = torch.randn(
+                        hidden, dtype=torch.float16)
+
+                torch.save(
+                    {
+                        'model0': model0,
+                        'model1': model1
+                    },
+                    os.path.join(rank_dir, 'model_optim_rng.pt'))
+
+        reader = MCoreCheckpointReader(
+            mcore_dir=self.checkpoint_dir,
+            tp_size=tp_size,
+            pp_size=pp_size,
+            ep_size=ep_size,
+            num_layers=num_layers,
+            hidden_size=hidden,
+            vocab_size=100,
+            schedules_method='dualpipev',
+            verbose=False,
+            validate_shapes=False,
+        )
+        result = reader.extract_weights()
+        params = result.megatron_params
+
+        # 应包含所有层的权重
+        layer_ids = set()
+        for name in params:
+            match = re.match(r'module\.decoder\.layers\.(\d+)\.', name)
+            if match:
+                layer_ids.add(int(match.group(1)))
+        self.assertEqual(len(layer_ids), num_layers,
+                         f"DualPipe 应提取所有 {num_layers} 层: {sorted(layer_ids)}")
+
+    def test_local_experts_format(self):
+        """测试 local_experts 格式的 EP 权重"""
+        strategy = MoeParallelStrategy()
+        merger = ShapeMerger(strategy)
+
+        # local_experts 格式: 每个 EP rank 存储不同专家，单个权重形状不变
+        local_shape_fc1 = (12288, 7168)
+        local_shape_fc2 = (7168, 12288)
+        ep_shapes_fc1 = [local_shape_fc1] * 8
+        ep_shapes_fc2 = [local_shape_fc2] * 8
+
+        # local_experts 不做 EP 维度合并，形状应保持不变
+        self.assertEqual(
+            merger.merge_ep_shapes(
+                'decoder.layers.0.mlp.local_experts.0.linear_fc1.weight',
+                ep_shapes_fc1), local_shape_fc1)
+        self.assertEqual(
+            merger.merge_ep_shapes(
+                'decoder.layers.0.mlp.local_experts.0.linear_fc2.weight',
+                ep_shapes_fc2), local_shape_fc2)
+
+        # is_ep_sharded 应识别 local_experts
+        self.assertTrue(
+            strategy.is_ep_sharded(
+                'decoder.layers.0.mlp.local_experts.0.linear_fc1.weight'))
+        self.assertTrue(
+            strategy.is_ep_sharded(
+                'decoder.layers.0.mlp.local_experts.0.linear_fc2.weight'))
+
+    def test_single_layer_model(self):
+        """测试单层模型的边界情况"""
+        self.create_mock_checkpoint(tp_size=1,
+                                    pp_size=1,
+                                    ep_size=1,
+                                    num_layers=1)
+        reader = MCoreCheckpointReader(
+            mcore_dir=self.checkpoint_dir,
+            tp_size=1,
+            pp_size=1,
+            ep_size=1,
+            num_layers=1,
+            verbose=False,
+            validate_shapes=False,
+        )
+        result = reader.extract_weights()
+        self.assertGreater(len(result.megatron_params), 0)
+        # 单层模型应包含 embedding, 1 层 attention, final_layernorm, output
+        self.assertIn('module.embedding.word_embeddings.weight',
+                      result.megatron_params)
+        self.assertIn('module.decoder.final_layernorm.weight',
+                      result.megatron_params)
+
+    def test_extra_state_filtered(self):
+        """测试 _extra_state 权重被过滤"""
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000001')
+        os.makedirs(iter_dir, exist_ok=True)
+        with open(
+                os.path.join(self.checkpoint_dir,
+                             'latest_checkpointed_iteration.txt'), 'w') as f:
+            f.write('1')
+
+        rank_dir = os.path.join(iter_dir, 'mp_rank_00')
+        os.makedirs(rank_dir, exist_ok=True)
+        state = {
+            'model': {
+                'embedding.word_embeddings.weight':
+                torch.randn(100, 64),
+                '_extra_state':
+                torch.randn(10),
+                'decoder.layers.0.self_attention._extra_state':
+                torch.randn(5),
+            }
+        }
+        torch.save(state, os.path.join(rank_dir, 'model_optim_rng.pt'))
+
+        reader = MCoreCheckpointReader(
+            mcore_dir=self.checkpoint_dir,
+            tp_size=1,
+            pp_size=1,
+            ep_size=1,
+            verbose=False,
+            validate_shapes=False,
+        )
+        result = reader.extract_weights()
+        params = result.megatron_params
+
+        self.assertIn('module.embedding.word_embeddings.weight', params)
+        self.assertNotIn('module._extra_state', params)
+        self.assertNotIn(
+            'module.decoder.layers.0.self_attention._extra_state', params)
+
+    def test_dtype_preservation(self):
+        """测试不同 dtype 的正确保留"""
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000001')
+        os.makedirs(iter_dir, exist_ok=True)
+        with open(
+                os.path.join(self.checkpoint_dir,
+                             'latest_checkpointed_iteration.txt'), 'w') as f:
+            f.write('1')
+
+        rank_dir = os.path.join(iter_dir, 'mp_rank_00')
+        os.makedirs(rank_dir, exist_ok=True)
+        state = {
+            'model': {
+                'embedding.word_embeddings.weight':
+                torch.randn(100, 64, dtype=torch.bfloat16),
+                'decoder.final_layernorm.weight':
+                torch.randn(64, dtype=torch.float32),
+                'output_layer.weight':
+                torch.randn(100, 64, dtype=torch.float16),
+            }
+        }
+        torch.save(state, os.path.join(rank_dir, 'model_optim_rng.pt'))
+
+        reader = MCoreCheckpointReader(
+            mcore_dir=self.checkpoint_dir,
+            tp_size=1,
+            pp_size=1,
+            ep_size=1,
+            num_layers=0,
+            verbose=False,
+            validate_shapes=False,
+        )
+        result = reader.extract_weights()
+        params = result.megatron_params
+
+        self.assertEqual(
+            params['module.embedding.word_embeddings.weight']['dtype'],
+            'bfloat16')
+        self.assertEqual(
+            params['module.decoder.final_layernorm.weight']['dtype'],
+            'float32')
+        self.assertEqual(
+            params['module.output_layer.weight']['dtype'], 'float16')
+
+    # ------------------------------------------------------------------
+    # 新增测试: 工具函数和边界情况
+    # ------------------------------------------------------------------
+
+    def test_dtype_to_elem_size(self):
+        """测试 _dtype_to_elem_size 各种数据类型的元素字节大小"""
+        self.assertEqual(_dtype_to_elem_size('float64'), 8)
+        self.assertEqual(_dtype_to_elem_size('float32'), 4)
+        self.assertEqual(_dtype_to_elem_size('fp32'), 4)
+        self.assertEqual(_dtype_to_elem_size('float16'), 2)
+        self.assertEqual(_dtype_to_elem_size('fp16'), 2)
+        self.assertEqual(_dtype_to_elem_size('bfloat16'), 2)
+        self.assertEqual(_dtype_to_elem_size('bf16'), 2)
+        self.assertEqual(_dtype_to_elem_size('int8'), 1)
+        self.assertEqual(_dtype_to_elem_size('uint8'), 1)
+        # 未知类型默认 2
+        self.assertEqual(_dtype_to_elem_size('unknown'), 2)
+
+    def test_natural_sort_key(self):
+        """测试 _natural_sort_key 确保正确的排序顺序"""
+        names = [
+            'module.output_layer.weight',
+            'module.decoder.layers.3.input_layernorm.weight',
+            'module.decoder.final_layernorm.weight',
+            'module.decoder.layers.0.input_layernorm.weight',
+            'module.decoder.layers.1.input_layernorm.weight',
+            'module.embedding.word_embeddings.weight',
+            'module.decoder.layers.10.input_layernorm.weight',
+            'module.decoder.layers.2.input_layernorm.weight',
+        ]
+        sorted_names = sorted(names, key=_natural_sort_key)
+        # embedding 应在最前
+        self.assertTrue(sorted_names[0].startswith('module.embedding'))
+        # layers 应按层号排列: 0, 1, 2, 3, 10
+        layer_names = [n for n in sorted_names if '.layers.' in n]
+        layer_ids = [
+            int(re.search(r'layers\.(\d+)', n).group(1)) for n in layer_names
+        ]
+        self.assertEqual(layer_ids, [0, 1, 2, 3, 10])
+        # final_layernorm 应在 layers 之后
+        self.assertIn('final_layernorm', sorted_names[-2])
+        # output_layer 应在最后
+        self.assertIn('output_layer', sorted_names[-1])
+
+    def test_standard_vpp_validation(self):
+        """测试 StandardVppMapper 对非法配置的校验"""
+        mapper = StandardVppMapper()
+        # num_layers 不能被 pp_size 整除
+        with self.assertRaises(ValueError):
+            mapper.build_mapping(7, 3, 1)
+        # layers_per_pp 不能被 vpp_stage 整除
+        with self.assertRaises(ValueError):
+            mapper.build_mapping(8, 2, 3)
+
+    def test_dualpipe_small_config(self):
+        """测试 DualPipe 最小配置 (8 层, pp=2)"""
+        mapper = DualPipeMapper()
+        mapping = mapper.build_mapping(8, 2, 2)
+        self.assertEqual(len(mapping), 8)
+        self.assertEqual(sorted(mapping.keys()), list(range(8)))
+
+    def test_layer_mapper_factory(self):
+        """测试 LayerMapperFactory 正确创建 mapper"""
+        self.assertIsInstance(LayerMapperFactory.create(False), StandardVppMapper)
+        self.assertIsInstance(LayerMapperFactory.create(True), DualPipeMapper)
+
+    def test_ep_shape_merging_local_experts(self):
+        """测试 local_experts 格式的 EP 合并不修改形状"""
+        strategy = MoeParallelStrategy()
+        merger = ShapeMerger(strategy)
+
+        # local_experts 格式：每个 EP rank 上的形状相同，不做维度合并
+        shape = (12288, 7168)
+        ep_shapes = [shape] * 4
+        result = merger.merge_ep_shapes(
+            'decoder.layers.0.mlp.local_experts.0.linear_fc1.weight', ep_shapes)
+        self.assertEqual(result, shape)
+
+    def test_resolve_iter_dir_iter_0000000_fallback(self):
+        """测试 _resolve_iter_dir 回退到 iter_0000000"""
+        iter_dir = os.path.join(self.checkpoint_dir, 'iter_0000000')
+        os.makedirs(iter_dir)
+        resolved = _resolve_iter_dir(self.checkpoint_dir)
+        self.assertEqual(resolved, iter_dir)
+
+    def test_parallel_config_dualpipe(self):
+        """测试 ParallelConfig.dualpipe 属性"""
+        self.assertTrue(
+            ParallelConfig(schedules_method='dualpipev').dualpipe)
+        self.assertTrue(
+            ParallelConfig(schedules_method='DualPipeV').dualpipe)
+        self.assertFalse(ParallelConfig(schedules_method=None).dualpipe)
+        self.assertFalse(ParallelConfig(schedules_method='vpp').dualpipe)
+
+    def test_model_config_properties(self):
+        """测试 ModelConfig 计算属性"""
+        config = ModelConfig(
+            num_attention_heads=64,
+            num_query_groups=2,
+            kv_channels=128,
+        )
+        # qkv_dim = (64 + 2*2) * 128 = 8704
+        self.assertEqual(config.qkv_dim, 8704)
+        # attention_proj_dim = 64 * 128 = 8192
+        self.assertEqual(config.attention_proj_dim, 8192)
 
 
 if __name__ == '__main__':

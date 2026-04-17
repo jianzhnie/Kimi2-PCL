@@ -20,12 +20,13 @@ import os
 import pickle
 import re
 import sys
+import threading
 import zipfile
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -36,33 +37,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # Data Classes
 # =============================================================================
-
-
-@dataclass(frozen=True)
-class TensorInfo:
-    """张量基本信息（不可变）"""
-    shape: Tuple[int, ...]
-    dtype: str
-    requires_grad: bool
-
-    @property
-    def size_bytes(self) -> int:
-        """计算张量字节大小"""
-        numel = 1
-        for dim in self.shape:
-            numel *= dim
-        return numel * _dtype_to_elem_size(self.dtype)
-
-
-@dataclass
-class WeightInfo:
-    """权重信息数据结构"""
-    name: str
-    shape: Tuple[int, ...]
-    dtype: str
-    requires_grad: bool
-    size_bytes: int
-    source: str = ''
 
 
 @dataclass
@@ -207,23 +181,17 @@ def _torch_load_compat(path: str, disable_mmap: bool = False) -> dict:
     except Exception:
         sig = None
 
-    support_weights_only = bool(sig and 'weights_only' in sig.parameters)
-    support_mmap = bool(sig and 'mmap' in sig.parameters and not disable_mmap)
+    has_wo = bool(sig and 'weights_only' in sig.parameters)
+    has_mmap = bool(sig and 'mmap' in sig.parameters and not disable_mmap)
 
-    candidates: List[dict] = [
-        {
-            **base, 'weights_only': True,
-            'mmap': True
-        } if support_weights_only and support_mmap else base,
-        {
-            **base, 'weights_only': False,
-            'mmap': True
-        } if support_mmap else base,
-        {
-            **base, 'weights_only': False
-        } if support_weights_only else base,
-        base,
-    ]
+    candidates: List[dict] = []
+    if has_wo and has_mmap:
+        candidates.append({**base, 'weights_only': True, 'mmap': True})
+    if has_mmap:
+        candidates.append({**base, 'weights_only': False, 'mmap': True})
+    if has_wo:
+        candidates.append({**base, 'weights_only': False})
+    candidates.append(base)
 
     for kw in candidates:
         try:
@@ -297,31 +265,34 @@ def _natural_sort_key(name: str) -> Tuple:
 
 
 class CheckpointCache:
-    """LRU 风格的 Checkpoint 文件缓存"""
+    """LRU 风格的 Checkpoint 文件缓存（线程安全）"""
 
     def __init__(self, max_size: int = 8):
         self._cache: Dict[str, dict] = {}
         self._access_order: List[str] = []
         self._max_size = max_size
+        self._lock = threading.Lock()
 
     def get(self, path: str) -> Optional[dict]:
-        if path not in self._cache:
-            return None
-        self._access_order.remove(path)
-        self._access_order.append(path)
-        return self._cache[path]
-
-    def put(self, path: str, state: dict) -> None:
-        if path in self._cache:
-            # 更新访问顺序，将当前 path 移到最新
+        with self._lock:
+            if path not in self._cache:
+                return None
             self._access_order.remove(path)
             self._access_order.append(path)
-            return
-        while len(self._cache) >= self._max_size:
-            oldest = self._access_order.pop(0)
-            del self._cache[oldest]
-        self._cache[path] = state
-        self._access_order.append(path)
+            return self._cache[path]
+
+    def put(self, path: str, state: dict) -> None:
+        with self._lock:
+            if path in self._cache:
+                # 更新访问顺序，将当前 path 移到最新
+                self._access_order.remove(path)
+                self._access_order.append(path)
+                return
+            while len(self._cache) >= self._max_size:
+                oldest = self._access_order.pop(0)
+                del self._cache[oldest]
+            self._cache[path] = state
+            self._access_order.append(path)
 
 
 # =============================================================================
@@ -527,7 +498,7 @@ class MoeParallelStrategy(ParallelStrategy):
                 name) or self.PATTERNS['output'].search(name):
             return (config.vocab_size, h)
 
-        # Q/K Layernorm (MLA)
+        # Q/K Layernorm (GQA)
         if self.PATTERNS['qk_norm'].search(name):
             return (config.kv_channels, )
 
@@ -562,6 +533,8 @@ class MoeParallelStrategy(ParallelStrategy):
             return (h, config.moe_ffn_hidden_size)
 
         # Router
+        if 'router.bias' in name:
+            return (config.num_experts, )
         if 'router.weight' in name:
             return (config.num_experts, h)
         if 'router.expert_bias' in name:
@@ -635,6 +608,8 @@ class ShapeMerger:
             base_shape[0] = sum(s[0] for s in ep_shapes)
             return tuple(base_shape)
 
+        # local_experts 格式: 每个 EP rank 存储不同的专家，单个专家权重形状不变
+        # 各 EP rank 上的同名专家权重形状应相同，直接返回第一个
         return ep_shapes[0]
 
     def merge(self, name: str, tp_ep_shapes: Dict[Tuple[int, int], Tuple[int,
@@ -841,8 +816,7 @@ class CheckpointLoader:
             ]
         else:
             return [
-                f'mp_rank_{tp_rank:02}_{pp_rank:03}_000',
-                f'mp_rank_{tp_rank:02}_{pp_rank:03}_001',
+                _mp_prefix(tp_rank, pp_rank, 0, tp, pp, ep),
                 f'mp_rank_{tp_rank:02}_{pp_rank:03}',
                 f'mp_rank_{tp_rank:02}',
             ]
@@ -1000,6 +974,7 @@ class MCoreCheckpointReader:
         # 状态
         self.layer_mapper: Optional[LayerMapper] = None
         self._layer2loc: Dict[int, Tuple[int, int, int]] = {}
+        self._loc2layer: Dict[Tuple[int, int, int], int] = {}
 
     def _validate(self) -> None:
         """验证参数合法性"""
@@ -1071,6 +1046,11 @@ class MCoreCheckpointReader:
 
         self._layer2loc = self.layer_mapper.build_mapping(
             self.model.num_layers, self.parallel.pp_size, vpp_stage)
+        # 构建反向映射 (pp, vpp, local) -> global，用于 O(1) 查找
+        self._loc2layer = {
+            loc: gid
+            for gid, loc in self._layer2loc.items()
+        }
 
         if self.verbose:
             logger.info(
@@ -1086,21 +1066,16 @@ class MCoreCheckpointReader:
             # 无 VPP 时，简单计算全局层号
             return pp_rank * layers_per_pp + local_idx
 
-        # 有 VPP 时，通过映射表查找
-        for global_id, (p, v, li) in self._layer2loc.items():
-            if p == pp_rank and v == vpp_rank and li == local_idx:
-                return global_id
+        # 有 VPP 时，通过反向映射表 O(1) 查找
+        loc = (pp_rank, vpp_rank, local_idx)
+        if loc in self._loc2layer:
+            return self._loc2layer[loc]
 
-        # 找不到时，使用启发式计算（更安全的 fallback）
-        logger.warning(
-            f"未找到 layer 映射: pp={pp_rank}, vpp={vpp_rank}, local={local_idx}, "
-            f"使用启发式计算")
-        # 启发式：pp_rank * layers_per_pp + vpp_rank * vpp_stage + local_idx
-        fallback_id = pp_rank * layers_per_pp + vpp_rank * self.parallel.vpp_stage + local_idx
-        if fallback_id >= self.model.num_layers:
-            raise ValueError(f"计算的全局 layer id ({fallback_id}) 超出范围 "
-                             f"[0, {self.model.num_layers}), 请检查 VPP 配置")
-        return fallback_id
+        raise ValueError(
+            f"未找到 layer 映射: pp={pp_rank}, vpp={vpp_rank}, local={local_idx}. "
+            f"请检查 VPP/DualPipe 配置是否与 checkpoint 一致 "
+            f"(vpp_size={self.parallel.vpp_size}, "
+            f"vpp_stage={self.parallel.vpp_stage})")
 
     def _convert_layer_index(self, name: str, pp_rank: int,
                              vpp_rank: Optional[int]) -> str:
@@ -1215,9 +1190,8 @@ class MCoreCheckpointReader:
                     # 过滤非 Tensor 类型和内部状态（如 optimizer 状态）
                     if not isinstance(tensor, torch.Tensor):
                         continue
-                    # 跳过 optimizer 状态（通常以 '_extra_state' 或特定前缀开头）
-                    if name.startswith('_extra_state') or name.startswith(
-                            'optimizer'):
+                    # 跳过 _extra_state 和 optimizer 状态
+                    if '_extra_state' in name or name.startswith('optimizer'):
                         continue
                     weight_tensors[name][(tp_rank, ep_rank)] = tensor
 
