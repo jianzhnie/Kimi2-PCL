@@ -69,10 +69,20 @@ class CkptConvert(object):
         noop_layers: str = None,
         vpp_stage: int = None,
         moe_grouped_gemm: bool = False,
+        moe_tp_extend_ep: bool = False,
         expert_tp_size: int = 1,
         dualpipe: bool = False,
         qlora_nf4: bool = False,
         qk_layernorm: bool = False,
+        num_experts: int = NUM_EXPERTS,
+        hidden_size: int = HIDDEN_SIZE,
+        num_attention_heads: int = NUM_ATTENTION_HEADS,
+        num_query_groups: int = NUM_QUERY_GROUPS,
+        qk_head_dim: int = QK_HEAD_DIM,
+        v_head_dim: int = V_HEAD_DIM,
+        ffn_hidden_size: int = FFN_HIDDEN_SIZE,
+        moe_ffn_hidden_size: int = MOE_FFN_HIDDEN_SIZE,
+        vocab_size: int = VOCAB_SIZE,
     ):
         self.tp_size = tp_size
         self.pp_size = pp_size
@@ -86,6 +96,7 @@ class CkptConvert(object):
         self.num_layer_list = num_layer_list
         self.noop_layers = noop_layers
         self.moe_grouped_gemm = moe_grouped_gemm
+        self.moe_tp_extend_ep = moe_tp_extend_ep
         self.expert_tp_size = expert_tp_size
         self.dualpipe = True if dualpipe == 'dualpipev' else False
         self.first_k_dense_replace = num_dense_layers
@@ -103,15 +114,15 @@ class CkptConvert(object):
             self.vpp_size = 2
             self.vpp_stage = self.num_layers // self.pp_size // self.vpp_size
 
-        self.hidden_size = HIDDEN_SIZE
-        self.num_experts = NUM_EXPERTS
-        self.num_attention_heads = NUM_ATTENTION_HEADS
-        self.num_query_groups = NUM_QUERY_GROUPS
-        self.qk_head_dim = QK_HEAD_DIM
-        self.v_head_dim = V_HEAD_DIM
-        self.ffn_hidden_size = FFN_HIDDEN_SIZE
-        self.moe_ffn_hidden_size = MOE_FFN_HIDDEN_SIZE
-        self.vocab_size = VOCAB_SIZE
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
+        self.num_attention_heads = num_attention_heads
+        self.num_query_groups = num_query_groups
+        self.qk_head_dim = qk_head_dim
+        self.v_head_dim = v_head_dim
+        self.ffn_hidden_size = ffn_hidden_size
+        self.moe_ffn_hidden_size = moe_ffn_hidden_size
+        self.vocab_size = vocab_size
 
         self._valid_parameter()
 
@@ -190,6 +201,10 @@ class CkptConvert(object):
             raise ValueError('expert_tp_size cannot exceed tp_size')
         if self.tp_size % self.expert_tp_size != 0:
             raise ValueError('tp_size must be divisible by expert_tp_size')
+        if self.moe_tp_extend_ep and self.expert_tp_size > 1:
+            raise ValueError(
+                'moe_tp_extend_ep and expert_tp_size>1 are mutually exclusive'
+            )
 
         if self.dualpipe:
             if self.tp_size > 1 and self.expert_tp_size != 1:
@@ -252,6 +267,7 @@ class CkptConvert(object):
         ns.pipeline_model_parallel_size = self.pp_size
         ns.expert_model_parallel_size = self.ep_size
         ns.expert_tensor_parallel_size = self.expert_tp_size
+        ns.moe_tp_extend_ep = self.moe_tp_extend_ep
         ns.context_parallel_size = 1
         ns.num_experts = self.num_experts
         ns.moe_grouped_gemm = self.moe_grouped_gemm
@@ -692,50 +708,110 @@ class CkptConvert(object):
             gemm_fc1_3d = gemm_fc1.view(self.num_experts, self.hidden_size, -1)
             gemm_fc2_3d = gemm_fc2.view(self.num_experts, -1, self.hidden_size)
 
-            gemm_fc1_ep = torch.chunk(gemm_fc1_3d, self.ep_size, dim=0)
-            gemm_fc2_ep = torch.chunk(gemm_fc2_3d, self.ep_size, dim=0)
+            if self.moe_tp_extend_ep:
+                # Split experts across EP*TP combined: each (tp_rank, ep_rank)
+                # gets a unique subset of experts
+                bucket_num = self.ep_size * self.tp_size
+                gemm_fc1_ep = torch.chunk(gemm_fc1_3d, bucket_num, dim=0)
+                gemm_fc2_ep = torch.chunk(gemm_fc2_3d, bucket_num, dim=0)
 
-            for ep_rank in range(self.ep_size):
-                fc1_ep = gemm_fc1_ep[ep_rank]
-                fc2_ep = gemm_fc2_ep[ep_rank]
+                for ep_rank in range(self.ep_size):
+                    for tp_rank in range(self.tp_size):
+                        idx = ep_rank * self.tp_size + tp_rank
+                        w1 = gemm_fc1_ep[idx].reshape(
+                            self.hidden_size, -1).clone()
+                        w2 = gemm_fc2_ep[idx].reshape(
+                            -1, self.hidden_size).clone()
+                        mg_model[ep_rank][tp_rank][
+                            experts_weight1_key] = w1
+                        mg_model[ep_rank][tp_rank][
+                            experts_weight2_key] = w2
+                        if self.qlora_nf4:
+                            self.qlora_nf4_quant(
+                                mg_model, ep_rank, tp_rank,
+                                experts_weight1_key, w1.clone())
+                            self.qlora_nf4_quant(
+                                mg_model, ep_rank, tp_rank,
+                                experts_weight2_key, w2.clone())
+            else:
+                # Standard EP: split by EP only, then optionally by expert_tp_size
+                gemm_fc1_ep = torch.chunk(gemm_fc1_3d, self.ep_size, dim=0)
+                gemm_fc2_ep = torch.chunk(gemm_fc2_3d, self.ep_size, dim=0)
 
-                if self.expert_tp_size > 1:
-                    if fc1_ep.shape[2] % self.expert_tp_size != 0:
-                        raise ValueError(
-                            f"grouped_gemm weight1 intermediate_dim ({fc1_ep.shape[2]}) "
-                            f"must be divisible by expert_tp_size ({self.expert_tp_size})"
-                        )
-                    if fc2_ep.shape[1] % self.expert_tp_size != 0:
-                        raise ValueError(
-                            f"grouped_gemm weight2 intermediate_dim ({fc2_ep.shape[1]}) "
-                            f"must be divisible by expert_tp_size ({self.expert_tp_size})"
-                        )
-                    fc1_shards = torch.chunk(fc1_ep,
-                                             self.expert_tp_size,
-                                             dim=2)
-                    fc2_shards = torch.chunk(fc2_ep,
-                                             self.expert_tp_size,
-                                             dim=1)
-                else:
-                    fc1_shards = [fc1_ep]
-                    fc2_shards = [fc2_ep]
+                for ep_rank in range(self.ep_size):
+                    fc1_ep = gemm_fc1_ep[ep_rank]
+                    fc2_ep = gemm_fc2_ep[ep_rank]
 
-                for tp_rank in range(self.tp_size):
-                    expert_tp_idx = tp_rank * self.expert_tp_size // self.tp_size
-                    w1 = fc1_shards[expert_tp_idx].reshape(
-                        self.hidden_size, -1).clone()
-                    w2 = fc2_shards[expert_tp_idx].reshape(
-                        -1, self.hidden_size).clone()
-                    mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
-                    mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
-                    if self.qlora_nf4:
-                        self.qlora_nf4_quant(mg_model, ep_rank, tp_rank,
-                                             experts_weight1_key, w1.clone())
-                        self.qlora_nf4_quant(mg_model, ep_rank, tp_rank,
-                                             experts_weight2_key, w2.clone())
+                    if self.expert_tp_size > 1:
+                        if fc1_ep.shape[2] % self.expert_tp_size != 0:
+                            raise ValueError(
+                                f"grouped_gemm weight1 intermediate_dim ({fc1_ep.shape[2]}) "
+                                f"must be divisible by expert_tp_size ({self.expert_tp_size})"
+                            )
+                        if fc2_ep.shape[1] % self.expert_tp_size != 0:
+                            raise ValueError(
+                                f"grouped_gemm weight2 intermediate_dim ({fc2_ep.shape[1]}) "
+                                f"must be divisible by expert_tp_size ({self.expert_tp_size})"
+                            )
+                        fc1_shards = torch.chunk(fc1_ep,
+                                                 self.expert_tp_size,
+                                                 dim=2)
+                        fc2_shards = torch.chunk(fc2_ep,
+                                                 self.expert_tp_size,
+                                                 dim=1)
+                    else:
+                        fc1_shards = [fc1_ep]
+                        fc2_shards = [fc2_ep]
+
+                    for tp_rank in range(self.tp_size):
+                        expert_tp_idx = tp_rank * self.expert_tp_size // self.tp_size
+                        w1 = fc1_shards[expert_tp_idx].reshape(
+                            self.hidden_size, -1).clone()
+                        w2 = fc2_shards[expert_tp_idx].reshape(
+                            -1, self.hidden_size).clone()
+                        mg_model[ep_rank][tp_rank][
+                            experts_weight1_key] = w1
+                        mg_model[ep_rank][tp_rank][
+                            experts_weight2_key] = w2
+                        if self.qlora_nf4:
+                            self.qlora_nf4_quant(
+                                mg_model, ep_rank, tp_rank,
+                                experts_weight1_key, w1.clone())
+                            self.qlora_nf4_quant(
+                                mg_model, ep_rank, tp_rank,
+                                experts_weight2_key, w2.clone())
             return
 
         # non-grouped gemm
+        if self.moe_tp_extend_ep:
+            bucket_num = self.ep_size * self.tp_size
+            num_local_experts = self.num_experts // bucket_num
+            for ep_rank in range(self.ep_size):
+                for tp_rank in range(self.tp_size):
+                    global_base = (ep_rank * self.tp_size + tp_rank) * num_local_experts
+                    for local_experts_idx in range(num_local_experts):
+                        global_experts_idx = global_base + local_experts_idx
+                        local_fc1 = experts_linear_fc1_list[
+                            global_experts_idx].t()
+                        local_fc2 = experts_linear_fc2_list[
+                            global_experts_idx].t()
+
+                        local_prefix = f"{prefix}.experts.local_experts.{local_experts_idx}"
+                        mg_model[ep_rank][tp_rank][
+                            f"{local_prefix}.linear_fc1.weight"] = local_fc1.clone()
+                        mg_model[ep_rank][tp_rank][
+                            f"{local_prefix}.linear_fc2.weight"] = local_fc2.clone()
+                        if self.qlora_nf4:
+                            self.qlora_nf4_quant(
+                                mg_model, ep_rank, tp_rank,
+                                f"{local_prefix}.linear_fc1.weight",
+                                local_fc1.clone())
+                            self.qlora_nf4_quant(
+                                mg_model, ep_rank, tp_rank,
+                                f"{local_prefix}.linear_fc2.weight",
+                                local_fc2.clone())
+            return
+
         num_local_experts = self.num_experts // self.ep_size
         for ep_rank in range(self.ep_size):
             for local_experts_idx in range(num_local_experts):
@@ -1050,6 +1126,44 @@ def get_args():
         '--qk-layernorm',
         action='store_true',
         help='Enable QK LayerNorm (must match pretrain config)')
+    parser.add_argument(
+        '--moe-tp-extend-ep',
+        action='store_true',
+        help=
+        'use tp group to extend experts parallelism instead of sharding weight tensor of experts in tp group'
+    )
+    parser.add_argument('--num-experts',
+                        type=int,
+                        default=NUM_EXPERTS,
+                        help='Number of experts.')
+    parser.add_argument('--hidden-size',
+                        type=int,
+                        default=HIDDEN_SIZE,
+                        help='Hidden size.')
+    parser.add_argument('--num-attention-heads',
+                        type=int,
+                        default=NUM_ATTENTION_HEADS,
+                        help='Number of attention heads.')
+    parser.add_argument('--num-query-groups',
+                        type=int,
+                        default=NUM_QUERY_GROUPS,
+                        help='Number of query groups for GQA.')
+    parser.add_argument('--kv-channels',
+                        type=int,
+                        default=QK_HEAD_DIM,
+                        help='KV channels (head dim).')
+    parser.add_argument('--ffn-hidden-size',
+                        type=int,
+                        default=FFN_HIDDEN_SIZE,
+                        help='FFN hidden size for dense layers.')
+    parser.add_argument('--moe-ffn-hidden-size',
+                        type=int,
+                        default=MOE_FFN_HIDDEN_SIZE,
+                        help='FFN hidden size for MoE experts.')
+    parser.add_argument('--vocab-size',
+                        type=int,
+                        default=VOCAB_SIZE,
+                        help='Vocabulary size.')
 
     args, _ = parser.parse_known_args()
     return args
@@ -1069,10 +1183,20 @@ def main():
         num_layer_list=args.num_layer_list,
         noop_layers=args.noop_layers,
         moe_grouped_gemm=args.moe_grouped_gemm,
+        moe_tp_extend_ep=args.moe_tp_extend_ep,
         expert_tp_size=args.expert_tensor_parallel_size,
         dualpipe=args.schedules_method,
         qlora_nf4=args.qlora_nf4,
         qk_layernorm=args.qk_layernorm,
+        num_experts=args.num_experts,
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.num_attention_heads,
+        num_query_groups=args.num_query_groups,
+        qk_head_dim=args.kv_channels,
+        v_head_dim=args.kv_channels,
+        ffn_hidden_size=args.ffn_hidden_size,
+        moe_ffn_hidden_size=args.moe_ffn_hidden_size,
+        vocab_size=args.vocab_size,
         vpp_stage=args.num_layers_per_virtual_pipeline_stage)
     converter.run()
 
