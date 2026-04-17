@@ -202,6 +202,7 @@ class MgCkptConvert:
         cast_dtype: str | None = None,
         io_threads: int = 4,
         disable_mmap: bool = False,
+        expert_tp_size: int = 1,
     ):
         self.verbose = os.environ.get('CKPT_CONVERT_VERBOSE', '1') != '0'
         self.log_rank_load = os.environ.get('CKPT_CONVERT_LOG_RANK',
@@ -216,6 +217,7 @@ class MgCkptConvert:
         self.tp_size = tp_size
         self.pp_size = pp_size
         self.ep_size = ep_size
+        self.expert_tp_size = max(1, int(expert_tp_size))
         self.first_k_dense_replace = first_k_dense_replace
         self.hidden_size = hidden_size
         self.num_experts = num_experts
@@ -576,11 +578,10 @@ class MgCkptConvert:
             layers_each_vpp = [[self.vpp_stage] * self.vpp_size
                                for _ in range(self.pp_size)]
             if self.noop_layers_list:
+                layers_per_pp = self.num_layers // self.pp_size
                 for layer in self.noop_layers_list:
-                    vpp_idx = layer // self.vpp_stage // self.pp_size
-                    pp_idx = (
-                        layer %
-                        (self.pp_size * self.vpp_stage)) // self.vpp_stage
+                    pp_idx = layer // layers_per_pp
+                    vpp_idx = (layer % layers_per_pp) // self.vpp_stage
                     layers_each_vpp[pp_idx][vpp_idx] -= 1
 
             real_layers = list(range(self.num_real_layers))
@@ -747,10 +748,8 @@ class MgCkptConvert:
             owners = self._tp_ranks_for_ep(pp_rank, ep)
             if not owners:
                 raise ValueError(f'找不到 ep={ep} 的权重目录: pp={pp_rank} key={key}')
-            if len(owners) != 1:
-                raise ValueError(
-                    f'router 不支持跨 TP 分片重建: pp={pp_rank} ep={ep} owners={owners}'
-                )
+            # With expert_tp_size < tp_size, multiple TP ranks hold identical
+            # router weights for the same EP rank.  Just pick the first owner.
             tp = owners[0]
             d = self._load_sparse_ep_state(tp, pp_rank, ep, vpp_rank)
             if key in d:
@@ -978,13 +977,22 @@ class MgCkptConvert:
             w1_key = f'{prefix}.experts.weight1'
             w2_key = f'{prefix}.experts.weight2'
             num_local = self.num_experts // self.ep_size
+            # With expert_tp_size < tp_size, each EP rank's expert weights
+            # are replicated across TP ranks (not sharded).  We only need
+            # one representative TP owner per EP rank.
+            num_expert_tp_owners = max(
+                1, self.tp_size // self.expert_tp_size)
             for ep_rank in range(self.ep_size):
                 owners = self._tp_ranks_for_ep(pp_rank, ep_rank)
                 if not owners:
                     raise ValueError(f'找不到 ep={ep_rank} 的权重目录: pp={pp_rank}')
+                # Only load from unique TP owners that hold different shards.
+                # When expert_tp_size=1, all owners hold identical data, so
+                # we only need the first one.
+                unique_owners = owners[:num_expert_tp_owners]
                 shards_w1: list[torch.Tensor] = []
                 shards_w2: list[torch.Tensor] = []
-                for tp_rank in owners:
+                for tp_rank in unique_owners:
                     d = self._load_sparse_ep_state(tp_rank, pp_rank, ep_rank,
                                                    vpp_rank)
                     if w1_key not in d or w2_key not in d:
@@ -1018,12 +1026,19 @@ class MgCkptConvert:
                     self._sparse_cache.pop(cache_key, None)
         else:
             num_local = self.num_experts // self.ep_size
+            # With expert_tp_size < tp_size, each EP rank's expert weights
+            # are replicated across TP ranks (not sharded).  We only need
+            # one representative TP owner per EP rank.
+            num_expert_tp_owners = max(
+                1, self.tp_size // self.expert_tp_size)
             for ep_rank in range(self.ep_size):
                 owners = self._tp_ranks_for_ep(pp_rank, ep_rank)
                 if not owners:
                     raise ValueError(f'找不到 ep={ep_rank} 的权重目录: pp={pp_rank}')
+                # Only load from unique TP owners that hold different shards.
+                unique_owners = owners[:num_expert_tp_owners]
                 local_states: dict[int, dict[str, torch.Tensor]] = {}
-                for tp_rank in owners:
+                for tp_rank in unique_owners:
                     local_states[tp_rank] = self._load_sparse_ep_state(
                         tp_rank, pp_rank, ep_rank, vpp_rank)
 
@@ -1033,8 +1048,8 @@ class MgCkptConvert:
                     fc1_key = f'{local_prefix}.linear_fc1.weight'
                     fc2_key = f'{local_prefix}.linear_fc2.weight'
 
-                    if len(owners) == 1:
-                        tp_rank = owners[0]
+                    if len(unique_owners) == 1:
+                        tp_rank = unique_owners[0]
                         fc1 = local_states[tp_rank].pop(fc1_key)
                         fc2 = local_states[tp_rank].pop(fc2_key)
                         gate, up = torch.chunk(fc1, 2, dim=0)
@@ -1043,10 +1058,10 @@ class MgCkptConvert:
                         hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2
                     else:
                         fc1_parts = [
-                            local_states[tp].pop(fc1_key) for tp in owners
+                            local_states[tp].pop(fc1_key) for tp in unique_owners
                         ]
                         fc2_parts = [
-                            local_states[tp].pop(fc2_key) for tp in owners
+                            local_states[tp].pop(fc2_key) for tp in unique_owners
                         ]
                         fc1 = torch.cat(fc1_parts, dim=0)
                         fc2 = torch.cat(fc2_parts, dim=1)
@@ -1371,6 +1386,11 @@ def get_args():
                         type=int,
                         default=2,
                         help='MoE router top-k (default: 2)')
+    parser.add_argument('--expert-tensor-parallel-size',
+                        type=int,
+                        default=1,
+                        help='Expert tensor parallel size (default: 1, '
+                        'experts not split by TP).')
 
     args = parser.parse_args()
     return args
@@ -1424,6 +1444,7 @@ def main() -> None:
         io_threads=args.io_threads,
         disable_mmap=args.disable_mmap,
         qk_layernorm=args.qk_layernorm,
+        expert_tp_size=args.expert_tensor_parallel_size,
     )
     converter.run()
     _write_sha256_manifest(args.save_dir, args.sha256_manifest)
