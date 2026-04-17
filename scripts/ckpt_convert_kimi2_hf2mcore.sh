@@ -60,6 +60,14 @@ SCHEDULES_METHOD="${SCHEDULES_METHOD:-}"
 NUM_LAYERS="${NUM_LAYERS:-32}"
 FIRST_K_DENSE_REPLACE="${FIRST_K_DENSE_REPLACE:-2}"
 NUM_EXPERTS="${NUM_EXPERTS:-128}"
+HIDDEN_SIZE="${HIDDEN_SIZE:-7168}"
+NUM_ATTENTION_HEADS="${NUM_ATTENTION_HEADS:-64}"
+NUM_QUERY_GROUPS="${NUM_QUERY_GROUPS:-2}"
+KV_CHANNELS="${KV_CHANNELS:-128}"
+FFN_HIDDEN_SIZE="${FFN_HIDDEN_SIZE:-18432}"
+MOE_FFN_HIDDEN_SIZE="${MOE_FFN_HIDDEN_SIZE:-12288}"
+VOCAB_SIZE="${VOCAB_SIZE:-163840}"
+QK_LAYERNORM="${QK_LAYERNORM:-1}"
 
 # 可选配置
 MOE_GROUPED_GEMM="${MOE_GROUPED_GEMM:-1}"
@@ -77,7 +85,7 @@ fi
 mkdir -p "${SAVE_DIR}"
 
 # 检查转换脚本
-CONVERT_SCRIPT="${REPO_ROOT}/utils/convert_ckpt_kimi2_hf2mcore.py"
+CONVERT_SCRIPT="${REPO_ROOT}/utils/convert_kimi2_hf2mcore.py"
 if [[ ! -f "${CONVERT_SCRIPT}" ]]; then
   echo "ERROR: Conversion script not found: ${CONVERT_SCRIPT}" >&2
   exit 3
@@ -129,6 +137,9 @@ if [[ "${MOE_GROUPED_GEMM}" == "1" ]]; then
 fi
 if [[ "${QLORA_NF4}" == "1" ]]; then
   EXTRA_ARGS+=(--qlora-nf4)
+fi
+if [[ "${QK_LAYERNORM}" == "1" ]]; then
+  EXTRA_ARGS+=(--qk-layernorm)
 fi
 
 python "${CONVERT_SCRIPT}" \
