@@ -7,6 +7,7 @@
 参考: convert_ckpt_deepseek3.py (框架风格) + convert_ckpt_hf2mcore.py (GQA/MoE 逻辑)
 """
 import argparse
+import gc
 import json
 import logging as logger
 import os
@@ -71,6 +72,7 @@ class CkptConvert(object):
         expert_tp_size: int = 1,
         dualpipe: bool = False,
         qlora_nf4: bool = False,
+        qk_layernorm: bool = False,
     ):
         self.tp_size = tp_size
         self.pp_size = pp_size
@@ -87,6 +89,7 @@ class CkptConvert(object):
         self.expert_tp_size = expert_tp_size
         self.dualpipe = True if dualpipe == 'dualpipev' else False
         self.first_k_dense_replace = num_dense_layers
+        self.qk_layernorm = qk_layernorm
         self.qlora_nf4 = qlora_nf4
 
         if not os.path.exists(self.hf_model_path):
@@ -227,6 +230,63 @@ class CkptConvert(object):
             if self.num_layers != NUM_LAYERS:
                 raise ValueError(
                     'num_layer_list supports only full parameters')
+
+    def _build_checkpoint_args(self):
+        """Build checkpoint args namespace for Megatron loading compatibility."""
+        import argparse
+        ns = argparse.Namespace()
+        ns.num_layers = self.num_layers
+        ns.hidden_size = self.hidden_size
+        ns.ffn_hidden_size = self.ffn_hidden_size or self.hidden_size * 4
+        ns.num_attention_heads = self.num_attention_heads
+        ns.num_query_groups = self.num_query_groups
+        ns.kv_channels = self.qk_head_dim
+        ns.qk_head_dim = self.qk_head_dim
+        ns.v_head_dim = self.v_head_dim
+        ns.seq_length = 4096
+        ns.max_position_embeddings = 131072
+        ns.vocab_size = self.vocab_size
+        ns.padded_vocab_size = self.vocab_size
+        ns.make_vocab_size_divisible_by = 1
+        ns.tensor_model_parallel_size = self.tp_size
+        ns.pipeline_model_parallel_size = self.pp_size
+        ns.expert_model_parallel_size = self.ep_size
+        ns.expert_tensor_parallel_size = self.expert_tp_size
+        ns.context_parallel_size = 1
+        ns.num_experts = self.num_experts
+        ns.moe_grouped_gemm = self.moe_grouped_gemm
+        ns.moe_ffn_hidden_size = self.moe_ffn_hidden_size
+        ns.first_k_dense_replace = self.first_k_dense_replace
+        ns.n_shared_experts = 1
+        ns.moe_router_topk = 2
+        ns.moe_router_num_groups = 8
+        ns.moe_router_group_topk = 2
+        ns.moe_router_topk_scaling_factor = 2.827
+        ns.moe_router_enable_expert_bias = True
+        ns.moe_token_dispatcher_type = 'alltoall'
+        ns.seq_aux = True
+        ns.norm_topk_prob = True
+        ns.use_distributed_optimizer = True
+        ns.mtp_num_layers = 0
+        ns.use_mcore_models = True
+        ns.use_legacy_models = False
+        ns.untie_embeddings_and_output_weights = True
+        ns.swiglu = True
+        ns.position_embedding_type = 'rope'
+        ns.normalization = 'RMSNorm'
+        ns.add_bias_linear = False
+        ns.norm_epsilon = 1e-6
+        ns.bf16 = True
+        ns.fp16 = False
+        ns.params_dtype = torch.bfloat16
+        ns.rotary_base = 50000.0
+        ns.use_rotary_position_embeddings = True
+        ns.qk_layernorm = self.qk_layernorm
+        if self.dualpipe:
+            ns.schedules_method = 'dualpipev'
+        if self.vpp_stage is not None:
+            ns.num_layers_per_virtual_pipeline_stage = self.vpp_stage
+        return ns
 
     def get_layer_files_map(self):
         """layer -> safetensors file map"""
@@ -520,13 +580,8 @@ class CkptConvert(object):
             down_proj = weights_dict.pop(
                 f"model.layers.{hf_layer_idx}.mlp.down_proj.weight")
 
-            linear_fc1 = torch.cat([gate_proj, up_proj], dim=0)
-
-            gate_tp = torch.chunk(linear_fc1, 2, dim=0)[0]
-            up_tp = torch.chunk(linear_fc1, 2, dim=0)[1]
-            # 更清晰的切分：先对 gate 和 up 各自做 TP 切分，再拼接
-            gate_chunks = torch.chunk(gate_tp, self.tp_size, dim=0)
-            up_chunks = torch.chunk(up_tp, self.tp_size, dim=0)
+            gate_chunks = torch.chunk(gate_proj, self.tp_size, dim=0)
+            up_chunks = torch.chunk(up_proj, self.tp_size, dim=0)
             fc1_shards = [
                 torch.cat([g, u], dim=0).clone()
                 for g, u in zip(gate_chunks, up_chunks)
@@ -569,9 +624,11 @@ class CkptConvert(object):
         shared_down = weights_dict.pop(
             f"model.layers.{hf_layer_idx}.mlp.shared_experts.down_proj.weight")
 
-        shared_fc1 = torch.cat([shared_gate, shared_up], dim=0)
+        shared_gate_chunks = torch.chunk(shared_gate, self.tp_size, dim=0)
+        shared_up_chunks = torch.chunk(shared_up, self.tp_size, dim=0)
         shared_fc1_shards = [
-            t.clone() for t in torch.chunk(shared_fc1, self.tp_size, dim=0)
+            torch.cat([g, u], dim=0).clone()
+            for g, u in zip(shared_gate_chunks, shared_up_chunks)
         ]
         shared_fc2_shards = [
             t.clone() for t in torch.chunk(shared_down, self.tp_size, dim=1)
@@ -635,35 +692,39 @@ class CkptConvert(object):
             gemm_fc1_3d = gemm_fc1.view(self.num_experts, self.hidden_size, -1)
             gemm_fc2_3d = gemm_fc2.view(self.num_experts, -1, self.hidden_size)
 
-            experts_per_ep = self.num_experts // self.ep_size
-            if experts_per_ep % self.expert_tp_size != 0 and self.expert_tp_size > 1:
-                raise ValueError(
-                    f"experts_per_ep ({experts_per_ep}) must be divisible by expert_tp_size ({self.expert_tp_size})"
-                )
-
             gemm_fc1_ep = torch.chunk(gemm_fc1_3d, self.ep_size, dim=0)
             gemm_fc2_ep = torch.chunk(gemm_fc2_3d, self.ep_size, dim=0)
 
             for ep_rank in range(self.ep_size):
+                fc1_ep = gemm_fc1_ep[ep_rank]
+                fc2_ep = gemm_fc2_ep[ep_rank]
+
                 if self.expert_tp_size > 1:
-                    num_tp_shards = self.tp_size // self.expert_tp_size
-                    fc1_tp = torch.chunk(gemm_fc1_ep[ep_rank],
-                                         num_tp_shards,
-                                         dim=0)
-                    fc2_tp = torch.chunk(gemm_fc2_ep[ep_rank],
-                                         num_tp_shards,
-                                         dim=0)
+                    if fc1_ep.shape[2] % self.expert_tp_size != 0:
+                        raise ValueError(
+                            f"grouped_gemm weight1 intermediate_dim ({fc1_ep.shape[2]}) "
+                            f"must be divisible by expert_tp_size ({self.expert_tp_size})"
+                        )
+                    if fc2_ep.shape[1] % self.expert_tp_size != 0:
+                        raise ValueError(
+                            f"grouped_gemm weight2 intermediate_dim ({fc2_ep.shape[1]}) "
+                            f"must be divisible by expert_tp_size ({self.expert_tp_size})"
+                        )
+                    fc1_shards = torch.chunk(fc1_ep,
+                                             self.expert_tp_size,
+                                             dim=2)
+                    fc2_shards = torch.chunk(fc2_ep,
+                                             self.expert_tp_size,
+                                             dim=1)
                 else:
-                    fc1_tp = [gemm_fc1_ep[ep_rank]]
-                    fc2_tp = [gemm_fc2_ep[ep_rank]]
+                    fc1_shards = [fc1_ep]
+                    fc2_shards = [fc2_ep]
 
                 for tp_rank in range(self.tp_size):
                     expert_tp_idx = tp_rank * self.expert_tp_size // self.tp_size
-                    w1 = fc1_tp[expert_tp_idx].permute(1, 0,
-                                                       2).contiguous().reshape(
-                                                           self.hidden_size,
-                                                           -1).clone()
-                    w2 = fc2_tp[expert_tp_idx].reshape(
+                    w1 = fc1_shards[expert_tp_idx].reshape(
+                        self.hidden_size, -1).clone()
+                    w2 = fc2_shards[expert_tp_idx].reshape(
                         -1, self.hidden_size).clone()
                     mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
                     mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
@@ -814,9 +875,10 @@ class CkptConvert(object):
 
                 # 检查是否所有权重都被消费
                 if pp_weights:
-                    logger.warning(
-                        f"pp_rank={pp_rank} 存在未被消费的 HF 权重: {list(pp_weights.keys())[:10]}"
-                    )
+                    unconsumed = list(pp_weights.keys())
+                    raise ValueError(
+                        f"pp_rank={pp_rank} 存在未被消费的 HF 权重 ({len(unconsumed)}): "
+                        f"{unconsumed[:20]}")
 
                 for ep_rank in range(self.ep_size):
                     for tp_rank in range(self.tp_size):
@@ -833,11 +895,15 @@ class CkptConvert(object):
                             {
                                 'model': mg_model[ep_rank][tp_rank],
                                 'checkpoint_version': 3.0,
-                                'iteration': 1
+                                'iteration': 1,
+                                'args': self._build_checkpoint_args(),
                             },
                             save_file_name,
                             pickle_protocol=4,
                             _use_new_zipfile_serialization=True)
+
+                del mg_model
+                gc.collect()
         else:
             vpp_local_layer_idx = self.generate_vpp_local_layer_idx()
             for pp_rank in range(self.pp_size):
@@ -880,9 +946,10 @@ class CkptConvert(object):
                                                    mg_model[vpp_rank])
 
                     if pp_weights:
-                        logger.warning(
-                            f"pp_rank={pp_rank} vpp_rank={vpp_rank} 存在未被消费的 HF 权重: {list(pp_weights.keys())[:10]}"
-                        )
+                        unconsumed = list(pp_weights.keys())
+                        raise ValueError(
+                            f"pp_rank={pp_rank} vpp_rank={vpp_rank} 存在未被消费的 HF 权重 ({len(unconsumed)}): "
+                            f"{unconsumed[:20]}")
 
                 for ep_rank in range(self.ep_size):
                     for tp_rank in range(self.tp_size):
@@ -896,7 +963,8 @@ class CkptConvert(object):
                         logger.info(f"Saving to {save_file_name}")
                         model_dict = {
                             'checkpoint_version': 3.0,
-                            'iteration': 1
+                            'iteration': 1,
+                            'args': self._build_checkpoint_args(),
                         }
 
                         for vpp_rank in range(self.vpp_size):
@@ -908,6 +976,9 @@ class CkptConvert(object):
                                    save_file_name,
                                    pickle_protocol=4,
                                    _use_new_zipfile_serialization=True)
+
+                del mg_model
+                gc.collect()
 
         logger.info('Done!')
 
@@ -975,6 +1046,10 @@ def get_args():
     parser.add_argument('--qlora-nf4',
                         action='store_true',
                         help='use bitsandbytes nf4 to quantize model.')
+    parser.add_argument(
+        '--qk-layernorm',
+        action='store_true',
+        help='Enable QK LayerNorm (must match pretrain config)')
 
     args, _ = parser.parse_known_args()
     return args
@@ -997,6 +1072,7 @@ def main():
         expert_tp_size=args.expert_tensor_parallel_size,
         dualpipe=args.schedules_method,
         qlora_nf4=args.qlora_nf4,
+        qk_layernorm=args.qk_layernorm,
         vpp_stage=args.num_layers_per_virtual_pipeline_stage)
     converter.run()
 
