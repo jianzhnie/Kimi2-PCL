@@ -33,8 +33,8 @@ set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 
 # 路径配置
-LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf}"
-SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf2mcore8}"
+LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf_step10000}"
+SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf2mcore_step10000}"
 
 
 if [[ -z "${LOAD_DIR}" ]]; then
@@ -49,12 +49,14 @@ if [[ -z "${SAVE_DIR}" ]]; then
 fi
 
 # 并行配置
-TP="${TP:-2}"
+TP="${TP:-1}"
 PP="${PP:-8}"
 EP="${EP:-8}"
 VPP_STAGE="${VPP_STAGE:-}"
 EXPERT_TP="${EXPERT_TP:-1}"
 SCHEDULES_METHOD="${SCHEDULES_METHOD:-}"
+
+SAVE_DIR="${SAVE_DIR}_tp${TP}_pp${PP}_ep${EP}"
 
 # 模型架构配置
 NUM_LAYERS="${NUM_LAYERS:-32}"

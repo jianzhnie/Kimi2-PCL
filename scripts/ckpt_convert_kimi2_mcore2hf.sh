@@ -45,8 +45,9 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 REPO_ROOT="${REPO_ROOT:-"/llm_workspace_1P/robin/Kimi2-PCL"}"
 
 # 路径配置
-LOAD_DIR="${LOAD_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore}"
-SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-hf}"
+ckpt_dir="/llm_workspace_1P/fdd/workspace/MindSpeed-LLM-0227/MindSpeed-LLM/TrainResults/kimi2_L32_exp_4096_dies/da943594-a2aa-4999-8729-4d935c0bfbfc"
+LOAD_DIR="${LOAD_DIR:-${ckpt_dir}}"
+SAVE_DIR="${SAVE_DIR:-/llm_workspace_1P/robin/hfhub/pcl-kimi2/kimi2-mcore2hf_step10000}"
 
 if [[ -z "${LOAD_DIR}" ]]; then
   echo "ERROR: LOAD_DIR must be set (source MCore checkpoint directory)" >&2
@@ -80,7 +81,7 @@ VOCAB_SIZE="${VOCAB_SIZE:-163840}"
 
 # 可选配置
 MOE_GROUPED_GEMM="${MOE_GROUPED_GEMM:-1}"
-MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-0}"
+MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-1}"
 EXPERT_TP="${EXPERT_TP:-1}"
 NOOP_LAYERS="${NOOP_LAYERS:-}"
 NUM_LAYER_LIST="${NUM_LAYER_LIST:-}"
