@@ -764,7 +764,7 @@ class CkptConvert(object):
                         fc2_shards = [fc2_ep]
 
                     for tp_rank in range(self.tp_size):
-                        expert_tp_idx = tp_rank * self.expert_tp_size // self.tp_size
+                        expert_tp_idx = tp_rank % self.expert_tp_size
                         w1 = fc1_shards[expert_tp_idx].reshape(
                             self.hidden_size, -1).clone()
                         w2 = fc2_shards[expert_tp_idx].reshape(
@@ -835,7 +835,7 @@ class CkptConvert(object):
                     fc2_shards = [local_fc2.clone()]
 
                 for tp_rank in range(self.tp_size):
-                    expert_tp_idx = tp_rank * self.expert_tp_size // self.tp_size
+                    expert_tp_idx = tp_rank % self.expert_tp_size
                     mg_model[ep_rank][tp_rank][
                         f"{local_prefix}.linear_fc1.weight"] = fc1_shards[
                             expert_tp_idx]

@@ -158,10 +158,10 @@ class MgCkptConvert(object):
         self.num_real_layers = self.num_layers - num_noop_layers
 
         self.model_index = {}
-        self.pprank_layer_idxs = {}
+        self.pprank_layer_idxs = defaultdict()
         self.vpprank_layer_idxs = defaultdict(dict)
-        self.layeridx_vpprank = {}
-        self.layeridx_pprank = {}
+        self.layeridx_vpprank = defaultdict()
+        self.layeridx_pprank = defaultdict()
 
         if self.vpp_stage is not None:
             self.calc_vpprank_layeridxs()
@@ -753,11 +753,10 @@ class MgCkptConvert(object):
                     else:
                         # moe_tp_extend_ep=False: experts split by expert_tp_size across TP ranks
                         if self.expert_tp_size > 1:
-                            # Select one TP rank per unique shard and concatenate
-                            step = self.tp_size // self.expert_tp_size
-                            unique_tp_indices = [
-                                i * step for i in range(self.expert_tp_size)
-                            ]
+                            # TP ranks 0..expert_tp_size-1 each hold a unique
+                            # shard; higher ranks are replicas.
+                            unique_tp_indices = list(
+                                range(self.expert_tp_size))
                             ep_weight1 = torch.cat(
                                 [ep_weight1_list[i] for i in unique_tp_indices],
                                 dim=2)
@@ -865,23 +864,54 @@ class MgCkptConvert(object):
                             local_fc1_key = f"{local_prefix}.{local_idx}.linear_fc1.weight"
                             local_fc2_key = f"{local_prefix}.{local_idx}.linear_fc2.weight"
 
-                            # moe_tp_extend_ep=False: 所有 TP rank 持有相同专家权重
-                            # 直接使用 tp_rank=0 的数据
-                            cur_fc1 = mg_models[(self.tp_rank_list[0],
-                                                 ep_rank)].pop(local_fc1_key)
-                            cur_fc2 = mg_models[(self.tp_rank_list[0],
-                                                 ep_rank)].pop(local_fc2_key)
+                            if self.expert_tp_size > 1:
+                                # expert_tp_size>1: each TP rank holds a
+                                # unique shard; gather from the first
+                                # expert_tp_size TP ranks.
+                                fc1_parts = [
+                                    mg_models[(tp, ep_rank)].pop(
+                                        local_fc1_key)
+                                    for tp in range(self.expert_tp_size)
+                                ]
+                                fc2_parts = [
+                                    mg_models[(tp, ep_rank)].pop(
+                                        local_fc2_key)
+                                    for tp in range(self.expert_tp_size)
+                                ]
+                                cur_fc1 = torch.cat(fc1_parts, dim=0)
+                                cur_fc2 = torch.cat(fc2_parts, dim=1)
+
+                                # Release replica TP ranks
+                                for tp in range(self.expert_tp_size,
+                                                self.tp_size):
+                                    mg_models[(tp,
+                                               ep_rank)].pop(local_fc1_key,
+                                                             None)
+                                    mg_models[(tp,
+                                               ep_rank)].pop(local_fc2_key,
+                                                             None)
+                            else:
+                                # expert_tp_size=1: all TP ranks hold
+                                # identical expert weights
+                                cur_fc1 = mg_models[(
+                                    self.tp_rank_list[0],
+                                    ep_rank)].pop(local_fc1_key)
+                                cur_fc2 = mg_models[(
+                                    self.tp_rank_list[0],
+                                    ep_rank)].pop(local_fc2_key)
+
+                                for tp_rank in self.tp_rank_list[1:]:
+                                    mg_models[(tp_rank,
+                                               ep_rank)].pop(
+                                                   local_fc1_key, None)
+                                    mg_models[(tp_rank,
+                                               ep_rank)].pop(
+                                                   local_fc2_key, None)
+
                             local_gate, local_up = torch.chunk(cur_fc1,
                                                                2,
                                                                dim=0)
                             local_down = cur_fc2
-
-                            # 释放其他 TP rank 的重复数据
-                            for tp_rank in self.tp_rank_list[1:]:
-                                mg_models[(tp_rank,
-                                           ep_rank)].pop(local_fc1_key, None)
-                                mg_models[(tp_rank,
-                                           ep_rank)].pop(local_fc2_key, None)
 
                             hf_dict[hf_local_gate_key.format(
                                 hf_layer_idx,
