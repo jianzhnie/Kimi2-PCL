@@ -24,13 +24,12 @@ Kimi2 MCore to HuggingFace 权重转换脚本
 """
 
 import argparse
+import gc
 import json
 import logging as logger
 import os
 from collections import defaultdict
 from itertools import product
-
-import gc
 
 import numpy as np
 import safetensors.torch
@@ -231,6 +230,9 @@ class MgCkptConvert(object):
                 raise FileNotFoundError(f"can not find {latest_iter_file}")
 
         directory = os.path.join(ckpt_path, f'iter_{iteration:07d}')
+
+        os.makedirs(directory, exist_ok=True)
+
         return directory
 
     def get_last_hf_layer(self):
@@ -241,6 +243,7 @@ class MgCkptConvert(object):
             else:
                 return self.vpprank_layer_idxs[0][1][-1]
 
+        # {pp0:{[0,1],[4,5]}, pp1:{[2,3],[]}}  --> last hf: 3
         for pp_rank in range(self.pp_size - 1, -1, -1):
             if self.vpp_stage is not None:
                 for vpp_rank in range(self.vpp_size - 1, -1, -1):
@@ -299,12 +302,15 @@ class MgCkptConvert(object):
             layers_each_pp = self.num_layers // self.pp_size
             layer_pop_num = layers_each_pp // 2
             all_layer_list = [i for i in range(self.num_layers)]
-
+            # dualpipe_layer_list example
+            # pp2: [0 1 2 3 4 5 6 7] -> [0 1 6 7 | 2 3 4 5]
+            # pp4: [0 1 2 3 4 5 6 7] -> [0 7 | 1 6 | 2 5 | 3 4]
             while all_layer_list:
                 dualpipe_layer_list.extend(all_layer_list[:layer_pop_num])
                 dualpipe_layer_list.extend(all_layer_list[-layer_pop_num:])
                 all_layer_list = all_layer_list[layer_pop_num:-layer_pop_num]
 
+            # calc pp idx and vpp idx of each hf layer
             pp_rank, vpp_rank = 0, 0
             each_pp_layer = self.num_layers // self.pp_size
             for idx, layer in enumerate(dualpipe_layer_list):
@@ -399,6 +405,7 @@ class MgCkptConvert(object):
                 dualpipe_layer_list.extend(all_layer_list[-layer_pop_num:])
                 all_layer_list = all_layer_list[layer_pop_num:-layer_pop_num]
 
+            # vpprank_hflayer_idxs {pp_rank: {vpp_rank: [hf_layer1, hf_layer2, ...]}}
             for pp_rank in range(self.pp_size):
                 for vpp_rank in range(self.vpp_size):
                     pp_list = dualpipe_layer_list[pp_rank *
@@ -453,7 +460,8 @@ class MgCkptConvert(object):
         candidates.append(os.path.join(mp_rank_path, 'model_optim_rng.pt'))
 
         # Fallback: always include both pp and ep if provided
-        if pp_rank is not None and ep_rank is not None and (self.pp_size > 1 or self.ep_size > 1):
+        if pp_rank is not None and ep_rank is not None and (self.pp_size > 1 or
+                                                            self.ep_size > 1):
             alt = os.path.join(iter_path, f'mp_rank_{tp_rank:02d}')
             if self.pp_size > 1:
                 alt += f'_{pp_rank:03d}'
@@ -518,9 +526,10 @@ class MgCkptConvert(object):
         """
         GQA Attention 转换
 
-        MCore 格式:
-        - linear_qkv: [qkv_proj_rows, hidden_size] (Q, K, V 融合)
-        - linear_proj: [hidden_size, attention_proj_dim] (输出投影)
+        MCore 格式 (per TP rank):
+        - linear_qkv: [q_per_tp + k_per_tp + v_per_tp, hidden_size]
+          布局: [Q_tp; K_tp; V_tp] along dim=0
+        - linear_proj: [hidden_size, proj_dim_per_tp]
 
         HF 格式:
         - q_proj: [num_attention_heads * head_dim, hidden_size]
@@ -533,7 +542,17 @@ class MgCkptConvert(object):
         proj_key = f"{prefix}.self_attention.linear_proj.weight"
 
         linear_proj_list = []
-        qkv_list = []
+        q_parts = []
+        k_parts = []
+        v_parts = []
+
+        # GQA: 每个 TP shard 内部是 [Q_tp; K_tp; V_tp] 布局
+        # 必须先按 shard 拆分 QKV，再合并各 shard 的 Q/K/V
+        heads_per_tp = self.num_attention_heads // self.tp_size
+        kv_heads_per_tp = self.num_query_groups // self.tp_size
+        q_per_tp = heads_per_tp * self.q_head_dim
+        k_per_tp = kv_heads_per_tp * self.k_head_dim
+        v_per_tp = kv_heads_per_tp * self.v_head_dim
 
         for tp_rank in self.tp_rank_list:
             cur_linear_proj = mg_models[(tp_rank,
@@ -541,23 +560,19 @@ class MgCkptConvert(object):
             linear_proj_list.append(cur_linear_proj.clone())
 
             cur_qkv = mg_models[(tp_rank, self.ep_rank_list[0])].pop(qkv_key)
-            qkv_list.append(cur_qkv.clone())
+            # Per-shard QKV split
+            q_r, k_r, v_r = torch.split(cur_qkv,
+                                        [q_per_tp, k_per_tp, v_per_tp],
+                                        dim=0)
+            q_parts.append(q_r)
+            k_parts.append(k_r)
+            v_parts.append(v_r)
 
-        # 合并 TP 切分的权重
-        # linear_proj: [hidden_size, attention_proj_dim] 沿 dim=1 合并
+        # 合并 TP shards
         o_proj = torch.cat(linear_proj_list, dim=1)
-
-        # linear_qkv: [qkv_proj_rows, hidden_size] 沿 dim=0 合并
-        qkv_weight = torch.cat(qkv_list, dim=0)
-
-        # 拆分 QKV
-        # Q: [0 : q_proj_rows]
-        # K: [q_proj_rows : q_proj_rows + k_proj_rows]
-        # V: [q_proj_rows + k_proj_rows : qkv_proj_rows]
-        q_proj = qkv_weight[:self.q_proj_rows, :]
-        k_proj = qkv_weight[self.q_proj_rows:self.q_proj_rows +
-                            self.k_proj_rows, :]
-        v_proj = qkv_weight[self.q_proj_rows + self.k_proj_rows:, :]
+        q_proj = torch.cat(q_parts, dim=0)
+        k_proj = torch.cat(k_parts, dim=0)
+        v_proj = torch.cat(v_parts, dim=0)
 
         # QK LayerNorm (可选)
         q_norm_key = f"{prefix}.self_attention.q_layernorm.weight"
@@ -688,7 +703,8 @@ class MgCkptConvert(object):
             hf_local_down_key = 'model.layers.{}.mlp.experts.{}.down_proj.weight'
 
             if self.moe_tp_extend_ep:
-                local_expert_nums = self.num_experts // (self.tp_size * self.ep_size)
+                local_expert_nums = self.num_experts // (self.tp_size *
+                                                         self.ep_size)
             else:
                 local_expert_nums = self.num_experts // self.ep_size
 
@@ -739,28 +755,18 @@ class MgCkptConvert(object):
                                     hf_layer_idx,
                                     expert_idx)] = down.contiguous().clone()
                     else:
-                        # cat tp data [local_nums, hidden_size, intermediate_size*2]
-                        ep_weight1 = torch.cat(ep_weight1_list, dim=2)
-                        ep_weight2 = torch.cat(ep_weight2_list, dim=1)
+                        # moe_tp_extend_ep=False: 所有 TP rank 持有相同的专家权重
+                        # 只需使用 tp_rank=0 的数据即可
+                        ep_weight1 = ep_weight1_list[0]
+                        ep_weight2 = ep_weight2_list[0]
 
                         for local_idx in range(local_expert_nums):
                             expert_idx = ep_rank * local_expert_nums + local_idx
-                            gate_list, up_list = [], []
-                            ep_weight1_expert = ep_weight1[local_idx].t()
-                            cur_w1_list = torch.chunk(ep_weight1_expert,
-                                                      self.tp_size,
-                                                      dim=0)
-                            for weight1_tp in cur_w1_list:
-                                cur_gate, cur_up = torch.chunk(weight1_tp,
-                                                               2,
-                                                               dim=0)
-                                gate_list.append(
-                                    cur_gate.reshape(-1, self.hidden_size))
-                                up_list.append(
-                                    cur_up.reshape(-1, self.hidden_size))
-
-                            local_gate = torch.cat(gate_list, dim=0)
-                            local_up = torch.cat(up_list, dim=0)
+                            ep_weight1_expert = ep_weight1[local_idx].reshape(
+                                self.hidden_size, -1).t()
+                            gate, up = torch.chunk(ep_weight1_expert, 2, dim=0)
+                            local_gate = gate.reshape(-1, self.hidden_size)
+                            local_up = up.reshape(-1, self.hidden_size)
                             local_down = ep_weight2[local_idx].t()
 
                             hf_dict[hf_local_gate_key.format(
@@ -779,25 +785,32 @@ class MgCkptConvert(object):
                 if self.moe_tp_extend_ep:
                     for ep_rank in self.ep_rank_list:
                         for tp_rank in self.tp_rank_list:
-                            global_expert_base = (ep_rank * self.tp_size + tp_rank) * local_expert_nums
+                            global_expert_base = (ep_rank * self.tp_size +
+                                                  tp_rank) * local_expert_nums
                             for local_idx in range(local_expert_nums):
                                 expert_idx = global_expert_base + local_idx
                                 local_fc1_key = f"{local_prefix}.{local_idx}.linear_fc1.weight"
                                 local_fc2_key = f"{local_prefix}.{local_idx}.linear_fc2.weight"
 
-                                cur_fc1 = mg_models[(tp_rank, ep_rank)].pop(local_fc1_key)
-                                cur_gate, cur_up = torch.chunk(cur_fc1, 2, dim=0)
-                                cur_down = mg_models[(tp_rank, ep_rank)].pop(local_fc2_key)
+                                cur_fc1 = mg_models[(
+                                    tp_rank, ep_rank)].pop(local_fc1_key)
+                                cur_gate, cur_up = torch.chunk(cur_fc1,
+                                                               2,
+                                                               dim=0)
+                                cur_down = mg_models[(
+                                    tp_rank, ep_rank)].pop(local_fc2_key)
 
                                 hf_dict[hf_local_gate_key.format(
                                     hf_layer_idx,
-                                    expert_idx)] = cur_gate.contiguous().clone()
+                                    expert_idx)] = cur_gate.contiguous().clone(
+                                    )
                                 hf_dict[hf_local_up_key.format(
                                     hf_layer_idx,
                                     expert_idx)] = cur_up.contiguous().clone()
                                 hf_dict[hf_local_down_key.format(
                                     hf_layer_idx,
-                                    expert_idx)] = cur_down.contiguous().clone()
+                                    expert_idx)] = cur_down.contiguous().clone(
+                                    )
                 else:
                     for ep_rank in self.ep_rank_list:
                         for local_idx in range(local_expert_nums):
@@ -805,10 +818,23 @@ class MgCkptConvert(object):
                             local_fc1_key = f"{local_prefix}.{local_idx}.linear_fc1.weight"
                             local_fc2_key = f"{local_prefix}.{local_idx}.linear_fc2.weight"
 
-                            local_gate, local_up = self.linear_fc1_gather_from_tp(
-                                mg_models, local_fc1_key, ep_rank=ep_rank)
-                            local_down = self.linear_fc2_gather_from_tp(
-                                mg_models, local_fc2_key, ep_rank=ep_rank)
+                            # moe_tp_extend_ep=False: 所有 TP rank 持有相同专家权重
+                            # 直接使用 tp_rank=0 的数据
+                            cur_fc1 = mg_models[(self.tp_rank_list[0],
+                                                 ep_rank)].pop(local_fc1_key)
+                            cur_fc2 = mg_models[(self.tp_rank_list[0],
+                                                 ep_rank)].pop(local_fc2_key)
+                            local_gate, local_up = torch.chunk(cur_fc1,
+                                                               2,
+                                                               dim=0)
+                            local_down = cur_fc2
+
+                            # 释放其他 TP rank 的重复数据
+                            for tp_rank in self.tp_rank_list[1:]:
+                                mg_models[(tp_rank,
+                                           ep_rank)].pop(local_fc1_key, None)
+                                mg_models[(tp_rank,
+                                           ep_rank)].pop(local_fc2_key, None)
 
                             hf_dict[hf_local_gate_key.format(
                                 hf_layer_idx,
@@ -1029,9 +1055,10 @@ def get_args():
                         type=int,
                         default=VOCAB_SIZE,
                         help='Vocabulary size.')
-    parser.add_argument('--qk-layernorm',
-                        action='store_true',
-                        help='Enable QK LayerNorm (must match training config)')
+    parser.add_argument(
+        '--qk-layernorm',
+        action='store_true',
+        help='Enable QK LayerNorm (must match training config)')
     parser.add_argument('--rotary-base',
                         type=float,
                         default=50000.0,
