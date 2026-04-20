@@ -92,7 +92,6 @@ class MgCkptConvert(object):
         moe_ffn_hidden_size: int = MOE_FFN_HIDDEN_SIZE,
         vocab_size: int = VOCAB_SIZE,
         qk_layernorm: bool = False,
-        rotary_base: float = 50000.0,
     ):
         self.tp_size = tp_size
         self.pp_size = pp_size
@@ -125,7 +124,6 @@ class MgCkptConvert(object):
         self.moe_ffn_hidden_size = moe_ffn_hidden_size
         self.vocab_size = vocab_size
         self.qk_layernorm = qk_layernorm
-        self.rotary_base = rotary_base
 
         # GQA 维度计算
         self.q_head_dim = kv_channels
@@ -179,19 +177,8 @@ class MgCkptConvert(object):
 
         self._valid_parameter()
 
-        # Pre-compute inv_freq for RoPE (written per layer for verification)
-        self._reset_inv_freq()
-
         self._tensor_size = 0
         self._hf_weight_dict = {}
-
-    def _reset_inv_freq(self):
-        inv_dim = self.kv_channels
-        if inv_dim <= 0:
-            self.inv_freq = torch.empty((0,), dtype=torch.float32)
-            return
-        self.inv_freq = 1.0 / (self.rotary_base ** (
-            torch.arange(0, inv_dim, 2, dtype=torch.float32) / inv_dim))
 
     def _valid_parameter(self):
         if self.num_layer_list_cmd is None:
@@ -623,11 +610,6 @@ class MgCkptConvert(object):
                 f"model.layers.{hf_layer_idx}.self_attn.k_layernorm.weight"] = k_ln.clone(
                 )
 
-        # Write inv_freq for verification compatibility (HF model
-        # recomputes it at load time, but it helps verify roundtrip)
-        hf_dict[
-            f"model.layers.{hf_layer_idx}.self_attn.rotary_emb.inv_freq"
-        ] = self.inv_freq.clone()
 
     def linear_fc1_gather_from_tp(self, mg_models, fc1_key, ep_rank=0):
         """cat linear fc1 (gate and up)"""
@@ -1107,7 +1089,7 @@ def get_args():
                         help='Number of layers per virtual pipeline stage')
     parser.add_argument('--moe-grouped-gemm',
                         action='store_true',
-                        default=True,
+                        default=False,
                         help='Use moe grouped gemm.')
     parser.add_argument('--noop-layers',
                         type=str,
@@ -1180,10 +1162,6 @@ def get_args():
         '--qk-layernorm',
         action='store_true',
         help='Enable QK LayerNorm (must match training config)')
-    parser.add_argument('--rotary-base',
-                        type=float,
-                        default=50000.0,
-                        help='Rotary base for RoPE')
 
     args = parser.parse_args()
     return args
@@ -1217,7 +1195,6 @@ def main():
         moe_ffn_hidden_size=args.moe_ffn_hidden_size,
         vocab_size=args.vocab_size,
         qk_layernorm=args.qk_layernorm,
-        rotary_base=args.rotary_base,
     )
     converter.run()
 
