@@ -446,11 +446,12 @@ class MoeParallelStrategy(ParallelStrategy):
         if '.local_experts.' in name:
             return None
 
-        # Shared experts 参与 TP 切分 (row-wise, 切分输出维度)
+        # Shared experts 参与 TP 切分
+        # fc1: row-wise (切分输出维度), fc2: column-wise (切分输入维度)
         if self.PATTERNS['shared_experts_fc1'].search(name):
             return 0
         if self.PATTERNS['shared_experts_fc2'].search(name):
-            return 1
+            return None if name.endswith('.bias') else 1
 
         # Row-wise (dim=0): 输出维度被切分
         # embedding: [vocab_size, hidden_size] -> 切分 vocab_size (dim=0)
@@ -462,13 +463,16 @@ class MoeParallelStrategy(ParallelStrategy):
         if 'mlp.linear_fc1' in name and 'shared_experts' not in name:
             return 0
 
-        # Column-wise (dim=1): 输入维度被切分
+        # Column-wise (dim=1): 输入维度被切分 (仅限 weight，bias 不切分)
         # linear_proj: [hidden_size, attention_proj_dim] -> 切分 attention_proj_dim (dim=1)
         # linear_fc2: [hidden_size, ffn_hidden_size] -> 切分 ffn_hidden_size (dim=1)
+        # 注意: column-parallel 的 bias 是 [output_dim]，不受 TP 切分
         if self.PATTERNS['proj'].search(name):
-            return 1
+            return None if name.endswith('.bias') else 1
         if 'mlp.linear_fc2' in name and 'shared_experts' not in name:
-            return 1
+            return None if name.endswith('.bias') else 1
+        if self.PATTERNS['shared_experts_fc2'].search(name):
+            return None if name.endswith('.bias') else 1
 
         # 不切分
         if self.PATTERNS['layernorm'].search(name):
@@ -515,6 +519,8 @@ class MoeParallelStrategy(ParallelStrategy):
         # Attention projection
         if 'self_attention.linear_proj.weight' in name:
             return (h, config.attention_proj_dim)
+        if 'self_attention.linear_proj.bias' in name:
+            return (h, )
 
         # Dense MLP (first_k_dense_replace layers)
         # 注意: linear_fc1 在 SwiGLU 下是 gate_proj + up_proj 的拼接，dim=0 是 2*ffn_hidden_size
@@ -522,6 +528,11 @@ class MoeParallelStrategy(ParallelStrategy):
             return (config.ffn_hidden_size * 2, h)
         if self.PATTERNS['dense_mlp_fc2'].search(name):
             return (h, config.ffn_hidden_size)
+        # Dense MLP bias
+        if '.mlp.linear_fc1.bias' in name and 'shared_experts' not in name:
+            return (config.ffn_hidden_size * 2, )
+        if '.mlp.linear_fc2.bias' in name and 'shared_experts' not in name:
+            return (h, )
 
         # Shared experts
         # 注意: shared_experts 的 linear_fc1 同样在 SwiGLU 下是 2*moe_ffn_hidden_size
@@ -531,6 +542,12 @@ class MoeParallelStrategy(ParallelStrategy):
         if self.PATTERNS['shared_experts_fc2'].search(
                 name) and '.weight' in name:
             return (h, config.moe_ffn_hidden_size)
+        if self.PATTERNS['shared_experts_fc1'].search(
+                name) and '.bias' in name:
+            return (config.moe_ffn_hidden_size * 2, )
+        if self.PATTERNS['shared_experts_fc2'].search(
+                name) and '.bias' in name:
+            return (h, )
 
         # Router
         if 'router.bias' in name:
@@ -583,6 +600,11 @@ class ShapeMerger:
             return tp_shapes[0]
 
         base_shape = list(tp_shapes[0])
+        if parallel_dim >= len(base_shape):
+            logger.warning(
+                'TP merge: parallel_dim=%d 超出 shape 维度 %s (name=%s), 跳过合并',
+                parallel_dim, base_shape, name)
+            return tp_shapes[0]
         base_shape[parallel_dim] = sum(s[parallel_dim] for s in tp_shapes)
 
         if debug:

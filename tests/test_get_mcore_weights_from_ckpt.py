@@ -649,6 +649,13 @@ class TestGetMCoreWeightsFromCkpt(unittest.TestCase):
             ('mlp.experts.weight2', None),
             ('mlp.router.weight', None),
             ('input_layernorm.weight', None),
+            # Bias: row-parallel bias IS sharded (dim=0), column-parallel bias is NOT
+            ('self_attention.linear_qkv.bias', 0),
+            ('mlp.linear_fc1.bias', 0),
+            ('mlp.shared_experts.linear_fc1.bias', 0),
+            ('self_attention.linear_proj.bias', None),
+            ('mlp.linear_fc2.bias', None),
+            ('mlp.shared_experts.linear_fc2.bias', None),
         ]
         for name, expected_dim in cases:
             with self.subTest(name=name):
@@ -695,7 +702,58 @@ class TestGetMCoreWeightsFromCkpt(unittest.TestCase):
                 self.assertEqual(strategy.get_expected_shape(name, config),
                                  expected_shape)
 
-    def test_tp_shape_merging(self):
+    def test_expected_shape_bias(self):
+        """测试 bias 张量的期望 Shape"""
+        strategy = MoeParallelStrategy()
+        config = ModelConfig(
+            num_layers=32,
+            num_experts=128,
+            num_attention_heads=64,
+            num_query_groups=2,
+            hidden_size=7168,
+            kv_channels=128,
+            ffn_hidden_size=18432,
+            moe_ffn_hidden_size=12288,
+            vocab_size=163840,
+        )
+        cases = [
+            # Row-parallel bias (dim=0 sharded): shape is 1D output dim
+            ('layers.0.self_attention.linear_qkv.bias', (config.qkv_dim, )),
+            ('layers.0.mlp.linear_fc1.bias', (config.ffn_hidden_size * 2, )),
+            # Column-parallel bias (NOT sharded): shape is 1D output dim
+            ('layers.0.mlp.linear_fc2.bias', (7168, )),
+            ('layers.0.self_attention.linear_proj.bias', (7168, )),
+            # Shared experts bias
+            ('layers.2.mlp.shared_experts.linear_fc1.bias',
+             (config.moe_ffn_hidden_size * 2, )),
+            ('layers.2.mlp.shared_experts.linear_fc2.bias', (7168, )),
+        ]
+        for name, expected_shape in cases:
+            with self.subTest(name=name):
+                self.assertEqual(strategy.get_expected_shape(name, config),
+                                 expected_shape)
+
+    def test_tp_merge_safety_for_bias(self):
+        """测试 TP 合并时 1D bias 不会导致 IndexError"""
+        strategy = MoeParallelStrategy()
+        merger = ShapeMerger(strategy)
+
+        # Row-parallel bias (dim=0): 正常合并
+        merged = merger.merge_tp_shapes(
+            'self_attention.linear_qkv.bias',
+            [(4352, ), (4352, )])
+        self.assertEqual(merged, (8704, ))
+
+        # Column-parallel bias (dim=None): 不合并，保持原样
+        merged = merger.merge_tp_shapes(
+            'self_attention.linear_proj.bias',
+            [(7168, ), (7168, )])
+        self.assertEqual(merged, (7168, ))
+
+        # Dense MLP fc2 bias: 不合并
+        merged = merger.merge_tp_shapes(
+            'mlp.linear_fc2.bias', [(7168, ), (7168, )])
+        self.assertEqual(merged, (7168, ))
         """测试 TP 维度合并"""
         strategy = MoeParallelStrategy()
         merger = ShapeMerger(strategy)
