@@ -311,12 +311,25 @@ class CkptConvert(object):
     def get_layer_files_map(self):
         """layer -> safetensors file map"""
         layer_map_dict = defaultdict(set)
-        weights_map_file_path = os.path.join(self.hf_model_path,
-                                             'model.safetensors.index.json')
 
-        with open(weights_map_file_path) as f:
-            weights_map = json.load(f)
-        weights_map = weights_map['weight_map']
+        # Try index.json first, then fall back to single safetensors file
+        index_path = os.path.join(self.hf_model_path,
+                                  'model.safetensors.index.json')
+        single_path = os.path.join(self.hf_model_path, 'model.safetensors')
+
+        if os.path.isfile(index_path):
+            with open(index_path) as f:
+                weights_map = json.load(f)
+            weights_map = weights_map['weight_map']
+        elif os.path.isfile(single_path):
+            # Single safetensors file: all keys map to the same file
+            import safetensors
+            with safetensors.safe_open(single_path, framework='pt',
+                                       device='cpu') as f:
+                weights_map = {k: 'model.safetensors' for k in f.keys()}
+        else:
+            raise FileNotFoundError(
+                f'找不到 HF safetensors index 或单文件: {self.hf_model_path}')
 
         for key, value in weights_map.items():
             if key.startswith('model.layers.'):
