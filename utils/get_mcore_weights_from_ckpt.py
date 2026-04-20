@@ -550,9 +550,10 @@ class MoeParallelStrategy(ParallelStrategy):
         if '.experts.weight2' in name:
             return (config.num_experts * config.moe_ffn_hidden_size, h)
         # Local experts 格式 (非 grouped_gemm)
-        if '.local_experts.' in name and '.fc1' in name:
-            return (config.moe_ffn_hidden_size, h)
-        if '.local_experts.' in name and '.fc2' in name:
+        # 注意: SwiGLU 下 fc1 同样是 gate+up 拼接，dim=0 为 2*moe_ffn_hidden_size
+        if '.local_experts.' in name and 'linear_fc1' in name:
+            return (config.moe_ffn_hidden_size * 2, h)
+        if '.local_experts.' in name and 'linear_fc2' in name:
             return (h, config.moe_ffn_hidden_size)
 
         return None
@@ -804,22 +805,24 @@ class CheckpointLoader:
 
     def _build_candidates(self, tp_rank: int, pp_rank: int,
                           ep_rank: Optional[int]) -> List[str]:
-        """构建候选路径列表"""
+        """构建候选路径列表（自动去重，保持优先级）"""
         tp, pp, ep = self.parallel.tp_size, self.parallel.pp_size, self.parallel.ep_size
 
         if ep_rank is not None:
-            return [
+            raw = [
                 _mp_prefix(tp_rank, pp_rank, ep_rank, tp, pp, ep),
                 f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_rank:03}',
                 f'mp_rank_{tp_rank:02}_{ep_rank:03}_{pp_rank:03}',
                 f'mp_rank_{tp_rank:02}_{ep_rank:03}',
             ]
         else:
-            return [
+            raw = [
                 _mp_prefix(tp_rank, pp_rank, 0, tp, pp, ep),
                 f'mp_rank_{tp_rank:02}_{pp_rank:03}',
                 f'mp_rank_{tp_rank:02}',
             ]
+        # 去重但保持顺序
+        return list(dict.fromkeys(raw))
 
     def load(self,
              tp_rank: int,

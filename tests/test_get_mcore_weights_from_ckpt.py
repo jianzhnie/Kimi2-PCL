@@ -685,6 +685,10 @@ class TestGetMCoreWeightsFromCkpt(unittest.TestCase):
             ('layers.0.mlp.shared_experts.linear_fc2.weight', (7168, 12288)),
             ('layers.0.mlp.experts.weight1', (7168, 128 * 12288 * 2)),
             ('layers.0.mlp.experts.weight2', (128 * 12288, 7168)),
+            # Local experts: SwiGLU 下 fc1 同样为 gate+up 拼接，dim0 = 2*moe_ffn_hidden_size
+            ('layers.0.mlp.local_experts.0.linear_fc1.weight',
+             (12288 * 2, 7168)),
+            ('layers.0.mlp.local_experts.0.linear_fc2.weight', (7168, 12288)),
         ]
         for name, expected_shape in cases:
             with self.subTest(name=name):
@@ -1322,7 +1326,8 @@ class TestGetMCoreWeightsFromCkpt(unittest.TestCase):
         merger = ShapeMerger(strategy)
 
         # local_experts 格式: 每个 EP rank 存储不同专家，单个权重形状不变
-        local_shape_fc1 = (12288, 7168)
+        # SwiGLU: fc1 dim0 = 2 * moe_ffn_hidden_size
+        local_shape_fc1 = (12288 * 2, 7168)
         local_shape_fc2 = (7168, 12288)
         ep_shapes_fc1 = [local_shape_fc1] * 8
         ep_shapes_fc2 = [local_shape_fc2] * 8
