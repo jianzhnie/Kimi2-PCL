@@ -49,10 +49,6 @@ MOE_FFN_HIDDEN_SIZE = 12288
 VOCAB_SIZE = 163840
 NUM_LAYERS = 32
 
-TENSOR_SIZE = 0
-hf_weight_dict = defaultdict()
-
-
 def load_data(file_path):
     logger.info(f"Loading the checkpoint from {file_path}.")
     return torch.load(file_path, map_location='cpu', weights_only=False)
@@ -179,6 +175,9 @@ class MgCkptConvert(object):
 
         self._valid_parameter()
 
+        self._tensor_size = 0
+        self._hf_weight_dict = {}
+
     def _valid_parameter(self):
         if self.num_layer_list_cmd is None:
             if self.num_layers % self.pp_size != 0:
@@ -253,8 +252,6 @@ class MgCkptConvert(object):
                 raise FileNotFoundError(f"can not find {latest_iter_file}")
 
         directory = os.path.join(ckpt_path, f'iter_{iteration:07d}')
-
-        os.makedirs(directory, exist_ok=True)
 
         return directory
 
@@ -915,9 +912,24 @@ class MgCkptConvert(object):
                                                ep_rank)].pop(
                                                    local_fc2_key, None)
 
-                            local_gate, local_up = torch.chunk(cur_fc1,
-                                                               2,
-                                                               dim=0)
+                            if self.expert_tp_size > 1:
+                                # gate/up are interleaved per expert_tp
+                                # shard; de-interleave them.
+                                chunks = torch.chunk(
+                                    cur_fc1, self.expert_tp_size,
+                                    dim=0)
+                                gate_list, up_list = [], []
+                                for chunk in chunks:
+                                    g, u = torch.chunk(chunk, 2,
+                                                       dim=0)
+                                    gate_list.append(g)
+                                    up_list.append(u)
+                                local_gate = torch.cat(gate_list,
+                                                       dim=0)
+                                local_up = torch.cat(up_list, dim=0)
+                            else:
+                                local_gate, local_up = torch.chunk(
+                                    cur_fc1, 2, dim=0)
                             local_down = cur_fc2
 
                             hf_dict[hf_local_gate_key.format(
@@ -932,13 +944,12 @@ class MgCkptConvert(object):
 
     def save_safetensors(self, hf_dict, cur_file_idx):
         """save safetensors file"""
-        global TENSOR_SIZE
         num_files = self.num_real_layers
 
         safetensors_file_name = f"model-{cur_file_idx:05d}-of-{num_files:06d}.safetensors"
         for key in hf_dict.keys():
             self.model_index[key] = safetensors_file_name
-            TENSOR_SIZE += tensor_memory_size(hf_dict[key])
+            self._tensor_size += tensor_memory_size(hf_dict[key])
 
         logger.info(f"Saving to {safetensors_file_name}")
         safetensors.torch.save_file(hf_dict,
@@ -949,49 +960,47 @@ class MgCkptConvert(object):
     def read_pp_rank_weights(self, pp_rank, mg_models):
         """get pp_rank weights"""
         layer_list = self.pprank_layer_idxs[pp_rank]
-        global hf_weight_dict
 
         for _, layer in enumerate(layer_list):
             logger.info(f"Converting the weights of layer {layer}")
 
             if pp_rank == 0 and layer == 0:
-                self.set_model_preprocess(hf_weight_dict, mg_models)
+                self.set_model_preprocess(self._hf_weight_dict, mg_models)
             local_idx = self.layeridx_pprank[layer][1]
 
-            self.set_model_layer_norm(hf_weight_dict, mg_models, layer,
+            self.set_model_layer_norm(self._hf_weight_dict, mg_models, layer,
                                       local_idx)
-            self.set_model_attn(hf_weight_dict, mg_models, layer, local_idx)
-            self.set_model_mlp(hf_weight_dict, mg_models, layer, local_idx)
+            self.set_model_attn(self._hf_weight_dict, mg_models, layer, local_idx)
+            self.set_model_mlp(self._hf_weight_dict, mg_models, layer, local_idx)
 
             if layer != self.last_save_hf_layer:
-                self.save_safetensors(hf_weight_dict, layer + 1)
-                hf_weight_dict = defaultdict()
+                self.save_safetensors(self._hf_weight_dict, layer + 1)
+                self._hf_weight_dict = {}
 
         if pp_rank == self.pp_size - 1:
-            self.set_model_postprocess(hf_weight_dict, mg_models)
-            self.save_safetensors(hf_weight_dict, self.last_save_hf_layer + 1)
-            hf_weight_dict = defaultdict()
+            self.set_model_postprocess(self._hf_weight_dict, mg_models)
+            self.save_safetensors(self._hf_weight_dict, self.last_save_hf_layer + 1)
+            self._hf_weight_dict = {}
 
     def read_vpp_rank_weights(self, pp_rank, vpp_rank, mg_models):
         """get vpp_rank weights"""
         layer_list = self.vpprank_layer_idxs[pp_rank][vpp_rank]
-        global hf_weight_dict
 
         for _, layer in enumerate(layer_list):
             logger.info(f"Converting the weights of layer {layer}")
 
             if pp_rank == 0 and vpp_rank == 0 and layer == 0:
-                self.set_model_preprocess(hf_weight_dict, mg_models)
+                self.set_model_preprocess(self._hf_weight_dict, mg_models)
             local_idx = self.layeridx_vpprank[layer][2]
 
-            self.set_model_layer_norm(hf_weight_dict, mg_models, layer,
+            self.set_model_layer_norm(self._hf_weight_dict, mg_models, layer,
                                       local_idx)
-            self.set_model_attn(hf_weight_dict, mg_models, layer, local_idx)
-            self.set_model_mlp(hf_weight_dict, mg_models, layer, local_idx)
+            self.set_model_attn(self._hf_weight_dict, mg_models, layer, local_idx)
+            self.set_model_mlp(self._hf_weight_dict, mg_models, layer, local_idx)
 
             if layer != self.last_save_hf_layer:
-                self.save_safetensors(hf_weight_dict, layer + 1)
-                hf_weight_dict = defaultdict()
+                self.save_safetensors(self._hf_weight_dict, layer + 1)
+                self._hf_weight_dict = {}
 
         # dualpipe: post weight(norm+lm_head) in pp0vpp-1
         dualpipe_flag = self.dualpipe and pp_rank == 0 and vpp_rank == self.vpp_size - 1
@@ -999,9 +1008,9 @@ class MgCkptConvert(object):
         norm_flag = not self.dualpipe and pp_rank == self.pp_size - 1 and vpp_rank == self.vpp_size - 1
 
         if dualpipe_flag or norm_flag:
-            self.set_model_postprocess(hf_weight_dict, mg_models)
-            self.save_safetensors(hf_weight_dict, self.last_save_hf_layer + 1)
-            hf_weight_dict = defaultdict()
+            self.set_model_postprocess(self._hf_weight_dict, mg_models)
+            self.save_safetensors(self._hf_weight_dict, self.last_save_hf_layer + 1)
+            self._hf_weight_dict = {}
 
     def run(self):
         for pp_rank in self.pp_rank_list:
@@ -1036,7 +1045,7 @@ class MgCkptConvert(object):
             json.dump(
                 {
                     'metadata': {
-                        'total_size': TENSOR_SIZE
+                        'total_size': self._tensor_size
                     },
                     'weight_map': self.model_index
                 },

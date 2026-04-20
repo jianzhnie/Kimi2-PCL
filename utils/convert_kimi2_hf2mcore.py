@@ -296,6 +296,10 @@ class CkptConvert(object):
         ns.fp16 = False
         ns.params_dtype = torch.bfloat16
         ns.rotary_base = 50000.0
+        if hasattr(self, '_target_dtype') and self._target_dtype is not None:
+            ns.bf16 = (self._target_dtype == torch.bfloat16)
+            ns.fp16 = (self._target_dtype == torch.float16)
+            ns.params_dtype = self._target_dtype
         ns.use_rotary_position_embeddings = True
         ns.qk_layernorm = self.qk_layernorm
         if self.dualpipe:
