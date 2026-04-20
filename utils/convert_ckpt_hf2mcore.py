@@ -1220,40 +1220,40 @@ class CkptConvert:
                 raise ValueError(
                     f'moe grouped gemm hidden_size 不匹配: hidden_size={self.hidden_size} gemm_fc1={tuple(gemm_fc1.shape)} gemm_fc2={tuple(gemm_fc2.shape)}'
                 )
-            experts_per_ep = self.num_experts // self.ep_size
-            if self.expert_tp_size > 1:
-                if experts_per_ep % self.expert_tp_size != 0:
-                    raise ValueError(
-                        f'experts_per_ep ({experts_per_ep}) must be divisible by '
-                        f'expert_tp_size ({self.expert_tp_size})')
             gemm_fc1_ep = torch.chunk(gemm_fc1, self.ep_size, dim=0)
             gemm_fc2_ep = torch.chunk(gemm_fc2, self.ep_size, dim=0)
             for ep_rank in range(self.ep_size):
                 if self.expert_tp_size > 1:
-                    num_tp_shards = self.tp_size // self.expert_tp_size
-                    fc1_tp = torch.chunk(gemm_fc1_ep[ep_rank],
-                                         num_tp_shards,
-                                         dim=0)
-                    fc2_tp = torch.chunk(gemm_fc2_ep[ep_rank],
-                                         num_tp_shards,
-                                         dim=0)
+                    # Weight-sharding: split each expert's intermediate
+                    # dimension across expert_tp_size TP ranks (not
+                    # expert-subsampling).  Each TP rank gets ALL experts
+                    # but with a shard of the intermediate dim.
+                    fc1_shards = torch.chunk(gemm_fc1_ep[ep_rank],
+                                             self.expert_tp_size,
+                                             dim=2)
+                    fc2_shards = torch.chunk(gemm_fc2_ep[ep_rank],
+                                             self.expert_tp_size,
+                                             dim=1)
                 else:
                     # expert_tp=1: 专家权重不做 TP 切分，所有 TP rank 获得相同权重
-                    fc1_tp = [gemm_fc1_ep[ep_rank]]
-                    fc2_tp = [gemm_fc2_ep[ep_rank]]
+                    fc1_shards = [gemm_fc1_ep[ep_rank]]
+                    fc2_shards = [gemm_fc2_ep[ep_rank]]
                 for tp_rank in range(self.tp_size):
-                    expert_tp_idx = tp_rank * self.expert_tp_size // self.tp_size
-                    # NOTE: reshape on a contiguous chunk returns a VIEW
-                    # of the full (all-experts) storage.  torch.save
-                    # serializes the entire underlying Storage, not just
-                    # the viewed portion, causing ~EP× disk bloat.
-                    # .clone() creates an independent tensor with its own
-                    # Storage containing only the needed expert subset.
-                    w1 = fc1_tp[expert_tp_idx].permute(1, 0,
-                                                       2).contiguous().reshape(
-                                                           self.hidden_size,
-                                                           -1).clone()
-                    w2 = fc2_tp[expert_tp_idx].reshape(
+                    expert_tp_idx = tp_rank % self.expert_tp_size
+                    # Use expert-first layout: [num_local, hidden_size,
+                    # intermediate*2] -> [hidden_size, -1].  This matches
+                    # MCore's grouped_gemm convention where weight1 is
+                    # viewed as [num_local_experts, hidden_size,
+                    # intermediate*2].
+                    # NOTE: reshape may return a VIEW of the full
+                    # (all-experts) storage.  torch.save serializes the
+                    # entire underlying Storage, not just the viewed
+                    # portion, causing ~EP× disk bloat.  .clone()
+                    # creates an independent tensor with its own Storage
+                    # containing only the needed expert subset.
+                    shard = fc1_shards[expert_tp_idx]
+                    w1 = shard.reshape(self.hidden_size, -1).clone()
+                    w2 = fc2_shards[expert_tp_idx].reshape(
                         -1, self.hidden_size).clone()
                     mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
                     mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
@@ -1288,8 +1288,7 @@ class CkptConvert:
                     local_fc1_shards = [local_fc1.contiguous().clone()]
                     local_fc2_shards = [local_fc2.contiguous().clone()]
                 for tp_rank in range(self.tp_size):
-                    expert_tp_idx = (tp_rank * self.expert_tp_size //
-                                     self.tp_size)
+                    expert_tp_idx = tp_rank % self.expert_tp_size
                     mg_model[ep_rank][tp_rank][
                         f'{local_prefix}.linear_fc1.weight'] = local_fc1_shards[
                             expert_tp_idx]

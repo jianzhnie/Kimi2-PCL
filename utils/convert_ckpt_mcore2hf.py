@@ -977,11 +977,10 @@ class MgCkptConvert:
             w1_key = f'{prefix}.experts.weight1'
             w2_key = f'{prefix}.experts.weight2'
             num_local = self.num_experts // self.ep_size
-            # With expert_tp_size < tp_size, each EP rank's expert weights
-            # are replicated across TP ranks (not sharded).  We only need
-            # one representative TP owner per EP rank.
-            num_expert_tp_owners = max(
-                1, self.tp_size // self.expert_tp_size)
+            # expert_tp_size controls how many TP ranks hold unique shards
+            # of the expert weight.  expert_tp_size=1 → replicated (need 1
+            # owner); expert_tp_size=tp_size → fully sharded (need all).
+            num_expert_tp_owners = max(1, self.expert_tp_size)
             for ep_rank in range(self.ep_size):
                 owners = self._tp_ranks_for_ep(pp_rank, ep_rank)
                 if not owners:
@@ -1008,13 +1007,30 @@ class MgCkptConvert:
                     shards_w1, dim=1)
                 local_w2 = shards_w2[0] if len(shards_w2) == 1 else torch.cat(
                     shards_w2, dim=0)
-                w1_3d = local_w1.view(self.hidden_size, num_local,
-                                      -1).permute(1, 0, 2).contiguous()
+                # Expert-first layout: weight1 is stored as
+                # [hidden_size, num_local * intermediate*2], where each
+                # expert's rows are contiguous.  Reshape directly to
+                # [num_local, hidden_size, intermediate*2].
+                w1_3d = local_w1.reshape(num_local, self.hidden_size,
+                                         -1).contiguous()
                 w2_3d = local_w2.view(num_local, -1, self.hidden_size)
                 for li in range(num_local):
                     expert = ep_rank * num_local + li
                     fc1 = w1_3d[li].t()
-                    gate, up = torch.chunk(fc1, 2, dim=0)
+                    if self.expert_tp_size > 1 and len(shards_w1) > 1:
+                        # gate/up are interleaved per expert_tp shard;
+                        # de-interleave them.
+                        chunks = torch.chunk(fc1, self.expert_tp_size,
+                                             dim=0)
+                        gate_list, up_list = [], []
+                        for chunk in chunks:
+                            g, u = torch.chunk(chunk, 2, dim=0)
+                            gate_list.append(g)
+                            up_list.append(u)
+                        gate = torch.cat(gate_list, dim=0)
+                        up = torch.cat(up_list, dim=0)
+                    else:
+                        gate, up = torch.chunk(fc1, 2, dim=0)
                     down = w2_3d[li].t()
                     hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate
                     hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up
@@ -1026,11 +1042,10 @@ class MgCkptConvert:
                     self._sparse_cache.pop(cache_key, None)
         else:
             num_local = self.num_experts // self.ep_size
-            # With expert_tp_size < tp_size, each EP rank's expert weights
-            # are replicated across TP ranks (not sharded).  We only need
-            # one representative TP owner per EP rank.
-            num_expert_tp_owners = max(
-                1, self.tp_size // self.expert_tp_size)
+            # expert_tp_size controls how many TP ranks hold unique shards
+            # of the expert weight.  expert_tp_size=1 → replicated (need 1
+            # owner); expert_tp_size=tp_size → fully sharded (need all).
+            num_expert_tp_owners = max(1, self.expert_tp_size)
             for ep_rank in range(self.ep_size):
                 owners = self._tp_ranks_for_ep(pp_rank, ep_rank)
                 if not owners:
@@ -1065,7 +1080,20 @@ class MgCkptConvert:
                         ]
                         fc1 = torch.cat(fc1_parts, dim=0)
                         fc2 = torch.cat(fc2_parts, dim=1)
-                        gate, up = torch.chunk(fc1, 2, dim=0)
+                        if self.expert_tp_size > 1:
+                            # gate/up are interleaved per expert_tp
+                            # shard; de-interleave them.
+                            chunks = torch.chunk(fc1, self.expert_tp_size,
+                                                 dim=0)
+                            gate_list, up_list = [], []
+                            for chunk in chunks:
+                                g, u = torch.chunk(chunk, 2, dim=0)
+                                gate_list.append(g)
+                                up_list.append(u)
+                            gate = torch.cat(gate_list, dim=0)
+                            up = torch.cat(up_list, dim=0)
+                        else:
+                            gate, up = torch.chunk(fc1, 2, dim=0)
                         hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.gate_proj.weight'] = gate
                         hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.up_proj.weight'] = up
                         hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2
