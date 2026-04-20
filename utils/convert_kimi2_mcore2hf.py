@@ -49,6 +49,7 @@ MOE_FFN_HIDDEN_SIZE = 12288
 VOCAB_SIZE = 163840
 NUM_LAYERS = 32
 
+
 def load_data(file_path):
     logger.info(f"Loading the checkpoint from {file_path}.")
     # Try weights_only=True first for security, fall back to False
@@ -135,13 +136,11 @@ class MgCkptConvert(object):
         self.qkv_proj_rows = self.q_proj_rows + self.k_proj_rows + self.v_proj_rows
 
         self.tp_rank_list = list(range(self.tp_size))
-        if self.moe_tp_extend_ep and self.tp_size > 1:
-            # With moe_tp_extend_ep, EP directories are interleaved across TP ranks.
-            # Each TP rank handles ep_size/tp_size local EP ranks.
-            # Global EP index = tp_rank + ep_rank * tp_size
-            self.ep_rank_list = list(range(self.ep_size // self.tp_size))
-        else:
-            self.ep_rank_list = list(range(self.ep_size))
+        # Always iterate over full ep_size range.
+        # With moe_tp_extend_ep, global_ep = tp_rank + ep_rank * tp_size maps each
+        # (tp_rank, ep_rank) pair to a unique directory, giving ep_size * tp_size
+        # total files — one per expert bucket.
+        self.ep_rank_list = list(range(self.ep_size))
         self.pp_rank_list = list(range(self.pp_size))
 
         if vpp_stage is not None:
@@ -228,15 +227,12 @@ class MgCkptConvert(object):
                 'num_attention_heads should be divisible by tp_size')
 
         if self.num_query_groups % self.tp_size != 0:
-            raise ValueError(
-                'num_query_groups should be divisible by tp_size')
+            raise ValueError('num_query_groups should be divisible by tp_size')
 
         if self.expert_tp_size > self.tp_size:
-            raise ValueError(
-                'expert_tp_size cannot exceed tp_size')
+            raise ValueError('expert_tp_size cannot exceed tp_size')
         if self.tp_size % self.expert_tp_size != 0:
-            raise ValueError(
-                'tp_size must be divisible by expert_tp_size')
+            raise ValueError('tp_size must be divisible by expert_tp_size')
 
     @staticmethod
     def get_iter_path(ckpt_path, iteration=None):
@@ -610,7 +606,6 @@ class MgCkptConvert(object):
                 f"model.layers.{hf_layer_idx}.self_attn.k_layernorm.weight"] = k_ln.clone(
                 )
 
-
     def linear_fc1_gather_from_tp(self, mg_models, fc1_key, ep_rank=0):
         """cat linear fc1 (gate and up)"""
         gate_list, up_list = [], []
@@ -709,7 +704,14 @@ class MgCkptConvert(object):
             hf_local_up_key = 'model.layers.{}.mlp.experts.{}.up_proj.weight'
             hf_local_down_key = 'model.layers.{}.mlp.experts.{}.down_proj.weight'
 
-            local_expert_nums = self.num_experts // self.ep_size
+            if self.moe_tp_extend_ep and self.tp_size > 1:
+                # With moe_tp_extend_ep, experts are split across ep_size * tp_size
+                # buckets.  Each (tp_rank, ep_rank) file holds
+                # num_experts // (ep_size * tp_size) experts.
+                local_expert_nums = self.num_experts // (self.ep_size *
+                                                         self.tp_size)
+            else:
+                local_expert_nums = self.num_experts // self.ep_size
 
             if self.moe_grouped_gemm:
                 for ep_rank in self.ep_rank_list:
@@ -762,14 +764,16 @@ class MgCkptConvert(object):
                         if self.expert_tp_size > 1:
                             # TP ranks 0..expert_tp_size-1 each hold a unique
                             # shard; higher ranks are replicas.
-                            unique_tp_indices = list(
-                                range(self.expert_tp_size))
-                            ep_weight1 = torch.cat(
-                                [ep_weight1_list[i] for i in unique_tp_indices],
-                                dim=2)
-                            ep_weight2 = torch.cat(
-                                [ep_weight2_list[i] for i in unique_tp_indices],
-                                dim=1)
+                            unique_tp_indices = list(range(
+                                self.expert_tp_size))
+                            ep_weight1 = torch.cat([
+                                ep_weight1_list[i] for i in unique_tp_indices
+                            ],
+                                                   dim=2)
+                            ep_weight2 = torch.cat([
+                                ep_weight2_list[i] for i in unique_tp_indices
+                            ],
+                                                   dim=1)
 
                             for local_idx in range(local_expert_nums):
                                 expert_idx = ep_rank * local_expert_nums + local_idx
@@ -791,17 +795,15 @@ class MgCkptConvert(object):
                                 local_down = ep_weight2[local_idx].t()
 
                                 hf_dict[hf_local_gate_key.format(
-                                    hf_layer_idx,
-                                    expert_idx)] = local_gate.contiguous(
-                                    ).clone()
+                                    hf_layer_idx, expert_idx
+                                )] = local_gate.contiguous().clone()
                                 hf_dict[hf_local_up_key.format(
                                     hf_layer_idx,
                                     expert_idx)] = local_up.contiguous().clone(
                                     )
                                 hf_dict[hf_local_down_key.format(
-                                    hf_layer_idx,
-                                    expert_idx)] = local_down.contiguous(
-                                    ).clone()
+                                    hf_layer_idx, expert_idx
+                                )] = local_down.contiguous().clone()
                         else:
                             # expert_tp_size=1: all TP ranks hold identical expert weights
                             ep_weight1 = ep_weight1_list[0]
@@ -809,28 +811,26 @@ class MgCkptConvert(object):
 
                             for local_idx in range(local_expert_nums):
                                 expert_idx = ep_rank * local_expert_nums + local_idx
-                                ep_weight1_expert = ep_weight1[local_idx].reshape(
-                                    self.hidden_size, -1).t()
+                                ep_weight1_expert = ep_weight1[
+                                    local_idx].reshape(self.hidden_size,
+                                                       -1).t()
                                 gate, up = torch.chunk(ep_weight1_expert,
                                                        2,
                                                        dim=0)
-                                local_gate = gate.reshape(-1,
-                                                          self.hidden_size)
+                                local_gate = gate.reshape(-1, self.hidden_size)
                                 local_up = up.reshape(-1, self.hidden_size)
                                 local_down = ep_weight2[local_idx].t()
 
                                 hf_dict[hf_local_gate_key.format(
-                                    hf_layer_idx,
-                                    expert_idx)] = local_gate.contiguous(
-                                    ).clone()
+                                    hf_layer_idx, expert_idx
+                                )] = local_gate.contiguous().clone()
                                 hf_dict[hf_local_up_key.format(
                                     hf_layer_idx,
                                     expert_idx)] = local_up.contiguous().clone(
                                     )
                                 hf_dict[hf_local_down_key.format(
-                                    hf_layer_idx,
-                                    expert_idx)] = local_down.contiguous(
-                                    ).clone()
+                                    hf_layer_idx, expert_idx
+                                )] = local_down.contiguous().clone()
             else:
                 # local_experts 格式
                 local_prefix = f"{prefix}.mlp.experts.local_experts"
@@ -876,13 +876,11 @@ class MgCkptConvert(object):
                                 # unique shard; gather from the first
                                 # expert_tp_size TP ranks.
                                 fc1_parts = [
-                                    mg_models[(tp, ep_rank)].pop(
-                                        local_fc1_key)
+                                    mg_models[(tp, ep_rank)].pop(local_fc1_key)
                                     for tp in range(self.expert_tp_size)
                                 ]
                                 fc2_parts = [
-                                    mg_models[(tp, ep_rank)].pop(
-                                        local_fc2_key)
+                                    mg_models[(tp, ep_rank)].pop(local_fc2_key)
                                     for tp in range(self.expert_tp_size)
                                 ]
                                 cur_fc1 = torch.cat(fc1_parts, dim=0)
@@ -891,12 +889,10 @@ class MgCkptConvert(object):
                                 # Release replica TP ranks
                                 for tp in range(self.expert_tp_size,
                                                 self.tp_size):
-                                    mg_models[(tp,
-                                               ep_rank)].pop(local_fc1_key,
-                                                             None)
-                                    mg_models[(tp,
-                                               ep_rank)].pop(local_fc2_key,
-                                                             None)
+                                    mg_models[(tp, ep_rank)].pop(
+                                        local_fc1_key, None)
+                                    mg_models[(tp, ep_rank)].pop(
+                                        local_fc2_key, None)
                             else:
                                 # expert_tp_size=1: all TP ranks hold
                                 # identical expert weights
@@ -908,31 +904,28 @@ class MgCkptConvert(object):
                                     ep_rank)].pop(local_fc2_key)
 
                                 for tp_rank in self.tp_rank_list[1:]:
-                                    mg_models[(tp_rank,
-                                               ep_rank)].pop(
-                                                   local_fc1_key, None)
-                                    mg_models[(tp_rank,
-                                               ep_rank)].pop(
-                                                   local_fc2_key, None)
+                                    mg_models[(tp_rank, ep_rank)].pop(
+                                        local_fc1_key, None)
+                                    mg_models[(tp_rank, ep_rank)].pop(
+                                        local_fc2_key, None)
 
                             if self.expert_tp_size > 1:
                                 # gate/up are interleaved per expert_tp
                                 # shard; de-interleave them.
-                                chunks = torch.chunk(
-                                    cur_fc1, self.expert_tp_size,
-                                    dim=0)
+                                chunks = torch.chunk(cur_fc1,
+                                                     self.expert_tp_size,
+                                                     dim=0)
                                 gate_list, up_list = [], []
                                 for chunk in chunks:
-                                    g, u = torch.chunk(chunk, 2,
-                                                       dim=0)
+                                    g, u = torch.chunk(chunk, 2, dim=0)
                                     gate_list.append(g)
                                     up_list.append(u)
-                                local_gate = torch.cat(gate_list,
-                                                       dim=0)
+                                local_gate = torch.cat(gate_list, dim=0)
                                 local_up = torch.cat(up_list, dim=0)
                             else:
-                                local_gate, local_up = torch.chunk(
-                                    cur_fc1, 2, dim=0)
+                                local_gate, local_up = torch.chunk(cur_fc1,
+                                                                   2,
+                                                                   dim=0)
                             local_down = cur_fc2
 
                             hf_dict[hf_local_gate_key.format(
@@ -973,8 +966,10 @@ class MgCkptConvert(object):
 
             self.set_model_layer_norm(self._hf_weight_dict, mg_models, layer,
                                       local_idx)
-            self.set_model_attn(self._hf_weight_dict, mg_models, layer, local_idx)
-            self.set_model_mlp(self._hf_weight_dict, mg_models, layer, local_idx)
+            self.set_model_attn(self._hf_weight_dict, mg_models, layer,
+                                local_idx)
+            self.set_model_mlp(self._hf_weight_dict, mg_models, layer,
+                               local_idx)
 
             if layer != self.last_save_hf_layer:
                 self.save_safetensors(self._hf_weight_dict, layer + 1)
@@ -982,7 +977,8 @@ class MgCkptConvert(object):
 
         if pp_rank == self.pp_size - 1:
             self.set_model_postprocess(self._hf_weight_dict, mg_models)
-            self.save_safetensors(self._hf_weight_dict, self.last_save_hf_layer + 1)
+            self.save_safetensors(self._hf_weight_dict,
+                                  self.last_save_hf_layer + 1)
             self._hf_weight_dict = {}
 
     def read_vpp_rank_weights(self, pp_rank, vpp_rank, mg_models):
@@ -998,8 +994,10 @@ class MgCkptConvert(object):
 
             self.set_model_layer_norm(self._hf_weight_dict, mg_models, layer,
                                       local_idx)
-            self.set_model_attn(self._hf_weight_dict, mg_models, layer, local_idx)
-            self.set_model_mlp(self._hf_weight_dict, mg_models, layer, local_idx)
+            self.set_model_attn(self._hf_weight_dict, mg_models, layer,
+                                local_idx)
+            self.set_model_mlp(self._hf_weight_dict, mg_models, layer,
+                               local_idx)
 
             if layer != self.last_save_hf_layer:
                 self.save_safetensors(self._hf_weight_dict, layer + 1)
@@ -1012,7 +1010,8 @@ class MgCkptConvert(object):
 
         if dualpipe_flag or norm_flag:
             self.set_model_postprocess(self._hf_weight_dict, mg_models)
-            self.save_safetensors(self._hf_weight_dict, self.last_save_hf_layer + 1)
+            self.save_safetensors(self._hf_weight_dict,
+                                  self.last_save_hf_layer + 1)
             self._hf_weight_dict = {}
 
     def run(self):
@@ -1110,8 +1109,7 @@ def get_args():
         type=int,
         default=1,
         help=
-        'Expert tensor parallel size (default: 1, experts not split by TP).'
-    )
+        'Expert tensor parallel size (default: 1, experts not split by TP).')
     parser.add_argument(
         '--schedules-method',
         type=str,

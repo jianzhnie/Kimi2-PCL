@@ -212,8 +212,7 @@ class CkptConvert(object):
             raise ValueError('tp_size must be divisible by expert_tp_size')
         if self.moe_tp_extend_ep and self.expert_tp_size > 1:
             raise ValueError(
-                'moe_tp_extend_ep and expert_tp_size>1 are mutually exclusive'
-            )
+                'moe_tp_extend_ep and expert_tp_size>1 are mutually exclusive')
 
         if self.dualpipe:
             if self.tp_size > 1 and self.expert_tp_size != 1:
@@ -333,7 +332,8 @@ class CkptConvert(object):
         elif os.path.isfile(single_path):
             # Single safetensors file: all keys map to the same file
             import safetensors
-            with safetensors.safe_open(single_path, framework='pt',
+            with safetensors.safe_open(single_path,
+                                       framework='pt',
                                        device='cpu') as f:
                 weights_map = {k: 'model.safetensors' for k in f.keys()}
         else:
@@ -744,21 +744,19 @@ class CkptConvert(object):
                 for ep_rank in range(self.ep_size):
                     for tp_rank in range(self.tp_size):
                         idx = ep_rank * self.tp_size + tp_rank
-                        w1 = gemm_fc1_ep[idx].reshape(
-                            self.hidden_size, -1).clone()
+                        w1 = gemm_fc1_ep[idx].reshape(self.hidden_size,
+                                                      -1).clone()
                         w2 = gemm_fc2_ep[idx].reshape(
                             -1, self.hidden_size).clone()
-                        mg_model[ep_rank][tp_rank][
-                            experts_weight1_key] = w1
-                        mg_model[ep_rank][tp_rank][
-                            experts_weight2_key] = w2
+                        mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
+                        mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
                         if self.qlora_nf4:
-                            self.qlora_nf4_quant(
-                                mg_model, ep_rank, tp_rank,
-                                experts_weight1_key, w1.clone())
-                            self.qlora_nf4_quant(
-                                mg_model, ep_rank, tp_rank,
-                                experts_weight2_key, w2.clone())
+                            self.qlora_nf4_quant(mg_model, ep_rank,
+                                                 tp_rank, experts_weight1_key,
+                                                 w1.clone())
+                            self.qlora_nf4_quant(mg_model, ep_rank,
+                                                 tp_rank, experts_weight2_key,
+                                                 w2.clone())
             else:
                 # Standard EP: split by EP only, then optionally by expert_tp_size
                 gemm_fc1_ep = torch.chunk(gemm_fc1_3d, self.ep_size, dim=0)
@@ -795,17 +793,15 @@ class CkptConvert(object):
                             self.hidden_size, -1).clone()
                         w2 = fc2_shards[expert_tp_idx].reshape(
                             -1, self.hidden_size).clone()
-                        mg_model[ep_rank][tp_rank][
-                            experts_weight1_key] = w1
-                        mg_model[ep_rank][tp_rank][
-                            experts_weight2_key] = w2
+                        mg_model[ep_rank][tp_rank][experts_weight1_key] = w1
+                        mg_model[ep_rank][tp_rank][experts_weight2_key] = w2
                         if self.qlora_nf4:
-                            self.qlora_nf4_quant(
-                                mg_model, ep_rank, tp_rank,
-                                experts_weight1_key, w1.clone())
-                            self.qlora_nf4_quant(
-                                mg_model, ep_rank, tp_rank,
-                                experts_weight2_key, w2.clone())
+                            self.qlora_nf4_quant(mg_model, ep_rank,
+                                                 tp_rank, experts_weight1_key,
+                                                 w1.clone())
+                            self.qlora_nf4_quant(mg_model, ep_rank,
+                                                 tp_rank, experts_weight2_key,
+                                                 w2.clone())
             return
 
         # non-grouped gemm
@@ -814,7 +810,8 @@ class CkptConvert(object):
             num_local_experts = self.num_experts // bucket_num
             for ep_rank in range(self.ep_size):
                 for tp_rank in range(self.tp_size):
-                    global_base = (ep_rank * self.tp_size + tp_rank) * num_local_experts
+                    global_base = (ep_rank * self.tp_size +
+                                   tp_rank) * num_local_experts
                     for local_experts_idx in range(num_local_experts):
                         global_experts_idx = global_base + local_experts_idx
                         local_fc1 = experts_linear_fc1_list[
@@ -824,9 +821,11 @@ class CkptConvert(object):
 
                         local_prefix = f"{prefix}.experts.local_experts.{local_experts_idx}"
                         mg_model[ep_rank][tp_rank][
-                            f"{local_prefix}.linear_fc1.weight"] = local_fc1.clone()
+                            f"{local_prefix}.linear_fc1.weight"] = local_fc1.clone(
+                            )
                         mg_model[ep_rank][tp_rank][
-                            f"{local_prefix}.linear_fc2.weight"] = local_fc2.clone()
+                            f"{local_prefix}.linear_fc2.weight"] = local_fc2.clone(
+                            )
                         if self.qlora_nf4:
                             self.qlora_nf4_quant(
                                 mg_model, ep_rank, tp_rank,
