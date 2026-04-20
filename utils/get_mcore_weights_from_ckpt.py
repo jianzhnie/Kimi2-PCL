@@ -1072,10 +1072,7 @@ class MCoreCheckpointReader:
         self._layer2loc = self.layer_mapper.build_mapping(
             self.model.num_layers, self.parallel.pp_size, vpp_stage)
         # 构建反向映射 (pp, vpp, local) -> global，用于 O(1) 查找
-        self._loc2layer = {
-            loc: gid
-            for gid, loc in self._layer2loc.items()
-        }
+        self._loc2layer = {loc: gid for gid, loc in self._layer2loc.items()}
 
         if self.verbose:
             logger.info(

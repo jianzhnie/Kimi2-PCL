@@ -1020,8 +1020,7 @@ class MgCkptConvert:
                     if self.expert_tp_size > 1 and len(shards_w1) > 1:
                         # gate/up are interleaved per expert_tp shard;
                         # de-interleave them.
-                        chunks = torch.chunk(fc1, self.expert_tp_size,
-                                             dim=0)
+                        chunks = torch.chunk(fc1, self.expert_tp_size, dim=0)
                         gate_list, up_list = [], []
                         for chunk in chunks:
                             g, u = torch.chunk(chunk, 2, dim=0)
@@ -1073,17 +1072,20 @@ class MgCkptConvert:
                         hf[f'model.layers.{hf_layer}.mlp.experts.{expert}.down_proj.weight'] = fc2
                     else:
                         fc1_parts = [
-                            local_states[tp].pop(fc1_key) for tp in unique_owners
+                            local_states[tp].pop(fc1_key)
+                            for tp in unique_owners
                         ]
                         fc2_parts = [
-                            local_states[tp].pop(fc2_key) for tp in unique_owners
+                            local_states[tp].pop(fc2_key)
+                            for tp in unique_owners
                         ]
                         fc1 = torch.cat(fc1_parts, dim=0)
                         fc2 = torch.cat(fc2_parts, dim=1)
                         if self.expert_tp_size > 1:
                             # gate/up are interleaved per expert_tp
                             # shard; de-interleave them.
-                            chunks = torch.chunk(fc1, self.expert_tp_size,
+                            chunks = torch.chunk(fc1,
+                                                 self.expert_tp_size,
                                                  dim=0)
                             gate_list, up_list = [], []
                             for chunk in chunks:
