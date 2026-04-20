@@ -18,7 +18,7 @@
 #
 # 使用示例:
 #   # 模式1: DualPipeV (与训练脚本一致)
-#   bash scripts/ckpt_convert_hf2mcore_kimi2.sh
+#   bash scripts/ckpt_convert_kimi2_hf2mcore.sh
 #
 #   # 模式2: 标准 VPP (PP=4, 每 vpp stage 4 层)
 #   VPP_STAGE=4 PP=4 bash scripts/ckpt_convert_hf2mcore_kimi2.sh
