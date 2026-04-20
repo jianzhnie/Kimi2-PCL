@@ -2,7 +2,7 @@
 # =============================================================================
 # Kimi2-1T-4k Huggingface (HF) 到 Megatron-Core (MCore) 模型权重转换脚本
 #
-# 使用 ckpt_ckpt_kimi2_1t_4k.py 进行转换
+# 使用 convert_kimi2_hf2mcore.py 进行转换
 #
 # 模型配置:
 #   - 32 层 Transformer
