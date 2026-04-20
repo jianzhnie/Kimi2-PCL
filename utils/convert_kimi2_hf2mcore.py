@@ -83,6 +83,7 @@ class CkptConvert(object):
         ffn_hidden_size: int = FFN_HIDDEN_SIZE,
         moe_ffn_hidden_size: int = MOE_FFN_HIDDEN_SIZE,
         vocab_size: int = VOCAB_SIZE,
+        rotary_base: float = 50000.0,
     ):
         self.tp_size = tp_size
         self.pp_size = pp_size
@@ -123,6 +124,7 @@ class CkptConvert(object):
         self.ffn_hidden_size = ffn_hidden_size
         self.moe_ffn_hidden_size = moe_ffn_hidden_size
         self.vocab_size = vocab_size
+        self.rotary_base = rotary_base
 
         self._valid_parameter()
 
@@ -172,7 +174,14 @@ class CkptConvert(object):
 
     def generate_mg_weights_dir(self, tp_rank, pp_rank, ep_rank):
         """Generate the megatron weight directory."""
-        if self.ep_size == 1 and self.pp_size == 1:
+        if self.moe_tp_extend_ep and self.tp_size > 1:
+            # Interleaved EP naming: global_ep = tp_rank + ep_rank * tp_size
+            global_ep = tp_rank + ep_rank * self.tp_size
+            if self.pp_size == 1:
+                prefix = f"mp_rank_{tp_rank:02}_{global_ep:03}"
+            else:
+                prefix = f"mp_rank_{tp_rank:02}_{pp_rank:03}_{global_ep:03}"
+        elif self.ep_size == 1 and self.pp_size == 1:
             prefix = f"mp_rank_{tp_rank:02}"
         elif self.ep_size == 1:
             prefix = f"mp_rank_{tp_rank:02}_{pp_rank:03}"
@@ -295,7 +304,7 @@ class CkptConvert(object):
         ns.bf16 = True
         ns.fp16 = False
         ns.params_dtype = torch.bfloat16
-        ns.rotary_base = 50000.0
+        ns.rotary_base = self.rotary_base
         if hasattr(self, '_target_dtype') and self._target_dtype is not None:
             ns.bf16 = (self._target_dtype == torch.bfloat16)
             ns.fp16 = (self._target_dtype == torch.float16)
@@ -1181,6 +1190,10 @@ def get_args():
                         type=int,
                         default=VOCAB_SIZE,
                         help='Vocabulary size.')
+    parser.add_argument('--rotary-base',
+                        type=float,
+                        default=50000.0,
+                        help='Rotary base for RoPE')
 
     args, _ = parser.parse_known_args()
     return args
@@ -1214,7 +1227,8 @@ def main():
         ffn_hidden_size=args.ffn_hidden_size,
         moe_ffn_hidden_size=args.moe_ffn_hidden_size,
         vocab_size=args.vocab_size,
-        vpp_stage=args.num_layers_per_virtual_pipeline_stage)
+        vpp_stage=args.num_layers_per_virtual_pipeline_stage,
+        rotary_base=args.rotary_base)
     converter.run()
 
 
