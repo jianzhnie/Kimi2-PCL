@@ -79,7 +79,7 @@ class MgCkptConvert(object):
         num_dense_layers: int = 2,
         num_layer_list: str = None,
         noop_layers: str = None,
-        moe_grouped_gemm: bool = True,
+        moe_grouped_gemm: bool = False,
         moe_tp_extend_ep: bool = False,
         expert_tp_size: int = 1,
         dualpipe: bool = False,
