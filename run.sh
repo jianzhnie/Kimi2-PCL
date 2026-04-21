@@ -38,8 +38,8 @@ docker exec -it vllm-ascend-env-a3  /bin/bash
 
 # 转换模型
 nohup bash scripts/ckpt_convert_hf2mcore.sh > hf2mcore.log  2>&1 &
-nohup bash scripts/ckpt_convert_h2mcore_kimi2.sh > hf2mcore_kimi2.log 2>&1 &
-
+nohup bash scripts/ckpt_convert_kimi2_hf2mcore.sh > ckpt_convert_kimi2_hf2mcore.log 2>&1 &
+nohup bash scripts/ckpt_convert_kimi2_mcore2hf.sh >  ckpt_convert_kimi2_mcore2hf.log 2>&1 &
 nohup bash scripts/ckpt_convert_mcore2hf.sh > mcore2hf.log  2>&1 &
 systemctl daemon-reload && systemctl start docker
 
