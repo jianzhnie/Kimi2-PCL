@@ -441,7 +441,13 @@ class CkptConvert(object):
     def load_matched_hf_weights(self, pp_rank, vpp_rank=None):
         """Read the safetensors file corresponding to the layer of pp_rank."""
         if vpp_rank is None:
-            layer_list = self.pprank_layer_idxs[pp_rank]
+            if self.vpp_stage is not None:
+                # Collect all layers across all vpp_ranks for this pp_rank
+                layer_list = []
+                for vr in range(self.vpp_size):
+                    layer_list.extend(self.vpprank_layer_idxs[pp_rank][vr])
+            else:
+                layer_list = self.pprank_layer_idxs[pp_rank]
         else:
             layer_list = self.vpprank_layer_idxs[pp_rank][vpp_rank].copy()
 
@@ -1009,9 +1015,12 @@ class CkptConvert(object):
             vpp_local_layer_idx = self.generate_vpp_local_layer_idx()
             for pp_rank in range(self.pp_size):
                 mg_model = defaultdict()
+
+                # Load all weights for the entire pp_rank (across all vpp_ranks)
+                # to handle safetensors files that contain multiple layers' weights
+                pp_weights = self.load_matched_hf_weights(pp_rank)
+
                 for vpp_rank in range(self.vpp_size):
-                    pp_weights = self.load_matched_hf_weights(
-                        pp_rank, vpp_rank)
                     mg_model[vpp_rank] = defaultdict(
                         lambda: defaultdict(lambda: defaultdict(dict)))
                     vpp_list = self.vpprank_layer_idxs[pp_rank][vpp_rank]
@@ -1046,11 +1055,12 @@ class CkptConvert(object):
                         self.set_model_postprocess(pp_weights,
                                                    mg_model[vpp_rank])
 
-                    if pp_weights:
-                        unconsumed = list(pp_weights.keys())
-                        raise ValueError(
-                            f"pp_rank={pp_rank} vpp_rank={vpp_rank} 存在未被消费的 HF 权重 ({len(unconsumed)}): "
-                            f"{unconsumed[:20]}")
+                # Check unconsumed after all vpp_ranks are processed
+                if pp_weights:
+                    unconsumed = list(pp_weights.keys())
+                    raise ValueError(
+                        f"pp_rank={pp_rank} 存在未被消费的 HF 权重 ({len(unconsumed)}): "
+                        f"{unconsumed[:20]}")
 
                 for ep_rank in range(self.ep_size):
                     for tp_rank in range(self.tp_size):
