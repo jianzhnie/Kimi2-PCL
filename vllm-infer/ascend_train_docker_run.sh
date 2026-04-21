@@ -22,9 +22,9 @@ docker run -d \
     --name ${CONTAINER_NAME} \
     --ipc=host \
     --net=host \
-    --privileged \
     --ulimit memlock=-1 \
     --ulimit stack=67108864 \
+    --privileged=true \
     --device=/dev/davinci0 \
     --device=/dev/davinci1 \
     --device=/dev/davinci2 \
@@ -46,5 +46,6 @@ docker run -d \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v /root/.cache:/root/.cache \
     -v /llm_workspace_1P:/llm_workspace_1P:rw \
+    -v /root/.ssh:/root/.ssh \
     -it ${IMAGE_NAME} \
     /bin/bash -c "while true; do sleep 1000; done"
