@@ -50,8 +50,37 @@ VOCAB_SIZE = 163840
 NUM_LAYERS = 32
 
 
+def _mp_prefix(tp_rank: int, pp_rank: int, ep_rank: int,
+               tp_size: int, pp_size: int, ep_size: int,
+               moe_tp_extend_ep: bool = False) -> str:
+    """Generate Megatron checkpoint directory prefix.
+
+    When moe_tp_extend_ep is True and tp_size > 1, the expert suffix is
+    global_ep = tp_rank + ep_rank * tp_size instead of raw ep_rank.
+    """
+    if moe_tp_extend_ep and tp_size > 1:
+        ep_suffix = tp_rank + ep_rank * tp_size
+    else:
+        ep_suffix = ep_rank
+
+    if ep_size == 1 and pp_size == 1:
+        return f'mp_rank_{tp_rank:02}'
+    if ep_size == 1:
+        return f'mp_rank_{tp_rank:02}_{pp_rank:03}'
+    if pp_size == 1:
+        return f'mp_rank_{tp_rank:02}_{ep_suffix:03}'
+    return f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_suffix:03}'
+
+
 def load_data(file_path):
     logger.info(f"Loading the checkpoint from {file_path}.")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(
+            f"Checkpoint file not found: {file_path}\n"
+            f"Please verify your parallel configuration arguments match the checkpoint layout "
+            f"(e.g., --moe-tp-extend-ep, --source-tensor-parallel-size, "
+            f"--source-pipeline-parallel-size, --source-expert-parallel-size)."
+        )
     # Try weights_only=True first for security, fall back to False
     try:
         return torch.load(file_path, map_location='cpu', weights_only=True)
@@ -467,17 +496,16 @@ class MgCkptConvert(object):
                                    pp_rank=None,
                                    ep_rank=None):
         """get megatron weight path"""
-        mp_rank_path = os.path.join(iter_path, f'mp_rank_{tp_rank:02d}')
-        if self.pp_size > 1:
-            mp_rank_path = mp_rank_path + f'_{pp_rank:03d}'
-        if self.ep_size > 1:
-            if self.moe_tp_extend_ep and self.tp_size > 1:
-                # Interleaved EP naming: global_ep = tp_rank + ep_rank * tp_size
-                global_ep = tp_rank + ep_rank * self.tp_size
-                mp_rank_path = mp_rank_path + f'_{global_ep:03d}'
-            else:
-                mp_rank_path = mp_rank_path + f'_{ep_rank:03d}'
-        return os.path.join(mp_rank_path, 'model_optim_rng.pt')
+        prefix = _mp_prefix(
+            tp_rank,
+            pp_rank if pp_rank is not None else 0,
+            ep_rank if ep_rank is not None else 0,
+            self.tp_size,
+            self.pp_size,
+            self.ep_size,
+            self.moe_tp_extend_ep,
+        )
+        return os.path.join(iter_path, prefix, 'model_optim_rng.pt')
 
     def set_model_preprocess(self, hf_dict, mg_models):
         """embedding"""
@@ -607,7 +635,7 @@ class MgCkptConvert(object):
                 )
 
     def linear_fc1_gather_from_tp(self, mg_models, fc1_key, ep_rank=0):
-        """cat linear fc1 (gate and up)"""
+        """cat linear fc1 (gate and up) — split gate/up per shard, then concat"""
         gate_list, up_list = [], []
         for tp_rank in self.tp_rank_list:
             cur_linear_fc1 = mg_models[(tp_rank, ep_rank)].pop(fc1_key)
@@ -1016,9 +1044,8 @@ class MgCkptConvert(object):
 
     def run(self):
         for pp_rank in self.pp_rank_list:
-            mg_weights = defaultdict()
-
             if self.vpp_stage is None:
+                mg_weights = {}
                 for tp_rank, ep_rank in product(self.tp_rank_list,
                                                 self.ep_rank_list):
                     model_path = self.get_pt_path_by_tpppep_rank(
@@ -1027,18 +1054,28 @@ class MgCkptConvert(object):
                     mg_weights[(tp_rank, ep_rank)] = tmp_model
 
                 self.read_pp_rank_weights(pp_rank, mg_weights)
+                del mg_weights
             else:
+                # Load each checkpoint file once, then extract vpp models
+                # sequentially.  Avoids re-reading the same file for each
+                # vpp_rank, cutting disk I/O by (vpp_size-1)/vpp_size.
+                raw_data = {}
+                for tp_rank, ep_rank in product(self.tp_rank_list,
+                                                self.ep_rank_list):
+                    pt_path = self.get_pt_path_by_tpppep_rank(
+                        self.iter_path, tp_rank, pp_rank, ep_rank)
+                    raw_data[(tp_rank, ep_rank)] = load_data(pt_path)
+
                 for vpp_rank in range(self.vpp_size):
+                    mg_weights = {}
                     for tp_rank, ep_rank in product(self.tp_rank_list,
                                                     self.ep_rank_list):
-                        pt_path = self.get_pt_path_by_tpppep_rank(
-                            self.iter_path, tp_rank, pp_rank, ep_rank)
-                        tmp_model = load_data(pt_path)[f'model{vpp_rank}']
-                        mg_weights[(tp_rank, ep_rank)] = tmp_model
-
+                        mg_weights[(tp_rank, ep_rank)] = raw_data[
+                            (tp_rank, ep_rank)].pop(f'model{vpp_rank}')
                     self.read_vpp_rank_weights(pp_rank, vpp_rank, mg_weights)
+                    del mg_weights
 
-            del mg_weights
+                del raw_data
             gc.collect()
 
         model_index_file_path = os.path.join(self.hf_save_path,
