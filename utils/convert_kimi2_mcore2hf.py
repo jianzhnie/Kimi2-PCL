@@ -59,17 +59,20 @@ def _mp_prefix(tp_rank: int, pp_rank: int, ep_rank: int,
     global_ep = tp_rank + ep_rank * tp_size instead of raw ep_rank.
     """
     if moe_tp_extend_ep and tp_size > 1:
+        # When moe_tp_extend_ep is active, effective EP = ep_size * tp_size.
+        # The ep_suffix must always be included regardless of raw ep_size.
         ep_suffix = tp_rank + ep_rank * tp_size
-    else:
-        ep_suffix = ep_rank
+        if pp_size == 1:
+            return f'mp_rank_{tp_rank:02}_{ep_suffix:03}'
+        return f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_suffix:03}'
 
     if ep_size == 1 and pp_size == 1:
         return f'mp_rank_{tp_rank:02}'
     if ep_size == 1:
         return f'mp_rank_{tp_rank:02}_{pp_rank:03}'
     if pp_size == 1:
-        return f'mp_rank_{tp_rank:02}_{ep_suffix:03}'
-    return f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_suffix:03}'
+        return f'mp_rank_{tp_rank:02}_{ep_rank:03}'
+    return f'mp_rank_{tp_rank:02}_{pp_rank:03}_{ep_rank:03}'
 
 
 def load_data(file_path):

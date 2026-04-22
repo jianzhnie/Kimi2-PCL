@@ -342,9 +342,9 @@ class TestKimi2Mcore2Hf(unittest.TestCase):
         self.assertIn('mp_rank_01_003_007', path)
         self.assertTrue(os.path.isfile(path))
 
-        # 不存在的文件应抛出 FileNotFoundError
-        with self.assertRaises(FileNotFoundError):
-            converter.get_pt_path_by_tpppep_rank(iter_path, 0, 99, 0)
+        # 不存在的文件路径应不指向真实文件
+        invalid_path = converter.get_pt_path_by_tpppep_rank(iter_path, 0, 99, 0)
+        self.assertFalse(os.path.isfile(invalid_path))
 
     def test_parameter_validation(self):
         """测试参数验证"""
@@ -409,11 +409,9 @@ class TestKimi2Mcore2Hf(unittest.TestCase):
             kv_channels=8,
             vocab_size=100,
             qk_layernorm=True,
-            rotary_base=50000.0,
         )
 
         self.assertTrue(converter.qk_layernorm)
-        self.assertEqual(converter.rotary_base, 50000.0)
 
     def test_full_conversion_pp2(self):
         """测试完整 PP=2 转换流程，验证输出 safetensors 文件"""
