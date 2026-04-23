@@ -24,10 +24,18 @@ export PARALLELISM="${PARALLELISM:-8}"
 # export RUN_CONTAINER_SCRIPT="${RUN_CONTAINER_SCRIPT:-${SCRIPT_DIR}/ascend_infer_docker_run.sh}"
 # export CONTAINER_NAME="${CONTAINER_NAME:-vllm-ascend-env-a3}"
 
-export IMAGE_NAME="cis-pengcheng.cmecloud.cn/ascendhub/mindspeed-llm:openeuler22.03-mindspeed-llm-2.3.0-a3-arm"
-export IMAGE_TAR="${IMAGE_TAR:-/llm_workspace_1P/robin/hfhub/docker/image/mindspeed-llm-2.3.0-a3-arm.tar}"
-export RUN_CONTAINER_SCRIPT="${RUN_CONTAINER_SCRIPT:-${SCRIPT_DIR}/ascend_train_docker_run.sh}"
-export CONTAINER_NAME="${CONTAINER_NAME:-mindspeed-llm-env}"
+# 训练镜像
+# export IMAGE_NAME="cis-pengcheng.cmecloud.cn/ascendhub/mindspeed-llm:openeuler22.03-mindspeed-llm-2.3.0-a3-arm"
+# export IMAGE_TAR="${IMAGE_TAR:-/llm_workspace_1P/robin/hfhub/docker/image/mindspeed-llm-2.3.0-a3-arm.tar}"
+# export RUN_CONTAINER_SCRIPT="${RUN_CONTAINER_SCRIPT:-${SCRIPT_DIR}/ascend_train_docker_run.sh}"
+# export CONTAINER_NAME="${CONTAINER_NAME:-mindspeed-llm-env}"
+# export VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${SCRIPT_DIR}/vllm_model_server.sh}"
+
+# 推理镜像
+export IMAGE_NAME="ascend910c-cann8.5.1-torch2.9.0-vllm0.18.0:latest"
+export IMAGE_TAR="${IMAGE_TAR:-/llm_workspace_1P/robin/hfhub/docker/image/ascend910c-cann8.5.1-torch2.9.0-vllm0.18.0.tar}"
+export RUN_CONTAINER_SCRIPT="${RUN_CONTAINER_SCRIPT:-${SCRIPT_DIR}/ascend_infer_docker_run.sh}"
+export CONTAINER_NAME="${CONTAINER_NAME:-vllm-ascend-npuslim-env}"
 export VLLM_START_SCRIPT="${VLLM_START_SCRIPT:-${SCRIPT_DIR}/vllm_model_server.sh}"
 
 # ------------------------------------------
