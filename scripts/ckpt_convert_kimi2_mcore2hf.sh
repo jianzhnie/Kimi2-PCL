@@ -61,9 +61,11 @@ if [[ -z "${SAVE_DIR}" ]]; then
 fi
 
 # 并行配置 (来自 pretrain_kimi2_1t_4k.sh)
+# 注意: 训练脚本使用 --expert-model-parallel-size 64, 但 moe_tp_extend_ep=True 时
+# EP group 包含 TP 维度, 纯 EP = 64/TP = 32, 转换脚本需要使用纯 EP 值
 TP="${TP:-2}"
 PP="${PP:-8}"
-EP="${EP:-64}"
+EP="${EP:-32}"
 VPP_STAGE="${VPP_STAGE:-}"
 SCHEDULES_METHOD="${SCHEDULES_METHOD:-dualpipev}"
 

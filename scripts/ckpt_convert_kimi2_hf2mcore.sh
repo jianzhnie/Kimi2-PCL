@@ -49,9 +49,11 @@ if [[ -z "${SAVE_DIR}" ]]; then
 fi
 
 # 并行配置
+# 注意: 训练脚本使用 --expert-model-parallel-size 64, 但 moe_tp_extend_ep=True 时
+# EP group 包含 TP 维度, 纯 EP = 64/TP = 32, 转换脚本需要使用纯 EP 值
 TP="${TP:-2}"
 PP="${PP:-8}"
-EP="${EP:-64}"
+EP="${EP:-32}"
 VPP_STAGE="${VPP_STAGE:-}"
 EXPERT_TP="${EXPERT_TP:-1}"
 SCHEDULES_METHOD="${SCHEDULES_METHOD:-dualpipev}"
@@ -73,7 +75,7 @@ QK_LAYERNORM="${QK_LAYERNORM:-1}"
 
 # 可选配置
 MOE_GROUPED_GEMM="${MOE_GROUPED_GEMM:-1}"
-MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-0}"
+MOE_TP_EXTEND_EP="${MOE_TP_EXTEND_EP:-1}"
 NOOP_LAYERS="${NOOP_LAYERS:-}"
 NUM_LAYER_LIST="${NUM_LAYER_LIST:-}"
 QLORA_NF4="${QLORA_NF4:-0}"
