@@ -25,13 +25,11 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import (
-    AttentionMaskConverter, _prepare_4d_attention_mask,
     _prepare_4d_causal_attention_mask)
 from transformers.modeling_outputs import (BaseModelOutputWithPast,
                                            CausalLMOutputWithPast,
@@ -102,26 +100,23 @@ class DeepseekV3RMSNorm(nn.Module):
 
 class DeepseekV3LayerNorm(nn.Module):
     """
-    LayerNorm with weight and bias.
+    LayerNorm with weight only (no bias).
     Used for q_layernorm and k_layernorm to align with Megatron implementation.
     """
 
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.bias = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
-        # Standard LayerNorm: normalize then apply weight and bias
         mean = hidden_states.mean(-1, keepdim=True)
         variance = (hidden_states - mean).pow(2).mean(-1, keepdim=True)
         hidden_states = (hidden_states -
                          mean) * torch.rsqrt(variance + self.variance_epsilon)
-        # Apply weight and bias
-        hidden_states = hidden_states * self.weight + self.bias
+        hidden_states = hidden_states * self.weight
         return hidden_states.to(input_dtype)
 
 
