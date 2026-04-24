@@ -1,56 +1,60 @@
-# PCl-Model-1T 大语言模型评测
+# PCl-Model-1T 大语言模型评测报告
 
-## 评测结果
+## 1. 评测概览
 
-- 当前评测结果基于训练 10000 Step 保存的Checkpoint 模型,  完成的token 数量为 4.3T。
-- 推理评测框架基于 vllm + lmeval。
-- 评测结果基于 MMLU Benchmark 数据集, 包含 4 个任务：人文、其他、社会科学、STEM。
+本报告记录了 PCl-Model-1T 大语言模型在预训练阶段的关键性能指标。
 
-### MMLU Benchmark
+- **模型阶段**: 基于预训练 10,000 Step 保存的 Checkpoint。
+- **训练规模**: 已完成 4.3T Tokens 的训练。
+- **评测环境**: 采用 `vLLM` 推理引擎配合 `lm-evaluation-harness` (lmeval) 框架。
+- **硬件平台**: 昇腾 (Ascend) NPU 集群。
 
-MMLU (Measuring Massive Multitask Language Understanding) 是一个全面的基准测试，旨在评估大型语言模型在广泛知识领域（如科学、技术、工程、数学、人文和社会科学）中的多任务能力。它涵盖了 57 个主题，从初等教育到高级专业水平，是目前衡量 LLM 综合理解和推理能力的核心评测指标之一。
+---
 
-#### MMLU Benchmark Results (zero-shot)
+## 2. 核心基准测试结果
 
-| 任务 (Task)       | n-shot | 准确率 (acc) ↑ | 标准误差 (acc_stderr) |
-| :---------------- | :----- | :------------- | :-------------------- |
-| mmlu              | 0      | 0.3441         | 0.0040                |
-| - humanities      | 0      | 0.3092         | 0.0067                |
-| - other           | 0      | 0.3798         | 0.0087                |
-| - social sciences | 0      | 0.3776         | 0.0087                |
-| - stem            | 0      | 0.3283         | 0.0083                |
+### 2.1 MMLU (Massive Multitask Language Understanding)
 
-#### MMLU Benchmark Results (5-shot)
+MMLU 是衡量语言模型综合理解能力的核心基准，涵盖了从基础教育到专业水平的 57 个主题。评测结果分为四个大类：**人文 (Humanities)**、**社会科学 (Social Sciences)**、**STEM (科学、技术、工程、数学)** 以及 **其他 (Other)**。
 
-| 任务 (Task)       | n-shot | 准确率 (acc) ↑ | 标准误差 (acc_stderr) |
-| :---------------- | :----- | :------------- | :-------------------- |
-| mmlu              | 5      | 0.3506         | 0.0040                |
-| - humanities      | 5      | 0.3184         | 0.0067                |
-| - other           | 5      | 0.3972         | 0.0087                |
-| - social sciences | 5      | 0.3760         | 0.0087                |
-| - stem            | 5      | 0.3279         | 0.0083                |
+#### 2.1.1 Zero-shot 结果 (n-shot: 0)
+
+| 任务 (Task) | 准确率 (acc) ↑ | 标准误差 (acc_stderr) |
+| :--- | :---: | :---: |
+| **MMLU (Overall)** | **0.3441** | 0.0040 |
+| - Humanities | 0.3092 | 0.0067 |
+| - Social Sciences | 0.3776 | 0.0087 |
+| - STEM | 0.3283 | 0.0083 |
+| - Other | 0.3798 | 0.0087 |
+
+#### 2.1.2 Few-shot 结果 (n-shot: 5)
+
+| 任务 (Task) | 准确率 (acc) ↑ | 标准误差 (acc_stderr) |
+| :--- | :---: | :---: |
+| **MMLU (Overall)** | **0.3506** | 0.0040 |
+| - Humanities | 0.3184 | 0.0067 |
+| - Social Sciences | 0.3760 | 0.0087 |
+| - STEM | 0.3279 | 0.0083 |
+| - Other | 0.3972 | 0.0087 |
 
 > **数据说明**：
->
-> **Task**:  
->
-> **准确率 (acc)**: 已四舍五入保留 4 位小数。
->
-> **标准误差 (acc_stderr)**: 已四舍五入保留 4 位小数。
+> - **Task**: `mmlu` 为全量 57 个子任务的宏平均结果；各子分类（如 Humanities）为其下属主题的加权平均。
+> - **准确率 (acc)**: 模型预测正确的样本比例，已四舍五入保留 4 位小数。
+> - **标准误差 (acc_stderr)**: 反映评测结果的统计稳定性，数值越小表示结果越可靠。
 
-### Wikitext-2 Perplexity
+---
 
-Wikitext-2 是一个常用于语言模型评估的数据集，包含从维基百科文章中提取的高质量文本。**Word Perplexity (困惑度)** 是衡量语言模型性能的关键指标，反映了模型对测试数据集中下一个词的预测能力。困惑度越低，表示模型对文本的预测越准确，语言建模能力越强。
+### 2.2 Wikitext-2 Perplexity (语言建模能力)
 
+Wikitext-2 数据集用于评估模型对高质量维基百科文本的语言建模能力。**困惑度 (Perplexity, PPL)** 是衡量模型预测文本序列能力的关键指标。
 
-#### Wikitext Benchmark Results
+#### Wikitext-2 评测结果
 
-
-| Tasks | n-shot | Metric | Value ↓ |
-| :--- | :---: | :--- | :---: |
-| wikitext | 0 | bits_per_byte | 0.7438 |
-| | 0 | byte_perplexity | 1.6745 |
-| | 0 | word_perplexity | 15.7494 |
+| 评测指标 (Metric) | 结果 (Value) ↓ | 说明 |
+| :--- | :---: | :--- |
+| **Word Perplexity** | **15.7494** | 基于单词层面的预测困惑度 |
+| Byte Perplexity | 1.6745 | 基于字节层面的预测困惑度 |
+| Bits per Byte (BPB) | 0.7438 | 平均每个字节所需的比特数 |
 
 
 ##  推理评测适配过程介绍
