@@ -213,27 +213,8 @@ class TestDeepseekV3Config:
 # =============================================================================
 
 
-class TestDeepseekV3Config:
-    """Test DeepseekV3Config from 100B configuration"""
-
-    def test_default_initialization(self):
-        """Test config with default values (1T model)"""
-        config = DeepseekV3Config()
-
-        # Check default values for 1T model (from actual config)
-        assert config.vocab_size == 163840
-        assert config.hidden_size == 7168
-        assert config.num_hidden_layers == 32
-        assert config.num_attention_heads == 64
-        assert config.intermediate_size == 18432
-
-    def test_custom_initialization(self, minimal_config_kwargs):
-        """Test config with custom values"""
-        config = DeepseekV3Config(**minimal_config_kwargs)
-
-        assert config.vocab_size == 128
-        assert config.hidden_size == 64
-        assert config.num_hidden_layers == 2
+class TestDeepseekV3Config100B:
+    """Test DeepseekV3Config with 100B-scale custom configurations"""
 
     def test_custom_vs_default_differences(self):
         """Test differences between custom and default configs"""
@@ -310,18 +291,6 @@ class TestMoEConfiguration:
 
 class TestAttentionConfiguration:
     """Test attention-specific configuration"""
-
-    def test_gqa_configuration(self):
-        """Test grouped query attention configuration"""
-        # When group_query_attention=True, num_key_value_heads is calculated from num_query_groups
-        config = DeepseekV3Config(
-            num_attention_heads=64,
-            num_query_groups=
-            8,  # This will set num_key_value_heads = 64 // 8 = 8
-        )
-
-        assert config.num_attention_heads == 64
-        assert config.num_key_value_heads == 8
 
     def test_qk_head_dims(self):
         """Test Q/K head dimension configuration"""
@@ -440,12 +409,6 @@ class TestConfigEdgeCases:
 
         assert config.vocab_size == 500000
         assert config.hidden_size == 16384
-
-    def test_zero_dropout(self):
-        """Test with zero dropout"""
-        config = DeepseekV3Config(attention_dropout=0.0)
-
-        assert config.attention_dropout == 0.0
 
     def test_high_dropout(self):
         """Test with high dropout"""

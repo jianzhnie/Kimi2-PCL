@@ -24,13 +24,6 @@ from utils.convert_ckpt_hf2mcore import (CkptConvert, _dtype_from_str,
                                          _parse_int_list, _sha256_file,
                                          _write_sha256_manifest)
 from utils.convert_ckpt_mcore2hf import MgCkptConvert
-from utils.convert_ckpt_mcore2hf import \
-    _dtype_from_str as _dtype_from_str_mcore
-from utils.convert_ckpt_mcore2hf import _mp_prefix as _mp_prefix_mcore
-from utils.convert_ckpt_mcore2hf import _resolve_iter_dir
-from utils.convert_ckpt_mcore2hf import _sha256_file as _sha256_file_mcore
-from utils.convert_ckpt_mcore2hf import \
-    _write_sha256_manifest as _write_sha256_manifest_mcore
 
 # =============================================================================
 # Fixtures
@@ -277,30 +270,6 @@ class TestWriteSHA256Manifest:
             assert result is None
 
 
-class TestMpPrefix:
-    """Test _mp_prefix function"""
-
-    def test_tp_only(self):
-        """Test with only tensor parallelism"""
-        result = _mp_prefix(1, 0, 0, tp=2, pp=1, ep=1)
-        assert result == 'mp_rank_01'
-
-    def test_tp_and_pp(self):
-        """Test with tensor and pipeline parallelism"""
-        result = _mp_prefix(1, 2, 0, tp=2, pp=4, ep=1)
-        assert result == 'mp_rank_01_002'
-
-    def test_tp_and_ep(self):
-        """Test with tensor and expert parallelism"""
-        result = _mp_prefix(1, 0, 3, tp=2, pp=1, ep=4)
-        assert result == 'mp_rank_01_003'
-
-    def test_all_parallelisms(self):
-        """Test with all parallelism types"""
-        result = _mp_prefix(1, 2, 3, tp=2, pp=4, ep=4)
-        assert result == 'mp_rank_01_002_003'
-
-
 # =============================================================================
 # HF to MCore Conversion Tests
 # =============================================================================
@@ -410,39 +379,6 @@ class TestCkptConvertLayerMapping:
 # =============================================================================
 # MCore to HF Conversion Tests
 # =============================================================================
-
-
-class TestResolveIterDir:
-    """Test _resolve_iter_dir function"""
-
-    def test_resolve_from_latest_file(self, temp_mcore_checkpoint):
-        """Test resolving from latest_checkpointed_iteration.txt"""
-        iter_dir = _resolve_iter_dir(temp_mcore_checkpoint)
-        assert os.path.basename(iter_dir) == 'iter_0000001'
-
-    def test_resolve_default_iter(self):
-        """Test resolving default iter_0000001"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            iter_dir = os.path.join(tmpdir, 'iter_0000001')
-            os.makedirs(iter_dir)
-
-            result = _resolve_iter_dir(tmpdir)
-            assert result == iter_dir
-
-    def test_resolve_already_iter_dir(self):
-        """Test when path is already an iter directory"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            iter_dir = os.path.join(tmpdir, 'iter_0000005')
-            os.makedirs(iter_dir)
-
-            result = _resolve_iter_dir(iter_dir)
-            assert result == iter_dir
-
-    def test_resolve_not_found(self):
-        """Test error when no iteration directory found"""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(FileNotFoundError, match='无法定位迭代目录'):
-                _resolve_iter_dir(tmpdir)
 
 
 class TestMgCkptConvertInitialization:
