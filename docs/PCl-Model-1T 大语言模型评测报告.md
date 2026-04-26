@@ -82,7 +82,10 @@ MMLU 是衡量语言模型综合理解能力的核心基准，涵盖了从基础
 
 > **数据来源**：各模型官方模型卡 (HuggingFace)、技术报告及社区评测。部分数值为社区评测或基于技术报告图表的估计值。
 >
-> **指标差异说明**：不同模型/评测框架使用的 MMLU 评测指标可能不同。例如 Llama 系列使用 `macro_avg/acc_char`，DeepSeek-V3 和 Kimi K2 使用 `EM` (Exact Match)。同一模型在不同指标下分数可能不同。本表优先采用各模型官方模型卡报告值。
+> **指标差异说明**：
+> - 不同模型/评测框架使用的 MMLU 评测指标可能不同。例如 Llama 系列使用 `macro_avg/acc_char`，DeepSeek-V3 和 Kimi K2 使用 `EM` (Exact Match)。同一模型在不同指标下分数可能不同。本表优先采用各模型官方模型卡报告值。
+> - **GPT-4**：表中 86.40 来自 GPT-4 Technical Report (OpenAI, 2023) Table 2 的官方报告值。由于 GPT-4 使用自定义评测方法（非标准 lm-eval-harness），社区评测（如 HELM）通常报告较低分数（约 83%），两者不具有严格可比性。
+> - **Yi 系列**：Yi-34B 和 Yi-6B 的 MMLU 分数来自 Yi Technical Report (arXiv:2403.04652) Table 2 的官方报告值。
 >
 > **分析**：PCL-Model-1T 当前处于预训练早期阶段 (10,000 Step / ~4.0T Tokens)，MMLU 指标随训练推进预计将持续提升。成熟模型（如 Llama-3、Qwen2.5 等）均在完整预训练后方进行评测，MMLU 指标通常在训练中后期才趋于收敛。
 
