@@ -28,6 +28,7 @@ MMLU 是衡量语言模型综合理解能力的核心基准，涵盖了从基础
 | **Step 10000**            | **34.41**      | 30.92      | 37.76           | 32.83 | 37.98 |
 | **Step 12700**            | 32.69          | 31.39      | 34.94           | 29.81 | 35.37 |
 | **Stage2 CPT (Step 350)** | 40.14          | 38.45      | 43.81           | 34.41 | 44.90 |
+| **Stage2 CPT (Step 500)** | 40.78          | 39.23      | 43.48           | 35.78 | 45.54 |
 
 #### 2.1.2 Few-shot 结果 (n-shot: 5)
 
@@ -102,6 +103,7 @@ Wikitext-2 数据集用于评估模型对高质量维基百科文本的语言建
 | **Step 10000**            | 15.75             | 1.67              | 0.74                  |
 | **Step 12700**            | 16.65             | 1.69              | 0.76                  |
 | **Stage2 CPT (Step 350)** | 22.57             | 1.79              | 0.84                  |
+| **Stage2 CPT (Step 500)** | -                 | -                 | -                     |
 
 #### 2.2.2 主流模型 Word Perplexity 跨模型对比
 
@@ -112,9 +114,9 @@ Wikitext-2 数据集用于评估模型对高质量维基百科文本的语言建
 | 模型         | 参数量 | WikiText-2 PPL ↓ | PTB PPL ↓ | LAMBADA PPL ↓ |
 | :----------- | :----- | :--------------- | :-------- | :------------ |
 | GPT-2 Small  | 124M   | 29.41            | 65.85     | 35.13         |
-| GPT-2 Medium | 355M   | 22.76            | 47.42     | 25.69         |
-| GPT-2 Large  | 774M   | 19.93            | 38.46     | 19.94         |
-| GPT-2 XL     | 1.5B   | 18.34            | 35.76     | 17.70         |
+| GPT-2 Medium | 355M   | 22.76            | 47.33     | 15.60         |
+| GPT-2 Large  | 774M   | 19.93            | 40.31     | 10.87         |
+| GPT-2 XL     | 1.5B   | 18.34            | 35.76     | 8.63          |
 | GPT-3        | 175B   | 16.44            | 20.50     | 8.11          |
 
 > **数据来源**：GPT-2 数据来自 HuggingFace GPT-2 模型卡 (Radford et al., 2019)；GPT-3 数据来自 Brown et al. (2020) 原始论文。*GPT-3 的 WikiText-2 PPL 值 16.44 为社区广泛引用值，原始论文未直接报告此指标。
@@ -201,6 +203,15 @@ Wikitext-2 数据集用于评估模型对高质量维基百科文本的语言建
 | `mmlu_social_sciences` | - social sciences | 43.81        | 0.89                  |
 | `mmlu_stem`            | - stem            | 34.41        | 0.84                  |
 
+#### Stage2 CPT (Step 500)
+| Group (组别)           | Alias (别名)      | acc (准确率) | acc_stderr (标准误差) |
+| :--------------------- | :---------------- | :----------- | :-------------------- |
+| `mmlu`                 | mmlu              | 40.78        | 0.41                  |
+| `mmlu_humanities`      | - humanities      | 39.23        | 0.70                  |
+| `mmlu_other`           | - other           | 45.54        | 0.89                  |
+| `mmlu_social_sciences` | - social sciences | 43.48        | 0.88                  |
+| `mmlu_stem`            | - stem            | 35.78        | 0.85                  |
+
 ### 附录 B: Wikitext-2 详细结果
 
 #### Step 900
@@ -237,3 +248,10 @@ Wikitext-2 数据集用于评估模型对高质量维基百科文本的语言建
 | **word_perplexity** | 22.57      |
 | **byte_perplexity** | 1.79       |
 | **bits_per_byte**   | 0.84       |
+
+#### Stage2 CPT (Step 500)
+| 指标 (Metric)       | 值 (Value) |
+| :------------------ | :--------- |
+| **word_perplexity** | -          |
+| **byte_perplexity** | -          |
+| **bits_per_byte**   | -          |
