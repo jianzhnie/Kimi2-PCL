@@ -52,33 +52,33 @@ MMLU 是衡量语言模型综合理解能力的核心基准，涵盖了从基础
 
 | 模型                 | 参数量                  | MMLU 5-shot | 架构  | 来源                     |
 | :------------------- | :---------------------- | :---------- | :---- | :----------------------- |
-| **Kimi K2 Base**     | 1T (MoE)                | **87.80**   | MoE   | Moonshot AI 技术报告     |
+| **Kimi K2 Base**     | 1T (MoE)                | **87.80**   | MoE   | Kimi K2 HuggingFace 模型卡 |
 | **DeepSeek-V3**      | 671B (MoE, 37B 激活)    | **87.10**   | MoE   | DeepSeek 技术报告        |
+| **GPT-4**            | 闭源                    | **86.40**   | —     | GPT-4 Technical Report   |
+| **Llama-4-Maverick** | 400B (MoE, 17B 激活)    | **85.50**   | MoE   | Meta HuggingFace 模型卡   |
 | **Llama-3.1-405B**   | 405B                    | **85.20**   | Dense | Meta 官方模型卡          |
 | **Qwen2.5-72B**      | 72.7B                   | **85.00**   | Dense | Qwen2.5 技术报告         |
-| **Llama-4-Maverick** | 400B (MoE, 17B 激活)    | **84.90**   | MoE   | Meta 官方模型卡          |
 | **Qwen2-72B**        | 72B                     | **84.20**   | Dense | Qwen2 官方模型卡         |
-| **GPT-4**            | 闭源                    | **83.00**   | —     | OpenAI 报告              |
 | **Llama-3-70B**      | 70B                     | **79.50**   | Dense | Meta 官方模型卡          |
 | **Llama-3.1-70B**    | 70B                     | **79.30**   | Dense | Meta 官方模型卡          |
-| **DeepSeek-V2**      | 236B (MoE, 21B 激活)    | **78.50**   | MoE   | DeepSeek-V2 技术报告     |
+| **DeepSeek-V2**      | 236B (MoE, 21B 激活)    | **78.50**   | MoE   | DeepSeek-V2 模型卡       |
 | **Mixtral-8x22B**    | 141B (MoE, 39B 激活)    | **77.60**   | MoE   | Mistral AI               |
-| **Yi-34B**           | 34B                     | **76.00**   | Dense | 01.AI                    |
-| **GLM-4-9B**         | 9B                      | **74.70**   | Dense | 智谱 AI                  |
-| **Qwen2.5-7B**       | 7.61B                   | **72.00**   | Dense | Qwen2.5 技术报告         |
-| **Mixtral-8x7B**     | 46.7B (MoE, 12.9B 激活) | **70.60**   | MoE   | Mistral AI               |
+| **Yi-34B**           | 34B                     | **76.30**   | Dense | Yi Technical Report      |
+| **GLM-4-9B**         | 9B                      | **74.70**   | Dense | GLM-4-9B HuggingFace 模型卡 |
+| **Qwen2.5-7B**       | 7.61B                   | **74.20**   | Dense | Qwen2.5 技术报告 / Blog  |
+| **Mixtral-8x7B**     | 46.7B (MoE, 12.9B 激活) | **70.60**   | MoE   | Mixtral of Experts Paper |
 | **Qwen2-7B**         | 7.6B                    | **70.30**   | Dense | Qwen2 官方模型卡         |
 | **Llama-2-70B**      | 70B                     | **69.70**   | Dense | Meta 官方模型卡          |
 | **GPT-3.5**          | 闭源                    | **69.10**   | —     | OpenAI 报告              |
 | **Llama-3.1-8B**     | 8B                      | **66.70**   | Dense | Meta 官方模型卡          |
 | **Llama-3-8B**       | 8B                      | **66.60**   | Dense | Meta 官方模型卡          |
-| **InternLM2-7B**     | 7B                      | **65.80**   | Dense | 上海 AI 实验室           |
+| **InternLM2-7B**     | 7B                      | **65.80**   | Dense | InternLM2 HuggingFace 模型卡 |
 | **Mistral-7B-v0.1**  | 7.3B                    | **64.20**   | Dense | Mistral AI               |
-| **Yi-6B**            | 6B                      | **63.00**   | Dense | 01.AI                    |
+| **Yi-6B**            | 6B                      | **63.20**   | Dense | Yi Technical Report      |
 | **Llama-2-13B**      | 13B                     | **53.80**   | Dense | Meta 官方模型卡          |
-| **DeepSeek-LLM-7B**  | 7B                      | **48.00**   | Dense | DeepSeek LLM 技术报告    |
+| **DeepSeek-LLM-7B**  | 7B                      | **48.20**   | Dense | DeepSeek LLM 技术报告    |
 | **Llama-2-7B**       | 7B                      | **45.70**   | Dense | Meta 官方模型卡          |
-| **PCL-Model-1T**     | —                       | **35.06**   | MOE   | 本报告 (预训练 10K Step) |
+| **PCL-Model-1T**     | 1T                     | **35.06**   | MoE   | 本报告 (预训练 10K Step) |
 
 > **数据来源**：各模型官方模型卡 (HuggingFace)、技术报告及社区评测。部分数值为社区评测或基于技术报告图表的估计值。
 >
