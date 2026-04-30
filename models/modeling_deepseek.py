@@ -38,17 +38,15 @@ from transformers.generation.utils import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.utils import (add_start_docstrings,
-                                add_start_docstrings_to_model_forward,
-                                is_flash_attn_2_available,
-                                is_flash_attn_greater_or_equal_2_10, logging,
+                                add_start_docstrings_to_model_forward, logging,
                                 replace_return_docstrings)
 
 from .configuration_deepseek import DeepseekV3Config
 
-if is_flash_attn_2_available():
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    from flash_attn.bert_padding import pad_input  # noqa
-    from flash_attn.bert_padding import index_first_axis, unpad_input
+from transformers.integrations.npu_flash_attention import (
+    npu_flash_attn_func,
+    npu_flash_attn_varlen_func,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -802,8 +800,198 @@ class DeepseekV3Attention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
+def _index_first_axis(logits, indices):
+    """Select tokens at the given indices along the first axis."""
+    return logits[indices]
+
+
+def _pad_input(unpadded_tensor, indices, batch_size, seq_len):
+    """Re-pad an unpadded tensor back to (batch_size, seq_len, ...)."""
+    output = unpadded_tensor.new_zeros(
+        batch_size * seq_len, *unpadded_tensor.shape[1:])
+    output[indices] = unpadded_tensor
+    return output.view(batch_size, seq_len, *unpadded_tensor.shape[1:])
+
+
+class DeepseekV3FlashAttention(nn.Module):
+    """GQA Attention module with QK-norm, using NPU fusion attention."""
+
+    def __init__(self, config: DeepseekV3Config, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_query_groups = config.num_query_groups
+        self.head_dim = config.kv_channels
+        self.num_key_value_groups = self.num_heads // self.num_query_groups
+        self.scaling = self.head_dim**-0.5
+        # YaRN mscale: scale attention logits when using yarn RoPE with mscale_all_dim > 0
+        if config.rope_scaling is not None and config.rope_scaling.get(
+                'mscale_all_dim', 0) > 0:
+            mscale = yarn_get_mscale(
+                config.rope_scaling['factor'],
+                config.rope_scaling['mscale_all_dim'],
+            )
+            self.scaling = self.scaling * mscale * mscale
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        if self.num_heads % self.num_query_groups != 0:
+            raise ValueError(
+                f'num_attention_heads ({self.num_heads}) must be divisible by '
+                f'num_query_groups ({self.num_query_groups})')
+
+        # Q projection: all heads
+        self.q_proj = nn.Linear(config.hidden_size,
+                                self.num_heads * self.head_dim,
+                                bias=config.attention_bias)
+        # K/V projections: only num_query_groups for GQA
+        self.k_proj = nn.Linear(config.hidden_size,
+                                self.num_query_groups * self.head_dim,
+                                bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size,
+                                self.num_query_groups * self.head_dim,
+                                bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim,
+                                config.hidden_size,
+                                bias=config.attention_bias)
+
+        # QK RMSNorm on head_dim, matches Megatron's --qk-layernorm with --normalization RMSNorm
+        self.q_layernorm = DeepseekV3RMSNorm(self.head_dim,
+                                            eps=config.rms_norm_eps)
+        self.k_layernorm = DeepseekV3RMSNorm(self.head_dim,
+                                            eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        position_embeddings: Optional[Tuple[torch.Tensor,
+                                            torch.Tensor]] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        bsz, q_len, _ = hidden_states.size()
+        hidden_shape = (bsz, q_len, -1, self.head_dim)
+
+        # Project and reshape: Q (bsz, q_len, num_heads, head_dim), K/V (bsz, q_len, num_kv_heads, head_dim)
+        query_states = self.q_proj(hidden_states).view(hidden_shape)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        value_states = self.v_proj(hidden_states).view(hidden_shape)
+
+        # Apply QK layernorm
+        query_states = self.q_layernorm(query_states)
+        key_states = self.k_layernorm(key_states)
+
+        # Transpose to (batch, num_heads, seq_len, head_dim) for RoPE and KV cache
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        # Apply rotary position embeddings
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids)
+
+        # Update KV cache
+        if past_key_value is not None:
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx)
+
+        # Transpose to (batch, seq_len, num_heads, head_dim) for flash_attn
+        # GQA is handled natively: Q has num_heads, K/V have num_query_groups
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        dropout_p = self.attention_dropout if self.training else 0.0
+
+        if attention_mask is not None:
+            # Varlen path: unpad for padded sequences
+            kv_seq_len = key_states.shape[1]
+            indices_k, cu_seqlens_k, max_seqlen_k = _get_unpad_data(
+                attention_mask)
+
+            key_states = _index_first_axis(
+                key_states.reshape(bsz * kv_seq_len, self.num_query_groups,
+                                   self.head_dim), indices_k)
+            value_states = _index_first_axis(
+                value_states.reshape(bsz * kv_seq_len, self.num_query_groups,
+                                     self.head_dim), indices_k)
+
+            if q_len == kv_seq_len:
+                # Prefill: Q and K/V have same seq length, unpad with same indices
+                query_states = _index_first_axis(
+                    query_states.reshape(bsz * q_len, self.num_heads,
+                                         self.head_dim), indices_k)
+                cu_seqlens_q = cu_seqlens_k
+                max_seqlen_q = max_seqlen_k
+            else:
+                # Decode with cache: Q has fewer tokens than cached K/V
+                query_mask = attention_mask[:, -q_len:].flatten()
+                query_indices = torch.nonzero(query_mask,
+                                             as_tuple=False).flatten()
+                query_states = query_states.reshape(
+                    bsz * q_len, self.num_heads,
+                    self.head_dim)[query_indices]
+                n_valid = query_indices.shape[0]
+                cu_seqlens_q = torch.arange(
+                    0,
+                    n_valid + 1,
+                    dtype=torch.int32,
+                    device=query_states.device)
+                max_seqlen_q = q_len
+
+            attn_output = npu_flash_attn_varlen_func(
+                query_states,
+                key_states,
+                value_states,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                dropout_p=dropout_p,
+                softmax_scale=self.scaling,
+                causal=self.is_causal and q_len > 1,
+            )
+
+            if q_len == kv_seq_len:
+                attn_output = _pad_input(attn_output, indices_k, bsz, q_len)
+            else:
+                output = query_states.new_zeros(bsz * q_len, self.num_heads,
+                                                self.head_dim)
+                output[query_indices] = attn_output
+                attn_output = output.view(bsz, q_len, self.num_heads,
+                                          self.head_dim)
+        else:
+            # Standard path: no padding
+            attn_output = npu_flash_attn_func(
+                query_states,
+                key_states,
+                value_states,
+                dropout_p=dropout_p,
+                softmax_scale=self.scaling,
+                causal=self.is_causal and q_len > 1,
+            )
+
+        # Reshape and project output
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
+
 ATTENTION_CLASSES = {
     'eager': DeepseekV3Attention,
+    'flash_attention_2': DeepseekV3FlashAttention,
 }
 
 
@@ -812,8 +1000,9 @@ class DeepseekV3DecoderLayer(nn.Module):
     def __init__(self, config: DeepseekV3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = DeepseekV3Attention(config=config,
-                                             layer_idx=layer_idx)
+        attn_impl = getattr(config, '_attn_implementation', 'eager')
+        attn_class = ATTENTION_CLASSES.get(attn_impl, DeepseekV3Attention)
+        self.self_attn = attn_class(config=config, layer_idx=layer_idx)
 
         self.mlp = (DeepseekV3MoE(config) if
                     (config.n_routed_experts is not None

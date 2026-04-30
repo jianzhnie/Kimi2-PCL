@@ -29,8 +29,8 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_attn_mask_utils import (
-    _prepare_4d_causal_attention_mask)
+from transformers.modeling_attn_mask_utils import \
+    _prepare_4d_causal_attention_mask
 from transformers.modeling_outputs import (BaseModelOutputWithPast,
                                            CausalLMOutputWithPast,
                                            SequenceClassifierOutputWithPast)
@@ -42,6 +42,7 @@ from transformers.utils import (add_start_docstrings,
                                 is_flash_attn_2_available,
                                 is_flash_attn_greater_or_equal_2_10, logging,
                                 replace_return_docstrings)
+
 from .configuration_deepseek import DeepseekV3Config
 
 if is_flash_attn_2_available():
