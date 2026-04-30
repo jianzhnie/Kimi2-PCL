@@ -88,30 +88,7 @@ class DeepseekV3RMSNorm(nn.Module):
         return (self.weight.to(input_dtype) * hidden_states).to(input_dtype)
 
 
-class DeepseekV3LayerNorm(nn.Module):
-    """
-    LayerNorm with weight only (no bias).
-    Used for q_layernorm and k_layernorm to align with Megatron implementation.
-    """
-
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        mean = hidden_states.mean(-1, keepdim=True)
-        variance = (hidden_states - mean).pow(2).mean(-1, keepdim=True)
-        hidden_states = (hidden_states -
-                         mean) * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = hidden_states * self.weight
-        return hidden_states.to(input_dtype)
-
-
 ALL_LAYERNORM_LAYERS.append(DeepseekV3RMSNorm)
-ALL_LAYERNORM_LAYERS.append(DeepseekV3LayerNorm)
 
 
 class DeepseekV3RotaryEmbedding(nn.Module):
@@ -746,10 +723,10 @@ class DeepseekV3Attention(nn.Module):
                                 bias=config.attention_bias)
 
         # QK layernorm (LayerNorm without bias on head_dim), matches Megatron's q_layernorm/k_layernorm
-        self.q_layernorm = DeepseekV3LayerNorm(self.head_dim,
-                                               eps=config.rms_norm_eps)
-        self.k_layernorm = DeepseekV3LayerNorm(self.head_dim,
-                                               eps=config.rms_norm_eps)
+        self.q_layernorm = DeepseekV3RMSNorm(self.head_dim,
+                                            eps=config.rms_norm_eps)
+        self.k_layernorm = DeepseekV3RMSNorm(self.head_dim,
+                                            eps=config.rms_norm_eps)
 
     def forward(
         self,
