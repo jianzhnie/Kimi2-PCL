@@ -72,7 +72,8 @@ class DeepseekV3RMSNorm(nn.Module):
 
     def __init__(self, hidden_size, eps=1e-6):
         """
-        DeepseekV3RMSNorm is equivalent to T5LayerNorm
+        DeepseekV3RMSNorm is equivalent to T5LayerNorm.
+        Matches Megatron's RMSNorm: norm in fp32, cast back, then multiply by weight.
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -722,7 +723,7 @@ class DeepseekV3Attention(nn.Module):
                                 config.hidden_size,
                                 bias=config.attention_bias)
 
-        # QK layernorm (LayerNorm without bias on head_dim), matches Megatron's q_layernorm/k_layernorm
+        # QK RMSNorm on head_dim, matches Megatron's --qk-layernorm with --normalization RMSNorm
         self.q_layernorm = DeepseekV3RMSNorm(self.head_dim,
                                             eps=config.rms_norm_eps)
         self.k_layernorm = DeepseekV3RMSNorm(self.head_dim,
