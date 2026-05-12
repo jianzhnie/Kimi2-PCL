@@ -27,6 +27,16 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
 
+# Mapping from safetensors dtype string to element size in bytes
+DTYPE_SIZES: dict[str, int] = {
+    "F64": 8, "I64": 8,
+    "F32": 4, "I32": 4,
+    "F16": 2, "BF16": 2, "I16": 2,
+    "F8_E4M3": 1, "F8_E5M2": 1,
+    "F8_E4M3FN": 1, "F8_E5M2FN": 1,
+    "I8": 1, "U8": 1, "BOOL": 1,
+}
+
 
 def load_config(model_dir: Path) -> dict:
     with open(model_dir / "config.json") as f:
@@ -43,7 +53,8 @@ def load_index(model_dir: Path) -> dict:
 
 def get_layer_index(param_name: str) -> int | None:
     """Extract layer index from parameter name. Returns None for non-layer params."""
-    m = re.match(r"model\.layers\.(\d+)\.", param_name)
+    # Use search instead of match to handle potential prefixes like 'transformer.'
+    m = re.search(r"model\.layers\.(\d+)\.", param_name)
     if m:
         return int(m.group(1))
     return None
@@ -141,6 +152,33 @@ def auto_detect_shard_size(model_dir: Path, shard_files: list[str]) -> int:
     print("WARNING: No shard files found on disk. Using default 8GB target. "
           "Output shards will match this size, not necessarily the originals.")
     return 8 * 1024 ** 3
+
+
+def read_safetensors_header(path: Path) -> dict[str, int]:
+    """Read only the JSON header of a safetensors file, return {tensor_name: nbytes}.
+
+    The safetensors format is:
+        8 bytes: header_size (little-endian u64)
+        header_size bytes: JSON dict with keys → {dtype, shape, data_offsets}
+        remaining bytes: raw tensor data
+
+    This function reads only the header, not the tensor data, so it's fast
+    even for multi-GB files.
+    """
+    with open(path, "rb") as f:
+        header_size = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(header_size))
+
+    result: dict[str, int] = {}
+    for key, meta in header.items():
+        if key == "__metadata__":
+            continue
+        elem_size = DTYPE_SIZES[meta["dtype"]]
+        numel = 1
+        for dim in meta["shape"]:
+            numel *= dim
+        result[key] = elem_size * numel
+    return result
 
 
 def tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -247,11 +285,16 @@ def main():
     print(f"Found {len(shard_files)} shard files, {len(index['weight_map'])} parameters")
 
     # ── Update & write config ───────────────────────────────────────────
-    config["num_layers"] = original_layers * 2
+    updated_keys = []
+    for key in ["num_layers", "num_hidden_layers", "n_layers"]:
+        if key in config:
+            config[key] = original_layers * 2
+            updated_keys.append(key)
+    
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
-    print("Updated config.json written.")
+    print(f"Updated config.json written (keys updated: {', '.join(updated_keys) if updated_keys else 'none'}).")
 
     # ── Classify parameters ─────────────────────────────────────────────
     layer_params = set()
@@ -264,13 +307,54 @@ def main():
     print(f"Layer params (×2 after duplication): {len(layer_params)}")
     print(f"Non-layer params (unchanged):        {len(non_layer_params)}")
 
-    # ── Process shards ──────────────────────────────────────────────────
+    # ── Pass 1: scan headers to determine exact shard count ─────────────
+    # Read only safetensors headers (no tensor data) — fast and low-memory.
+    # We simulate shard filling with the same algorithm as Pass 2 so the
+    # predicted count matches exactly.
+    print("\nPass 1/2: Scanning headers to determine output layout...")
+    num_output_shards = 1
+    current_bytes = 0
+    total_original = 0
+    total_duplicated = 0
+    total_output_bytes = 0
+
+    for shard_file in tqdm(shard_files, desc="Scanning", unit="shard"):
+        shard_path = model_dir / shard_file
+        if not shard_path.exists():
+            tqdm.write(f"  WARNING: {shard_file} not found — skipping")
+            continue
+
+        header = read_safetensors_header(shard_path)
+        for key, nbytes in header.items():
+            # Original
+            if nbytes + current_bytes > target_size_bytes and current_bytes > 0:
+                num_output_shards += 1
+                current_bytes = 0
+            current_bytes += nbytes
+            total_output_bytes += nbytes
+            total_original += 1
+
+            # Duplicates
+            layer_idx = get_layer_index(key)
+            if layer_idx is not None and layer_idx < original_layers:
+                for _ in source_to_targets.get(layer_idx, []):
+                    if nbytes + current_bytes > target_size_bytes and current_bytes > 0:
+                        num_output_shards += 1
+                        current_bytes = 0
+                    current_bytes += nbytes
+                    total_output_bytes += nbytes
+                    total_duplicated += 1
+    print(f"Output plan: {total_original:,} original + {total_duplicated:,} duplicated "
+          f"= {total_original + total_duplicated:,} tensors")
+    print(f"Total output size: {total_output_bytes / 1e9:.2f} GB "
+          f"across {num_output_shards} shard(s) "
+          f"(~{total_output_bytes / num_output_shards / 1e9:.2f} GB each)")
+
+    # ── Pass 2: actual tensor processing ────────────────────────────────
     new_weight_map: dict[str, str] = {}
     output_shard_idx = 1
     current_tensors: dict[str, torch.Tensor] = {}
     current_bytes = 0
-    total_original = 0
-    total_duplicated = 0
 
     def flush_shard():
         """Write accumulated tensors to an output shard, then clear the buffer."""
@@ -278,11 +362,12 @@ def main():
         if not current_tensors:
             return
 
-        shard_name = f"model_{output_shard_idx:05d}-of-XXXXX.safetensors"
+        shard_name = f"model_{output_shard_idx:05d}-of-{num_output_shards:05d}.safetensors"
         output_path = output_dir / shard_name
         n_tensors = len(current_tensors)
         size_gb = current_bytes / 1e9
-        print(f"  Writing shard #{output_shard_idx}: {n_tensors} tensors ({size_gb:.2f} GB)")
+        print(f"  Writing shard #{output_shard_idx}/{num_output_shards}: "
+              f"{n_tensors} tensors ({size_gb:.2f} GB)")
         save_file(current_tensors, str(output_path))
 
         for t_name in current_tensors:
@@ -292,7 +377,7 @@ def main():
         current_tensors.clear()
         current_bytes = 0
 
-    print("\nProcessing shards...")
+    print("\nPass 2/2: Loading tensors and writing shards...")
     for shard_file in tqdm(shard_files, desc="Input shards", unit="shard"):
         shard_path = model_dir / shard_file
         if not shard_path.exists():
@@ -310,7 +395,6 @@ def main():
 
                 current_tensors[key] = tensor
                 current_bytes += nbytes
-                total_original += 1
 
                 # ── Duplicated layer parameter ──────────────────────────
                 layer_idx = get_layer_index(key)
@@ -323,32 +407,39 @@ def main():
 
                         current_tensors[dup_key] = tensor.clone()
                         current_bytes += nbytes
-                        total_duplicated += 1
 
     # Flush remaining tensors
     flush_shard()
 
-    num_output_shards = output_shard_idx - 1
-    print(f"\nOriginal parameters:  {total_original}")
-    print(f"Duplicated parameters: {total_duplicated}")
-    print(f"Output shards:         {num_output_shards}")
+    actual_shards = output_shard_idx - 1
+    if actual_shards != num_output_shards:
+        print(f"WARNING: Predicted {num_output_shards} shards but wrote {actual_shards}. "
+              f"Adjusting index...")
+        # Fix up shard file names and the count for the index
+        for i in range(1, actual_shards + 1):
+            old_name = output_dir / f"model_{i:05d}-of-{num_output_shards:05d}.safetensors"
+            new_name = output_dir / f"model_{i:05d}-of-{actual_shards:05d}.safetensors"
+            if old_name.exists() and old_name != new_name:
+                old_name.rename(new_name)
+        num_output_shards = actual_shards
 
-    # ── Rename shard files with correct count ───────────────────────────
-    print("\nFinalizing shard file names...")
-    for i in range(1, num_output_shards + 1):
-        old = output_dir / f"model_{i:05d}-of-XXXXX.safetensors"
-        new = output_dir / f"model_{i:05d}-of-{num_output_shards:05d}.safetensors"
-        if old.exists():
-            old.rename(new)
+    print(f"\nOutput shards: {actual_shards}")
 
-    # Fix weight map with correct total count
+    # Build final weight map with correct count
     fixed_weight_map: dict[str, str] = {}
     for pname, sname in new_weight_map.items():
-        fixed_weight_map[pname] = sname.replace("-of-XXXXX", f"-of-{num_output_shards:05d}")
+        fixed_weight_map[pname] = re.sub(
+            r"-of-\d+\.safetensors",
+            f"-of-{num_output_shards:05d}.safetensors",
+            sname,
+        )
 
     # ── Write new index ──────────────────────────────────────────────────
+    new_metadata = {**index.get("metadata", {})}
+    if "total_size" in new_metadata:
+        new_metadata["total_size"] = total_output_bytes
     new_index = {
-        "metadata": index.get("metadata", {}),
+        "metadata": new_metadata,
         "weight_map": fixed_weight_map,
     }
     with open(output_dir / "model.safetensors.index.json", "w") as f:
