@@ -39,7 +39,7 @@ MMLU 是衡量语言模型综合理解能力的核心基准，涵盖了从基础
 | **Step 10000**            | **35.06**          | vLLM          |
 | **Step 12700**            | 38.94              | MindSpeed-LLM |
 | **Stage2 CPT (Step 550)** | 44.45              | MindSpeed-LLM |
-| **Stage2 CPT (Step 550)** | -                  | vLLM          |
+| **Stage2 CPT (Step 550)** | 36.38              | vLLM          |
 
 
 > **数据说明**：
@@ -218,7 +218,7 @@ Wikitext-2 数据集用于评估模型对高质量维基百科文本的语言建
 
 ### 附录 B: MMLU 5-shot 详细结果
 
-### Step 10000
+#### Step 10000
 
 | 任务 (Task)        | 准确率 (acc) ↑ | 标准误差 (acc_stderr) |
 | :----------------- | :------------- | :-------------------- |
@@ -227,6 +227,16 @@ Wikitext-2 数据集用于评估模型对高质量维基百科文本的语言建
 | - Social Sciences  | 37.60          | 0.87                  |
 | - STEM             | 32.79          | 0.83                  |
 | - Other            | 39.72          | 0.87                  |
+
+#### Stage2 CPT (Step 550)
+
+| Groups            | Version | Filter | n-shot | Metric |  Value   | Stderr |
+| :---------------- | :-----: | :----- | :----- | :----- | :------: | :----: |
+| mmlu              |    2    | none   |        | acc ↑  | 0.3638 ± | 0.0040 |
+| - humanities      |    2    | none   |        | acc ↑  | 0.3296 ± | 0.0067 |
+| - other           |    2    | none   |        | acc ↑  | 0.4123 ± | 0.0087 |
+| - social sciences |    2    | none   |        | acc ↑  | 0.3975 ± | 0.0088 |
+| - stem            |    2    | none   |        | acc ↑  | 0.3343 ± | 0.0084 |
 
 ### 附录 C: Wikitext-2 详细结果
 
