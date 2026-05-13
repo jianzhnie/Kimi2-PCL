@@ -68,6 +68,10 @@ class TestDoubleHfModelLayers(unittest.TestCase):
             shutil.rmtree(self.test_dir)
 
     def test_double_layers_sequential(self):
+        # Get original shard sizes
+        orig_shard_sizes = {f.name: f.stat().st_size for f in self.model_dir.glob("*.safetensors")}
+        avg_orig_size = sum(orig_shard_sizes.values()) / len(orig_shard_sizes)
+
         # Run expansion script (2 -> 4 layers, sequential)
         sys.argv = [
             "expand_model_layers.py",
@@ -90,21 +94,39 @@ class TestDoubleHfModelLayers(unittest.TestCase):
         # New layers: layer2(copy 0) + layer3(copy 1) = 4 params
         # Total: 10 params
         self.assertEqual(len(new_index["weight_map"]), 10)
+
+        # Verify total_size in metadata
+        with open(self.model_dir / "model.safetensors.index.json") as f:
+            old_index = json.load(f)
         
-        # 3. Verify weights
+        # We don't have total_size set in setUp correctly for dummy, but let's check if it exists in output
+        self.assertIn("total_size", new_index["metadata"])
+        # The script calculates total_size from Pass 1.
+        
+        # 3. Verify shard file sizes
+        # In the script, target_size_bytes is detected from original shards.
+        # Since our dummy shards are tiny, the script will likely put multiple tensors per shard
+        # but try to respect the detected average size if it's large. 
+        # For small files, it usually results in fewer shards or similar sizes.
+        new_shards = list(self.output_dir.glob("*.safetensors"))
+        for shard in new_shards:
+            # Check if shard size is reasonable (not 0)
+            self.assertGreater(shard.stat().st_size, 0)
+        
+        # 4. Verify weights
         all_weights = {}
         for shard_name in set(new_index["weight_map"].values()):
             all_weights.update(load_file(str(self.output_dir / shard_name)))
             
-        # Check layers 0-1 (unchanged)
-        torch.testing.assert_close(all_weights["model.layers.0.input_layernorm.weight"], torch.full((16,), 0.0))
-        torch.testing.assert_close(all_weights["model.layers.1.input_layernorm.weight"], torch.full((16,), 1.0))
+        # Check layers 0-1 (unchanged values)
+        torch.testing.assert_close(all_weights["model.layers.0.input_layernorm.weight"], self.weights["model.layers.0.input_layernorm.weight"])
+        torch.testing.assert_close(all_weights["model.layers.1.input_layernorm.weight"], self.weights["model.layers.1.input_layernorm.weight"])
         
-        # Check layers 2-3 (duplicated)
+        # Check layers 2-3 (duplicated values)
         # Layer 2 should copy Layer 0
-        torch.testing.assert_close(all_weights["model.layers.2.input_layernorm.weight"], torch.full((16,), 0.0))
+        torch.testing.assert_close(all_weights["model.layers.2.input_layernorm.weight"], self.weights["model.layers.0.input_layernorm.weight"])
         # Layer 3 should copy Layer 1
-        torch.testing.assert_close(all_weights["model.layers.3.input_layernorm.weight"], torch.full((16,), 1.0))
+        torch.testing.assert_close(all_weights["model.layers.3.input_layernorm.weight"], self.weights["model.layers.1.input_layernorm.weight"])
 
     def test_double_layers_custom_copy(self):
         # Run expansion script (2 -> 4 layers, all copy layer 1)

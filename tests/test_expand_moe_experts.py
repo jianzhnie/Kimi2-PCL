@@ -74,6 +74,9 @@ class TestExpandMoeExperts(unittest.TestCase):
             shutil.rmtree(self.test_dir)
 
     def test_expansion(self):
+        # Get original shard sizes
+        orig_shard_sizes = {f.name: f.stat().st_size for f in self.model_dir.glob("*.safetensors")}
+
         # Run expansion script (4 -> 8 experts)
         sys.argv = [
             "expand_moe_experts.py",
@@ -97,8 +100,17 @@ class TestExpandMoeExperts(unittest.TestCase):
         # New: experts(4*3=12)
         # Total: 16 + 12 = 28
         self.assertEqual(len(new_index["weight_map"]), 28)
+
+        # Verify total_size in metadata
+        self.assertIn("total_size", new_index["metadata"])
+        self.assertGreater(new_index["metadata"]["total_size"], 0)
         
-        # 3. Verify weights
+        # 3. Verify shard file sizes
+        new_shards = list(self.output_dir.glob("*.safetensors"))
+        for shard in new_shards:
+            self.assertGreater(shard.stat().st_size, 0)
+
+        # 4. Verify weights
         all_weights = {}
         for shard_name in set(new_index["weight_map"].values()):
             all_weights.update(load_file(str(self.output_dir / shard_name)))
