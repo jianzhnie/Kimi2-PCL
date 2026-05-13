@@ -74,8 +74,6 @@ class TestExpandMoeExperts(unittest.TestCase):
             shutil.rmtree(self.test_dir)
 
     def test_expansion(self):
-
-
         # Calculate original parameter sizes
         orig_expert_size = 0
         orig_router_size = 0
