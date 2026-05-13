@@ -73,6 +73,31 @@ class ModelWeightLoader:
         return self.shards[shard_name].get_tensor(name)
 
 
+def set_layer_index(param_name: str, new_index: int) -> str:
+    """Change the layer index in a parameter name. e.g. model.layers.0.xxx → model.layers.5.xxx"""
+    return re.sub(
+        r"model\.layers\.(\d+)\.",
+        f"model.layers.{new_index}.",
+        param_name,
+    )
+
+
+def verify_non_layer_params(orig_loader, exp_loader):
+    print("\nVerifying non-layer parameters (Embedding, Final Norm, etc.)")
+    mismatches = []
+    non_layer_params = [k for k in orig_loader.weight_map.keys() if get_layer_index(k) is None]
+    
+    for name in tqdm(non_layer_params, desc="Non-layer Params"):
+        t_orig = orig_loader.get_tensor(name)
+        t_exp = exp_loader.get_tensor(name)
+        
+        if t_exp is None:
+            mismatches.append(f"Missing in expanded: {name}")
+        elif not torch.equal(t_orig, t_exp):
+            mismatches.append(f"Value mismatch: {name}")
+    return mismatches
+
+
 def verify_layers(orig_loader, exp_loader, original_layers, target_layers, copy_source):
     print(f"\nVerifying Layer Expansion: {original_layers} -> {target_layers}")
     
@@ -85,11 +110,13 @@ def verify_layers(orig_loader, exp_loader, original_layers, target_layers, copy_
     else:
         mapping = [int(copy_source)] * num_new
     
-    # 2. Check original layers (0 to original_layers-1)
-    print(f"Checking original layers [0, {original_layers})...")
     mismatches = []
     
-    # Get all layer params from original model
+    # 2. Check non-layer params first
+    mismatches.extend(verify_non_layer_params(orig_loader, exp_loader))
+    
+    # 3. Check original layers (0 to original_layers-1)
+    print(f"Checking original layers [0, {original_layers})...")
     orig_params = [k for k in orig_loader.weight_map.keys() if get_layer_index(k) is not None]
     
     for name in tqdm(orig_params, desc="Original Layers"):
@@ -104,17 +131,16 @@ def verify_layers(orig_loader, exp_loader, original_layers, target_layers, copy_
         elif not torch.equal(t_orig, t_exp):
             mismatches.append(f"Value mismatch: {name}")
 
-    # 3. Check new layers (original_layers to target_layers-1)
+    # 4. Check new layers (original_layers to target_layers-1)
     print(f"Checking expanded layers [{original_layers}, {target_layers})...")
     for i, src_idx in enumerate(tqdm(mapping, desc="Expanded Layers")):
         new_idx = original_layers + i
         
-        # Find all params for the source layer
         src_prefix = f"model.layers.{src_idx}."
         src_params = [k for k in orig_loader.weight_map.keys() if k.startswith(src_prefix)]
         
         for src_name in src_params:
-            exp_name = src_name.replace(f"model.layers.{src_idx}.", f"model.layers.{new_idx}.")
+            exp_name = set_layer_index(src_name, new_idx)
             
             t_src = orig_loader.get_tensor(src_name)
             t_exp = exp_loader.get_tensor(exp_name)
@@ -143,8 +169,23 @@ def verify_experts(orig_loader, exp_loader):
     
     mismatches = []
     expansion_factor = exp_experts // orig_experts
+
+    # 1. Check all parameters that are NOT experts or routers (Attention, Norms, Embedding, etc.)
+    print("Checking non-expert/non-router parameters...")
+    all_orig_params = orig_loader.weight_map.keys()
+    for name in tqdm(all_orig_params, desc="General Params"):
+        if get_expert_info(name) is not None or is_router_param(name):
+            continue
+            
+        t_orig = orig_loader.get_tensor(name)
+        t_exp = exp_loader.get_tensor(name)
+        
+        if t_exp is None:
+            mismatches.append(f"Missing in expanded: {name}")
+        elif not torch.equal(t_orig, t_exp):
+            mismatches.append(f"Value mismatch: {name}")
     
-    # 1. Check experts
+    # 2. Check experts
     expert_params = [k for k in orig_loader.weight_map.keys() if get_expert_info(k) is not None]
     
     for name in tqdm(expert_params, desc="Experts"):
@@ -152,28 +193,24 @@ def verify_experts(orig_loader, exp_loader):
         t_orig = orig_loader.get_tensor(name)
         
         if e_idx < orig_experts:
-            # Routed expert
-            # Check original position
-            t_exp = exp_loader.get_tensor(name)
-            if t_exp is None or not torch.equal(t_orig, t_exp):
-                mismatches.append(f"Value mismatch: {name}")
-            
-            # Check copies
-            for f in range(1, expansion_factor):
-                dup_idx = e_idx + f * orig_experts
-                dup_name = f"model.layers.{l_idx}.mlp.experts.{dup_idx}.{rest}"
-                t_dup = exp_loader.get_tensor(dup_name)
-                if t_dup is None or not torch.equal(t_orig, t_dup):
-                    mismatches.append(f"Value mismatch: {dup_name} (should match {name})")
+            # Routed expert: Check original position and all duplicated copies
+            for f in range(expansion_factor):
+                target_idx = e_idx + f * orig_experts
+                target_name = f"model.layers.{l_idx}.mlp.experts.{target_idx}.{rest}"
+                t_exp = exp_loader.get_tensor(target_name)
+                if t_exp is None:
+                    mismatches.append(f"Missing in expanded: {target_name}")
+                elif not torch.equal(t_orig, t_exp):
+                    mismatches.append(f"Value mismatch: {target_name} (should match original expert {e_idx})")
         else:
-            # Zero-shot expert
+            # Zero-shot expert: Check shifted position
             new_e_idx = e_idx + (exp_experts - orig_experts)
             new_name = f"model.layers.{l_idx}.mlp.experts.{new_e_idx}.{rest}"
             t_exp = exp_loader.get_tensor(new_name)
             if t_exp is None or not torch.equal(t_orig, t_exp):
-                mismatches.append(f"Value mismatch: {new_name} (should match original {name})")
+                mismatches.append(f"Value mismatch: {new_name} (should match original zero-shot expert {e_idx})")
 
-    # 2. Check routers
+    # 3. Check routers
     router_params = [k for k in orig_loader.weight_map.keys() if is_router_param(k)]
     for name in tqdm(router_params, desc="Routers"):
         t_orig = orig_loader.get_tensor(name)
@@ -184,7 +221,7 @@ def verify_experts(orig_loader, exp_loader):
             continue
             
         # Router has shape [num_routed + zero, hidden]
-        # Real experts part
+        # Check expanded real experts part
         real_orig = t_orig[:orig_experts]
         real_exp = t_exp[:exp_experts]
         
@@ -193,7 +230,7 @@ def verify_experts(orig_loader, exp_loader):
             if not torch.equal(real_orig, part):
                 mismatches.append(f"Router value mismatch in real part (factor {f}): {name}")
         
-        # Zero experts part
+        # Check zero experts part (should be at the end)
         if zero_experts > 0:
             zero_orig = t_orig[orig_experts:]
             zero_exp = t_exp[exp_experts:]
