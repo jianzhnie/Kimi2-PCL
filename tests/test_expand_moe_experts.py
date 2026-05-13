@@ -332,5 +332,64 @@ class TestExpandMoeExperts(unittest.TestCase):
             new_config = json.load(f)
         self.assertEqual(new_config["moe_topk"], 16)
 
+    def test_expansion_with_zero_experts_parameters(self):
+        # 1. Create config with zero_expert_num
+        config = {
+            "model_type": "longcat",
+            "n_routed_experts": 4,
+            "zero_expert_num": 2,
+            "hidden_size": 16,
+            "num_layers": 1
+        }
+        with open(self.model_dir / "config.json", "w") as f:
+            json.dump(config, f)
+
+        # 2. Create weights (router dim = 4 + 2 = 6)
+        weights = {
+            "model.embed_tokens.weight": torch.randn(100, 16),
+            "model.layers.0.mlp.router.classifier.weight": torch.randn(6, 16),
+            "model.layers.0.mlp.router.e_score_correction_bias": torch.randn(6),
+            "model.norm.weight": torch.randn(16),
+        }
+        # Experts: 4 real + 2 zero-shot = 6 total
+        for i in range(6):
+            weights[f"model.layers.0.mlp.experts.{i}.gate_proj.weight"] = torch.full((32, 16), float(i))
+
+        # Save weights and index
+        save_file(weights, str(self.model_dir / "model.safetensors"))
+        index = {
+            "metadata": {"total_size": 0},
+            "weight_map": {k: "model.safetensors" for k in weights}
+        }
+        with open(self.model_dir / "model.safetensors.index.json", "w") as f:
+            json.dump(index, f)
+
+        # 3. Run expansion (4 -> 8 experts)
+        sys.argv = [
+            "expand_moe_experts.py",
+            "--model_dir", str(self.model_dir),
+            "--output_dir", str(self.output_dir),
+            "--target_experts", "8"
+        ]
+        expand_main()
+
+        # 4. Verify
+        with open(self.output_dir / "model.safetensors.index.json") as f:
+            new_index = json.load(f)
+        
+        all_weights = {}
+        for shard_name in set(new_index["weight_map"].values()):
+            all_weights.update(load_file(str(self.output_dir / shard_name)))
+        
+        # Original zero-shot experts (4, 5) should be moved to (8, 9)
+        # because routed experts expanded from 4 to 8.
+        self.assertIn("model.layers.0.mlp.experts.8.gate_proj.weight", all_weights)
+        self.assertIn("model.layers.0.mlp.experts.9.gate_proj.weight", all_weights)
+        torch.testing.assert_close(all_weights["model.layers.0.mlp.experts.8.gate_proj.weight"], torch.full((32, 16), 4.0))
+        torch.testing.assert_close(all_weights["model.layers.0.mlp.experts.9.gate_proj.weight"], torch.full((32, 16), 5.0))
+        
+        # Expert 4 is now a routed expert (copy of 0)
+        torch.testing.assert_close(all_weights["model.layers.0.mlp.experts.4.gate_proj.weight"], torch.full((32, 16), 0.0))
+
 if __name__ == "__main__":
     unittest.main()

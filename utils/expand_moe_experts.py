@@ -103,8 +103,11 @@ def build_expert_target_map(
     return dict(targets)
 
 
-def validate_expert_layout(index: dict, original_experts: int) -> dict[int, list[int]]:
-    """Validate that each MoE layer has contiguous expert indices [0, original_experts)."""
+def validate_expert_layout(index: dict, original_experts: int, zero_expert_num: int) -> dict[int, list[int]]:
+    """Validate that each MoE layer has contiguous expert indices.
+    
+    Expected: [0, original_experts) or [0, original_experts + zero_expert_num).
+    """
     experts_by_layer: dict[int, set[int]] = defaultdict(set)
     for param_name in index["weight_map"]:
         info = get_expert_info(param_name)
@@ -121,15 +124,17 @@ def validate_expert_layout(index: dict, original_experts: int) -> dict[int, list
         )
         sys.exit(1)
 
-    expected = list(range(original_experts))
+    expected_routed = list(range(original_experts))
+    expected_total = list(range(original_experts + zero_expert_num))
+    
     validated: dict[int, list[int]] = {}
     for layer_idx, expert_indices in sorted(experts_by_layer.items()):
         actual = sorted(expert_indices)
-        if actual != expected:
+        if actual != expected_routed and actual != expected_total:
             print(
                 f"ERROR: Layer {layer_idx} has expert indices {actual[:8]}"
                 f"{'...' if len(actual) > 8 else ''}, but expected contiguous "
-                f"indices 0-{original_experts - 1}.",
+                f"indices 0-{original_experts - 1} or 0-{original_experts + zero_expert_num - 1}.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -270,7 +275,7 @@ def main():
         print(f"Zero experts: {zero_expert_num} (identity pass-through, router dim: {total_routed})")
 
     shard_files = sorted(set(index["weight_map"].values()))
-    experts_by_layer = validate_expert_layout(index, original_experts)
+    experts_by_layer = validate_expert_layout(index, original_experts, zero_expert_num)
     source_to_targets = build_expert_target_map(original_experts, target_experts)
     print(f"Detected {len(experts_by_layer)} MoE layer(s) with {original_experts} experts each")
 
@@ -416,17 +421,26 @@ def main():
                 
                 elif info := get_expert_info(key):
                     layer_idx, expert_idx, rest = info
-                    # Keep the original expert and add only the new expert copies.
-                    if current_bytes + nbytes > target_shard_size and current_tensors:
-                        flush_shard()
-                    current_tensors[key] = tensor
-                    current_bytes += nbytes
+                    if expert_idx < original_experts:
+                        # Routed expert: keep original and add copies
+                        if current_bytes + nbytes > target_shard_size and current_tensors:
+                            flush_shard()
+                        current_tensors[key] = tensor
+                        current_bytes += nbytes
 
-                    for new_expert_idx in source_to_targets.get(expert_idx, []):
+                        for new_expert_idx in source_to_targets.get(expert_idx, []):
+                            new_key = f"model.layers.{layer_idx}.mlp.experts.{new_expert_idx}.{rest}"
+                            if current_bytes + nbytes > target_shard_size and current_tensors:
+                                flush_shard()
+                            current_tensors[new_key] = tensor.clone()
+                            current_bytes += nbytes
+                    else:
+                        # Zero-shot expert: shift to new indices after expanded routed experts
+                        new_expert_idx = expert_idx + (target_experts - original_experts)
                         new_key = f"model.layers.{layer_idx}.mlp.experts.{new_expert_idx}.{rest}"
                         if current_bytes + nbytes > target_shard_size and current_tensors:
                             flush_shard()
-                        current_tensors[new_key] = tensor.clone()
+                        current_tensors[new_key] = tensor
                         current_bytes += nbytes
                 
                 else:

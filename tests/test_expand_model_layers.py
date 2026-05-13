@@ -70,7 +70,7 @@ class TestDoubleHfModelLayers(unittest.TestCase):
     def test_double_layers_sequential(self):
         # Run expansion script (2 -> 4 layers, sequential)
         sys.argv = [
-            "double_hf_model_layers.py",
+            "expand_model_layers.py",
             "--model_dir", str(self.model_dir),
             "--output_dir", str(self.output_dir),
             "--original_layers", "2"
@@ -109,7 +109,7 @@ class TestDoubleHfModelLayers(unittest.TestCase):
     def test_double_layers_custom_copy(self):
         # Run expansion script (2 -> 4 layers, all copy layer 1)
         sys.argv = [
-            "double_hf_model_layers.py",
+            "expand_model_layers.py",
             "--model_dir", str(self.model_dir),
             "--output_dir", str(self.output_dir),
             "--original_layers", "2",
@@ -129,7 +129,7 @@ class TestDoubleHfModelLayers(unittest.TestCase):
 
     def test_double_layers_explicit_copy_list(self):
         sys.argv = [
-            "double_hf_model_layers.py",
+            "expand_model_layers.py",
             "--model_dir", str(self.model_dir),
             "--output_dir", str(self.output_dir),
             "--original_layers", "2",
@@ -148,7 +148,7 @@ class TestDoubleHfModelLayers(unittest.TestCase):
 
     def test_double_layers_rejects_out_of_range_copy_source(self):
         sys.argv = [
-            "double_hf_model_layers.py",
+            "expand_model_layers.py",
             "--model_dir", str(self.model_dir),
             "--output_dir", str(self.output_dir),
             "--original_layers", "2",
