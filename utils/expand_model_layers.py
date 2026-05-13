@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Double the number of transformer layers in a sharded safetensors model.
+Expand the number of transformer layers in a sharded safetensors model.
 
-For a model with 28 layers, creates a 56-layer version by:
-1. Keeping original layers 0-27 unchanged
-2. Duplicating them as layers 28-55, with configurable source mapping
+Keeps original layers 0 through N-1 unchanged, then creates new layers by
+duplicating selected original layers with configurable source mapping.
 
 Copy modes (--copy_source):
-  (default)  new layer N copies from layer N-28  (sequential: 28←0, 29←1, …)
+  (default)  sequential: new layer i copies from layer (i mod N)
   5          all new layers copy from layer 5
-  0,0,1,1,…  comma-separated list of 28 source indices, one per new layer
+  0,0,1,1,…  comma-separated list of source indices, one per new layer
 
 Processes shards one at a time to keep memory usage manageable.
 """

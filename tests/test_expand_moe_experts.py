@@ -74,8 +74,20 @@ class TestExpandMoeExperts(unittest.TestCase):
             shutil.rmtree(self.test_dir)
 
     def test_expansion(self):
-        # Get original shard sizes
-        orig_shard_sizes = {f.name: f.stat().st_size for f in self.model_dir.glob("*.safetensors")}
+
+
+        # Calculate original parameter sizes
+        orig_expert_size = 0
+        orig_router_size = 0
+        orig_other_size = 0
+        for k, v in self.weights.items():
+            nbytes = v.element_size() * v.nelement()
+            if "mlp.experts." in k:
+                orig_expert_size += nbytes
+            elif "mlp.router." in k:
+                orig_router_size += nbytes
+            else:
+                orig_other_size += nbytes
 
         # Run expansion script (4 -> 8 experts)
         sys.argv = [
@@ -91,50 +103,43 @@ class TestExpandMoeExperts(unittest.TestCase):
             new_config = json.load(f)
         self.assertEqual(new_config["n_routed_experts"], 8)
         
-        # 2. Verify index
+        # 2. Verify index and Total Size
         with open(self.output_dir / "model.safetensors.index.json") as f:
             new_index = json.load(f)
         
-        # Should have original + 4*3 new expert weights
-        # Original: embed(1) + router_w(1) + router_b(1) + norm(1) + experts(4*3=12) = 16
-        # New: experts(4*3=12)
-        # Total: 16 + 12 = 28
-        self.assertEqual(len(new_index["weight_map"]), 28)
-
-        # Verify total_size in metadata
-        self.assertIn("total_size", new_index["metadata"])
-        self.assertGreater(new_index["metadata"]["total_size"], 0)
+        # New expert size = 2 * original
+        # New router size = 2 * original (since 4 -> 8 experts, router dim doubles)
+        expected_total_size = orig_other_size + (8 // 4) * orig_expert_size + (8 // 4) * orig_router_size
+        self.assertEqual(new_index["metadata"]["total_size"], expected_total_size)
         
-        # 3. Verify shard file sizes
-        new_shards = list(self.output_dir.glob("*.safetensors"))
-        for shard in new_shards:
-            self.assertGreater(shard.stat().st_size, 0)
-
-        # 4. Verify weights
+        # 3. Verify weights (Exact consistency)
         all_weights = {}
         for shard_name in set(new_index["weight_map"].values()):
             all_weights.update(load_file(str(self.output_dir / shard_name)))
             
         # Check router expansion
-        self.assertEqual(all_weights["model.layers.0.mlp.router.classifier.weight"].shape, (8, 16))
-        self.assertEqual(all_weights["model.layers.0.mlp.router.e_score_correction_bias"].shape, (8,))
-        
-        # Check router weight identity (first 4 should match last 4)
         orig_router_w = self.weights["model.layers.0.mlp.router.classifier.weight"]
         new_router_w = all_weights["model.layers.0.mlp.router.classifier.weight"]
-        torch.testing.assert_close(new_router_w[:4], orig_router_w)
-        torch.testing.assert_close(new_router_w[4:], orig_router_w)
+        self.assertTrue(torch.equal(new_router_w[:4], orig_router_w))
+        self.assertTrue(torch.equal(new_router_w[4:], orig_router_w))
         
         # Check expert duplication
         for i in range(4):
-            orig_val = float(i)
-            # Original expert
-            torch.testing.assert_close(all_weights[f"model.layers.0.mlp.experts.{i}.gate_proj.weight"], torch.full((32, 16), orig_val))
-            # New expert (i+4)
-            torch.testing.assert_close(all_weights[f"model.layers.0.mlp.experts.{i+4}.gate_proj.weight"], torch.full((32, 16), orig_val))
+            orig_key = f"model.layers.0.mlp.experts.{i}.gate_proj.weight"
+            new_key = f"model.layers.0.mlp.experts.{i+4}.gate_proj.weight"
+            self.assertTrue(torch.equal(all_weights[new_key], self.weights[orig_key]))
 
-        for shard_name in set(new_index["weight_map"].values()):
-            self.assertTrue((self.output_dir / shard_name).exists())
+    def test_expansion_ratio_and_invalid_multiple(self):
+        """Test that script rejects target_experts that is not a multiple of original."""
+        sys.argv = [
+            "expand_moe_experts.py",
+            "--model_dir", str(self.model_dir),
+            "--output_dir", str(self.output_dir),
+            "--target_experts", "6" # 6 is not a multiple of 4
+        ]
+        with self.assertRaises(SystemExit) as exc:
+            expand_main()
+        self.assertEqual(exc.exception.code, 1)
 
     def test_expansion_with_gate_router_and_n_experts_key(self):
         shutil.rmtree(self.test_dir)
@@ -395,13 +400,17 @@ class TestExpandMoeExperts(unittest.TestCase):
         
         # Original zero-shot experts (4, 5) should be moved to (8, 9)
         # because routed experts expanded from 4 to 8.
-        self.assertIn("model.layers.0.mlp.experts.8.gate_proj.weight", all_weights)
-        self.assertIn("model.layers.0.mlp.experts.9.gate_proj.weight", all_weights)
-        torch.testing.assert_close(all_weights["model.layers.0.mlp.experts.8.gate_proj.weight"], torch.full((32, 16), 4.0))
-        torch.testing.assert_close(all_weights["model.layers.0.mlp.experts.9.gate_proj.weight"], torch.full((32, 16), 5.0))
+        # Check consistency: all_weights[new_key] must be EXACTLY weights[old_key]
+        for old_idx, new_idx in [(4, 8), (5, 9)]:
+            old_key = f"model.layers.0.mlp.experts.{old_idx}.gate_proj.weight"
+            new_key = f"model.layers.0.mlp.experts.{new_idx}.gate_proj.weight"
+            self.assertIn(new_key, all_weights)
+            self.assertTrue(torch.equal(all_weights[new_key], weights[old_key]), 
+                            f"Zero-shot expert weight mismatch: {new_key} vs {old_key}")
         
         # Expert 4 is now a routed expert (copy of 0)
-        torch.testing.assert_close(all_weights["model.layers.0.mlp.experts.4.gate_proj.weight"], torch.full((32, 16), 0.0))
+        self.assertTrue(torch.equal(all_weights["model.layers.0.mlp.experts.4.gate_proj.weight"], 
+                                   weights["model.layers.0.mlp.experts.0.gate_proj.weight"]))
 
 if __name__ == "__main__":
     unittest.main()

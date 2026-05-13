@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import unittest
+import re
 from pathlib import Path
 import sys
 
@@ -68,16 +69,23 @@ class TestDoubleHfModelLayers(unittest.TestCase):
             shutil.rmtree(self.test_dir)
 
     def test_double_layers_sequential(self):
-        # Get original shard sizes
-        orig_shard_sizes = {f.name: f.stat().st_size for f in self.model_dir.glob("*.safetensors")}
-        avg_orig_size = sum(orig_shard_sizes.values()) / len(orig_shard_sizes)
-
+        # Calculate original parameter sizes
+        orig_layer_size = 0
+        orig_non_layer_size = 0
+        for k, v in self.weights.items():
+            nbytes = v.element_size() * v.nelement()
+            if "model.layers." in k:
+                orig_layer_size += nbytes
+            else:
+                orig_non_layer_size += nbytes
+        
         # Run expansion script (2 -> 4 layers, sequential)
         sys.argv = [
             "expand_model_layers.py",
             "--model_dir", str(self.model_dir),
             "--output_dir", str(self.output_dir),
-            "--original_layers", "2"
+            "--original_layers", "2",
+            "--target_layers", "4"
         ]
         double_main()
         
@@ -86,47 +94,50 @@ class TestDoubleHfModelLayers(unittest.TestCase):
             new_config = json.load(f)
         self.assertEqual(new_config["num_layers"], 4)
         
-        # 2. Verify index
+        # 2. Verify index and Total Size
         with open(self.output_dir / "model.safetensors.index.json") as f:
             new_index = json.load(f)
         
-        # Original: embed(1) + layer0(2) + layer1(2) + norm(1) = 6 params
-        # New layers: layer2(copy 0) + layer3(copy 1) = 4 params
-        # Total: 10 params
-        self.assertEqual(len(new_index["weight_map"]), 10)
-
-        # Verify total_size in metadata
-        with open(self.model_dir / "model.safetensors.index.json") as f:
-            old_index = json.load(f)
+        # Expected size: non_layer + (4/2) * layer_size
+        expected_total_size = orig_non_layer_size + (4 // 2) * orig_layer_size
+        self.assertEqual(new_index["metadata"]["total_size"], expected_total_size)
         
-        # We don't have total_size set in setUp correctly for dummy, but let's check if it exists in output
-        self.assertIn("total_size", new_index["metadata"])
-        # The script calculates total_size from Pass 1.
-        
-        # 3. Verify shard file sizes
-        # In the script, target_size_bytes is detected from original shards.
-        # Since our dummy shards are tiny, the script will likely put multiple tensors per shard
-        # but try to respect the detected average size if it's large. 
-        # For small files, it usually results in fewer shards or similar sizes.
-        new_shards = list(self.output_dir.glob("*.safetensors"))
-        for shard in new_shards:
-            # Check if shard size is reasonable (not 0)
-            self.assertGreater(shard.stat().st_size, 0)
-        
-        # 4. Verify weights
+        # 3. Verify weight values (Exact consistency)
         all_weights = {}
         for shard_name in set(new_index["weight_map"].values()):
             all_weights.update(load_file(str(self.output_dir / shard_name)))
             
-        # Check layers 0-1 (unchanged values)
-        torch.testing.assert_close(all_weights["model.layers.0.input_layernorm.weight"], self.weights["model.layers.0.input_layernorm.weight"])
-        torch.testing.assert_close(all_weights["model.layers.1.input_layernorm.weight"], self.weights["model.layers.1.input_layernorm.weight"])
+        # Check all layers (0-3)
+        for li in range(4):
+            src_li = li % 2 # Sequential mode: 0,1 unchanged, 2 copies 0, 3 copies 1
+            for suffix in ["input_layernorm.weight", "mlp.gate_proj.weight"]:
+                key = f"model.layers.{li}.{suffix}"
+                src_key = f"model.layers.{src_li}.{suffix}"
+                torch.testing.assert_close(all_weights[key], self.weights[src_key])
+                # Ensure it's exactly the same data
+                self.assertTrue(torch.equal(all_weights[key], self.weights[src_key]))
+
+    def test_expansion_ratio_and_target_layers(self):
+        """Test with target_layers=6 (3x expansion of layers)"""
+        sys.argv = [
+            "expand_model_layers.py",
+            "--model_dir", str(self.model_dir),
+            "--output_dir", str(self.output_dir),
+            "--original_layers", "2",
+            "--target_layers", "6"
+        ]
+        double_main()
         
-        # Check layers 2-3 (duplicated values)
-        # Layer 2 should copy Layer 0
-        torch.testing.assert_close(all_weights["model.layers.2.input_layernorm.weight"], self.weights["model.layers.0.input_layernorm.weight"])
-        # Layer 3 should copy Layer 1
-        torch.testing.assert_close(all_weights["model.layers.3.input_layernorm.weight"], self.weights["model.layers.1.input_layernorm.weight"])
+        with open(self.output_dir / "config.json") as f:
+            self.assertEqual(json.load(f)["num_layers"], 6)
+            
+        with open(self.output_dir / "model.safetensors.index.json") as f:
+            new_index = json.load(f)
+        
+        # Verify 6 layers present
+        layers = sorted({int(re.search(r"layers\.(\d+)\.", k).group(1)) 
+                         for k in new_index["weight_map"] if "layers." in k})
+        self.assertEqual(layers, [0, 1, 2, 3, 4, 5])
 
     def test_double_layers_custom_copy(self):
         # Run expansion script (2 -> 4 layers, all copy layer 1)
