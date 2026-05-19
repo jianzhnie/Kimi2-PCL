@@ -8,7 +8,14 @@
 #   bash scripts/expand_moe_experts.sh                  # double experts, keep topk
 #   bash scripts/expand_moe_experts.sh 1024             # 1024 experts, keep topk
 #   bash scripts/expand_moe_experts.sh 1024 24          # 1024 experts, topk=24
-#   MODEL_DIR=/path/to/model bash scripts/expand_moe_experts.sh 1024 24
+#   TARGET_EXPERTS=1024 TARGET_TOPK=24 bash scripts/expand_moe_experts.sh
+#
+# Environment variables (override defaults):
+#   MODEL_DIR         - source model directory
+#   OUTPUT_DIR        - destination directory (auto-derived if not set)
+#   TARGET_EXPERTS    - target number of routed experts (default: double original)
+#   TARGET_ZERO_EXPERT - target number of zero experts (default: double original)
+#   TARGET_TOPK        - target moe_topk (default: unchanged)
 
 set -euo pipefail
 
@@ -17,24 +24,37 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 EXPAND_SCRIPT="$PROJECT_ROOT/utils/expand_moe_experts.py"
 
-TARGET_EXPERTS="${1:-}"
-TARGET_TOPK="${2:-}"
+# Positional args override env vars; both default to empty (auto-derive in Python)
+TARGET_EXPERTS="${1:-${TARGET_EXPERTS:-}}"
+TARGET_TOPK="${2:-${TARGET_TOPK:-}}"
+TARGET_ZERO_EXPERT="${TARGET_ZERO_EXPERT:-}"
+
 # Default paths - update these as needed
-MODEL_DIR="${MODEL_DIR:-/mnt/xufan_400T/models/LongCat-Flash-Chat}"
+MODEL_DIR="${MODEL_DIR:-/llm_workspace_1P/robin/hfhub/models/meituan-longcat/LongCat-Flash-Chat}"
+
+# Build output directory suffix from target values
+SUFFIX=""
 if [ -n "$TARGET_EXPERTS" ]; then
     SUFFIX="${TARGET_EXPERTS}E"
 else
     SUFFIX="2xE"
 fi
-[ -n "$TARGET_TOPK" ] && SUFFIX="${SUFFIX}-Topk${TARGET_TOPK}"
-OUTPUT_DIR="${OUTPUT_DIR:-/llm_workspace_1P/robin/hfhub/models/meituan-longcat/LongCat-Flash-Chat-${SUFFIX}}"
+if [ -n "$TARGET_ZERO_EXPERT" ]; then
+    SUFFIX="${SUFFIX}-${TARGET_ZERO_EXPERT}Zero-E"
+fi
+if [ -n "$TARGET_TOPK" ]; then
+    SUFFIX="${SUFFIX}-Topk${TARGET_TOPK}"
+fi
+
+OUTPUT_DIR="${OUTPUT_DIR:-/llm_workspace_1P/robin/hfhub/models/meituan-longcat/expand/LongCat-Flash-Chat-${SUFFIX}}"
 
 echo "============================================"
 echo "  Expand MoE Experts"
 echo "============================================"
 echo "Model dir:      ${MODEL_DIR}"
 echo "Output dir:     ${OUTPUT_DIR}"
-echo "Target Experts: ${TARGET_EXPERTS:-auto (double the original)}"
+echo "Target Experts: ${TARGET_EXPERTS:-auto}"
+echo "Target Zero Experts: ${TARGET_ZERO_EXPERT:-auto}"
 echo "Target Topk:    ${TARGET_TOPK:-auto (unchanged)}"
 
 if [ ! -d "$MODEL_DIR" ]; then
