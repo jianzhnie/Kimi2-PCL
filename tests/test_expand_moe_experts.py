@@ -637,5 +637,122 @@ class TestExpandMoeExperts(unittest.TestCase):
             expand_main()
         self.assertEqual(exc.exception.code, 1)
 
+    def test_parallel_produces_same_output_as_serial(self):
+        """Parallel (workers=2) must produce identical output to serial (workers=1)."""
+        # 1. Run serial expansion into output_serial
+        sys.argv = [
+            "expand_moe_experts.py",
+            "--model_dir", str(self.model_dir),
+            "--output_dir", str(self.output_dir / "serial"),
+            "--target_experts", "8",
+        ]
+        expand_main()
+
+        # 2. Run parallel expansion into output_parallel
+        sys.argv = [
+            "expand_moe_experts.py",
+            "--model_dir", str(self.model_dir),
+            "--output_dir", str(self.output_dir / "parallel"),
+            "--target_experts", "8",
+            "--workers", "2",
+        ]
+        expand_main()
+
+        # 3. Compare results
+        serial_idx = self.output_dir / "serial" / "model.safetensors.index.json"
+        parallel_idx = self.output_dir / "parallel" / "model.safetensors.index.json"
+
+        with open(serial_idx) as f:
+            s_idx = json.load(f)
+        with open(parallel_idx) as f:
+            p_idx = json.load(f)
+
+        # Same weight map (modulo shard filename differences)
+        self.assertEqual(
+            sorted(s_idx["weight_map"].keys()),
+            sorted(p_idx["weight_map"].keys()),
+        )
+
+        # Same config
+        with open(self.output_dir / "serial" / "config.json") as f:
+            s_cfg = json.load(f)
+        with open(self.output_dir / "parallel" / "config.json") as f:
+            p_cfg = json.load(f)
+        self.assertEqual(s_cfg, p_cfg)
+
+        # Same tensors (value-wise)
+        s_weights = {}
+        for shard_name in set(s_idx["weight_map"].values()):
+            s_weights.update(load_file(str(self.output_dir / "serial" / shard_name)))
+        p_weights = {}
+        for shard_name in set(p_idx["weight_map"].values()):
+            p_weights.update(load_file(str(self.output_dir / "parallel" / shard_name)))
+
+        for key in s_weights:
+            self.assertTrue(torch.equal(s_weights[key], p_weights[key]),
+                            f"Mismatch in tensor: {key}")
+
+    def test_parallel_with_noise_and_zero_experts(self):
+        """Parallel mode with noise injection and zero experts."""
+        # Setup config with zero_expert_num
+        config = {
+            "model_type": "longcat",
+            "n_routed_experts": 4,
+            "zero_expert_num": 2,
+            "hidden_size": 16,
+            "num_layers": 1,
+        }
+        with open(self.model_dir / "config.json", "w") as f:
+            json.dump(config, f)
+
+        weights = {
+            "model.layers.0.mlp.router.classifier.weight": torch.randn(6, 16),
+            "model.layers.0.mlp.router.e_score_correction_bias": torch.randn(6),
+        }
+        for i in range(6):  # 4 real + 2 zero
+            weights[f"model.layers.0.mlp.experts.{i}.gate_proj.weight"] = torch.full((32, 16), float(i))
+
+        save_file(weights, str(self.model_dir / "model.safetensors"))
+        index = {
+            "metadata": {"total_size": 0},
+            "weight_map": {k: "model.safetensors" for k in weights},
+        }
+        with open(self.model_dir / "model.safetensors.index.json", "w") as f:
+            json.dump(index, f)
+
+        # Run with 3 workers + noise (ensures noise is threaded through workers)
+        sys.argv = [
+            "expand_moe_experts.py",
+            "--model_dir", str(self.model_dir),
+            "--output_dir", str(self.output_dir),
+            "--target_experts", "8",
+            "--noise-scale", "1e-6",
+            "--workers", "3",
+        ]
+        expand_main()
+
+        # Verify output exists and is loadable
+        with open(self.output_dir / "config.json") as f:
+            new_config = json.load(f)
+        self.assertEqual(new_config["n_routed_experts"], 8)
+        self.assertEqual(new_config["zero_expert_num"], 4)
+
+        with open(self.output_dir / "model.safetensors.index.json") as f:
+            new_idx = json.load(f)
+        all_w = {}
+        for shard_name in set(new_idx["weight_map"].values()):
+            all_w.update(load_file(str(self.output_dir / shard_name)))
+
+        # Router shape should be expanded: 8 real + 4 zero = 12
+        self.assertEqual(
+            all_w["model.layers.0.mlp.router.classifier.weight"].shape, (12, 16))
+
+        # Expert 4 (first duplicate of expert 0) should exist and match
+        self.assertTrue(torch.equal(
+            all_w["model.layers.0.mlp.experts.0.gate_proj.weight"],
+            all_w["model.layers.0.mlp.experts.4.gate_proj.weight"],
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,7 @@ import re
 import shutil
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import torch
@@ -318,6 +319,142 @@ def plan_output_layout(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Parallel Pass 2: pre-scan + multi-process output shard writing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _expand_tensor_meta(key: str, dtype: str, shape: list[int],
+                        original_experts: int, zero_expert_num: int,
+                        total_routed: int, expansion_factor: int,
+                        source_to_targets: dict[int, list[int]],
+                        target_experts: int) -> list[tuple[str, int, str]]:
+    """Return list of (output_key, output_nbytes, action) for an input tensor.
+
+    action is one of: "keep", "clone", "router_weight", "router_bias"
+    Mirrors the actual expansion logic but operates on metadata only.
+    """
+    results: list[tuple[str, int, str]] = []
+    nbytes = get_nbytes_from_meta(dtype, shape)
+
+    if is_router_weight(key):
+        validate_router_shape(key, shape, total_routed)
+        new_dim0 = target_experts + zero_expert_num * expansion_factor
+        new_shape = [new_dim0] + list(shape[1:])
+        new_nbytes = get_nbytes_from_meta(dtype, new_shape)
+        results.append((key, new_nbytes, "router_weight"))
+    elif is_router_bias(key):
+        validate_router_shape(key, shape, total_routed)
+        new_dim0 = target_experts + zero_expert_num * expansion_factor
+        new_shape = [new_dim0] + list(shape[1:])
+        new_nbytes = get_nbytes_from_meta(dtype, new_shape)
+        results.append((key, new_nbytes, "router_bias"))
+    elif info := get_expert_info(key):
+        layer_idx, expert_idx, rest = info
+        if expert_idx < original_experts:
+            results.append((key, nbytes, "keep"))
+            for new_expert_idx in source_to_targets.get(expert_idx, []):
+                new_key = make_expert_key(layer_idx, new_expert_idx, rest)
+                results.append((new_key, nbytes, "clone"))
+        else:
+            base_new_idx = expert_idx - original_experts + target_experts
+            new_key = make_expert_key(layer_idx, base_new_idx, rest)
+            results.append((new_key, nbytes, "keep"))
+            zero_offset = expert_idx - original_experts
+            for f in range(1, expansion_factor):
+                copy_idx = target_experts + zero_offset + f * zero_expert_num
+                copy_key = make_expert_key(layer_idx, copy_idx, rest)
+                results.append((copy_key, nbytes, "clone"))
+    else:
+        results.append((key, nbytes, "keep"))
+
+    return results
+
+
+def _pre_scan_assignments(
+    model_dir: Path,
+    shard_files: list[str],
+    target_shard_size: int,
+    original_experts: int,
+    zero_expert_num: int,
+    expansion_factor: int,
+    source_to_targets: dict[int, list[int]],
+    target_experts: int,
+) -> tuple[dict[int, list[tuple[str, str, str, str]]], int, int]:
+    """Pre-scan all shard headers and assign each output tensor to an output shard.
+
+    Returns (shard_assignments, num_output_shards, total_output_bytes) where
+    shard_assignments maps output_shard_idx → [(input_shard, input_key, output_key, action)].
+    """
+    total_routed = original_experts + zero_expert_num
+    current_shard = 0
+    current_bytes = 0
+    total_output_bytes = 0
+    assignments: dict[int, list[tuple[str, str, str, str]]] = defaultdict(list)
+
+    for shard_file in tqdm(shard_files, desc="Pre-scanning"):
+        shard_path = model_dir / shard_file
+        if not shard_path.exists():
+            tqdm.write(f"  WARNING: {shard_file} not found — skipping")
+            continue
+        header = read_safetensors_header(shard_path)
+        for key, (dtype, shape) in header.items():
+            for output_key, output_nbytes, action in _expand_tensor_meta(
+                key, dtype, shape, original_experts, zero_expert_num,
+                total_routed, expansion_factor, source_to_targets, target_experts,
+            ):
+                if current_bytes + output_nbytes > target_shard_size and current_bytes > 0:
+                    current_shard += 1
+                    current_bytes = 0
+                assignments[current_shard].append(
+                    (shard_file, key, output_key, action))
+                current_bytes += output_nbytes
+                total_output_bytes += output_nbytes
+
+    num_output_shards = current_shard + 1 if assignments else 0
+    return dict(assignments), num_output_shards, total_output_bytes
+
+
+def _write_output_shard(args):
+    """Module-level worker for ProcessPoolExecutor. Writes a single output shard.
+
+    Args is a tuple of:
+      (output_path, assignments, model_dir_str, original_experts, zero_expert_num,
+       expansion_factor, noise_scale)
+
+    assignments: list of (input_shard, input_key, output_key, action)
+    """
+    (output_path, assignments, model_dir_str, original_experts, zero_expert_num,
+     expansion_factor, noise_scale) = args
+
+    model_dir = Path(model_dir_str)
+    by_input: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    for sfile, in_key, out_key, action in assignments:
+        by_input[sfile].append((in_key, out_key, action))
+
+    tensors: dict[str, torch.Tensor] = {}
+    for sfile, items in by_input.items():
+        with safe_open(str(model_dir / sfile), framework="pt", device="cpu") as sf:
+            for in_key, out_key, action in items:
+                tensor = sf.get_tensor(in_key)
+                if action == "keep":
+                    tensors[out_key] = tensor
+                elif action == "clone":
+                    tensors[out_key] = tensor.clone()
+                elif action == "router_weight":
+                    tensors[out_key] = expand_router_weight(
+                        tensor, original_experts, zero_expert_num,
+                        expansion_factor, noise_scale,
+                    )
+                elif action == "router_bias":
+                    tensors[out_key] = expand_router_bias(
+                        tensor, original_experts, zero_expert_num,
+                        expansion_factor,
+                    )
+
+    save_file(tensors, str(output_path))
+    return [(name, output_path.name) for name in tensors]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -336,6 +473,9 @@ def main():
     parser.add_argument("--noise-scale", type=float, default=0.0,
                         help="Gaussian noise scale for duplicated classifier weights "
                              "(default 0.0 = exact copies; recommend 1e-6 to break symmetry)")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="Number of worker processes for parallel output shard "
+                             "writing (default 1 = serial; use 0 for CPU count)")
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir).resolve()
@@ -425,115 +565,159 @@ def main():
         f"(~{total_output_bytes / num_output_shards / 1e9:.2f} GB each)"
     )
 
+    workers = args.workers if args.workers > 0 else (__import__("os").cpu_count() or 4)
+    if workers > 1:
+        print(f"Parallel mode: {workers} workers for output shard writing")
+
     # ── Pass 2: Process and write ───────────────────────────────────────
     new_weight_map: dict[str, str] = {}
-    output_shard_idx = 1
-    current_tensors: dict[str, torch.Tensor] = {}
-    current_bytes = 0
 
-    def flush_shard():
-        nonlocal output_shard_idx, current_tensors, current_bytes
-        if not current_tensors:
-            return
-        shard_name = f"model-{output_shard_idx:05d}-of-{num_output_shards:05d}.safetensors"
-        output_path = output_dir / shard_name
-        save_file(current_tensors, str(output_path))
-        for t_name in current_tensors:
-            new_weight_map[t_name] = shard_name
-        output_shard_idx += 1
-        current_tensors.clear()
+    if workers > 1:
+        # ---- Parallel path ----
+        assignments_by_shard, num_output_shards_ps, _ = _pre_scan_assignments(
+            model_dir, shard_files, target_shard_size,
+            original_experts, zero_expert_num, expansion_factor,
+            source_to_targets, target_experts,
+        )
+        if num_output_shards_ps != num_output_shards:
+            print(
+                f"  Pre-scan predicted {num_output_shards_ps} shards "
+                f"(Pass 1 predicted {num_output_shards}), using pre-scan value."
+            )
+            num_output_shards = num_output_shards_ps
+
+        tasks = []
+        for shard_idx in sorted(assignments_by_shard):
+            shard_name = f"model-{shard_idx + 1:05d}-of-{num_output_shards:05d}.safetensors"
+            output_path = output_dir / shard_name
+            tasks.append((
+                output_path,
+                assignments_by_shard[shard_idx],
+                str(model_dir),
+                original_experts,
+                zero_expert_num,
+                expansion_factor,
+                args.noise_scale,
+            ))
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = list(tqdm(
+                executor.map(_write_output_shard, tasks),
+                total=len(tasks),
+                desc="Writing output shards",
+            ))
+            for weight_entries in futures:
+                for name, shard_name in weight_entries:
+                    new_weight_map[name] = shard_name
+    else:
+        # ---- Serial path (original behaviour) ----
+        output_shard_idx = 1
+        current_tensors: dict[str, torch.Tensor] = {}
         current_bytes = 0
 
-    def maybe_flush(nbytes: int):
-        nonlocal current_bytes, current_tensors
-        if current_bytes + nbytes > target_shard_size and current_tensors:
-            flush_shard()
+        def flush_shard():
+            nonlocal output_shard_idx, current_tensors, current_bytes
+            if not current_tensors:
+                return
+            shard_name = f"model-{output_shard_idx:05d}-of-{num_output_shards:05d}.safetensors"
+            output_path = output_dir / shard_name
+            save_file(current_tensors, str(output_path))
+            for t_name in current_tensors:
+                new_weight_map[t_name] = shard_name
+            output_shard_idx += 1
+            current_tensors.clear()
+            current_bytes = 0
 
-    print("\nPass 2/2: Processing and writing tensors...")
-    for shard_file in tqdm(shard_files, desc="Input shards"):
-        with safe_open(str(model_dir / shard_file), framework="pt", device="cpu") as sf:
-            for key in sf.keys():
-                tensor = sf.get_tensor(key)
-                nbytes = tensor_nbytes(tensor)
+        def maybe_flush(nbytes: int):
+            nonlocal current_bytes, current_tensors
+            if current_bytes + nbytes > target_shard_size and current_tensors:
+                flush_shard()
 
-                if is_router_weight(key):
-                    validate_router_shape(key, list(tensor.shape), total_routed)
-                    new_tensor = expand_router_weight(
-                        tensor, original_experts, zero_expert_num,
-                        expansion_factor, args.noise_scale,
-                    )
-                    new_nbytes = tensor_nbytes(new_tensor)
-                    maybe_flush(new_nbytes)
-                    current_tensors[key] = new_tensor
-                    current_bytes += new_nbytes
+        print("\nPass 2/2: Processing and writing tensors...")
+        for shard_file in tqdm(shard_files, desc="Input shards"):
+            with safe_open(str(model_dir / shard_file), framework="pt", device="cpu") as sf:
+                for key in sf.keys():
+                    tensor = sf.get_tensor(key)
+                    nbytes = tensor_nbytes(tensor)
 
-                elif is_router_bias(key):
-                    validate_router_shape(key, list(tensor.shape), total_routed)
-                    new_tensor = expand_router_bias(
-                        tensor, original_experts, zero_expert_num, expansion_factor,
-                    )
-                    new_nbytes = tensor_nbytes(new_tensor)
-                    maybe_flush(new_nbytes)
-                    current_tensors[key] = new_tensor
-                    current_bytes += new_nbytes
+                    if is_router_weight(key):
+                        validate_router_shape(key, list(tensor.shape), total_routed)
+                        new_tensor = expand_router_weight(
+                            tensor, original_experts, zero_expert_num,
+                            expansion_factor, args.noise_scale,
+                        )
+                        new_nbytes = tensor_nbytes(new_tensor)
+                        maybe_flush(new_nbytes)
+                        current_tensors[key] = new_tensor
+                        current_bytes += new_nbytes
 
-                elif info := get_expert_info(key):
-                    layer_idx, expert_idx, rest = info
-                    if expert_idx < original_experts:
+                    elif is_router_bias(key):
+                        validate_router_shape(key, list(tensor.shape), total_routed)
+                        new_tensor = expand_router_bias(
+                            tensor, original_experts, zero_expert_num, expansion_factor,
+                        )
+                        new_nbytes = tensor_nbytes(new_tensor)
+                        maybe_flush(new_nbytes)
+                        current_tensors[key] = new_tensor
+                        current_bytes += new_nbytes
+
+                    elif info := get_expert_info(key):
+                        layer_idx, expert_idx, rest = info
+                        if expert_idx < original_experts:
+                            maybe_flush(nbytes)
+                            current_tensors[key] = tensor
+                            current_bytes += nbytes
+
+                            for new_expert_idx in source_to_targets.get(expert_idx, []):
+                                new_key = make_expert_key(layer_idx, new_expert_idx, rest)
+                                maybe_flush(nbytes)
+                                current_tensors[new_key] = tensor.clone()
+                                current_bytes += nbytes
+                        else:
+                            # Zero-expert: shift to new indices after expanded routed experts
+                            base_new_idx = expert_idx - original_experts + target_experts
+                            new_key = make_expert_key(layer_idx, base_new_idx, rest)
+                            maybe_flush(nbytes)
+                            current_tensors[new_key] = tensor
+                            current_bytes += nbytes
+
+                            # Additional copies for expanded zero-expert slots
+                            zero_offset = expert_idx - original_experts
+                            for f in range(1, expansion_factor):
+                                copy_idx = target_experts + zero_offset + f * zero_expert_num
+                                copy_key = make_expert_key(layer_idx, copy_idx, rest)
+                                maybe_flush(nbytes)
+                                current_tensors[copy_key] = tensor.clone()
+                                current_bytes += nbytes
+
+                    else:
                         maybe_flush(nbytes)
                         current_tensors[key] = tensor
                         current_bytes += nbytes
 
-                        for new_expert_idx in source_to_targets.get(expert_idx, []):
-                            new_key = make_expert_key(layer_idx, new_expert_idx, rest)
-                            maybe_flush(nbytes)
-                            current_tensors[new_key] = tensor.clone()
-                            current_bytes += nbytes
-                    else:
-                        # Zero-expert: shift to new indices after expanded routed experts
-                        base_new_idx = expert_idx - original_experts + target_experts
-                        new_key = make_expert_key(layer_idx, base_new_idx, rest)
-                        maybe_flush(nbytes)
-                        current_tensors[new_key] = tensor
-                        current_bytes += nbytes
+        flush_shard()
 
-                        # Additional copies for expanded zero-expert slots
-                        zero_offset = expert_idx - original_experts
-                        for f in range(1, expansion_factor):
-                            copy_idx = target_experts + zero_offset + f * zero_expert_num
-                            copy_key = make_expert_key(layer_idx, copy_idx, rest)
-                            maybe_flush(nbytes)
-                            current_tensors[copy_key] = tensor.clone()
-                            current_bytes += nbytes
-
-                else:
-                    maybe_flush(nbytes)
-                    current_tensors[key] = tensor
-                    current_bytes += nbytes
-
-    flush_shard()
-
-    # ── Fixup shard names if prediction was off ─────────────────────────
-    actual_shards = output_shard_idx - 1
-    if actual_shards != num_output_shards:
-        print(
-            f"\nWARNING: Predicted {num_output_shards} shards but wrote {actual_shards}. "
-            "Adjusting shard names..."
-        )
-        # Rename files on disk
-        for i in range(1, actual_shards + 1):
-            old_name = output_dir / f"model-{i:05d}-of-{num_output_shards:05d}.safetensors"
-            new_name = output_dir / f"model-{i:05d}-of-{actual_shards:05d}.safetensors"
-            if old_name.exists() and old_name != new_name:
-                old_name.rename(new_name)
-        # Fix weight_map entries
-        for key in new_weight_map:
-            new_weight_map[key] = re.sub(
-                r"-of-\d+\.safetensors",
-                f"-of-{actual_shards:05d}.safetensors",
-                new_weight_map[key],
+        # ── Fixup shard names if prediction was off ─────────────────────────
+        actual_shards = output_shard_idx - 1
+        if actual_shards != num_output_shards:
+            print(
+                f"\nWARNING: Predicted {num_output_shards} shards but wrote {actual_shards}. "
+                "Adjusting shard names..."
             )
-        num_output_shards = actual_shards
+            # Rename files on disk
+            for i in range(1, actual_shards + 1):
+                old_name = output_dir / f"model-{i:05d}-of-{num_output_shards:05d}.safetensors"
+                new_name = output_dir / f"model-{i:05d}-of-{actual_shards:05d}.safetensors"
+                if old_name.exists() and old_name != new_name:
+                    old_name.rename(new_name)
+            # Fix weight_map entries
+            for key in new_weight_map:
+                new_weight_map[key] = re.sub(
+                    r"-of-\d+\.safetensors",
+                    f"-of-{actual_shards:05d}.safetensors",
+                    new_weight_map[key],
+                )
+            num_output_shards = actual_shards
 
     # ── Write new index ──────────────────────────────────────────────────
     metadata = {**index.get("metadata", {})}
