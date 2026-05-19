@@ -14,7 +14,10 @@
 
 set -euo pipefail
 
-DOUBLE_SCRIPT="$(dirname "$0")/../utils/expand_model_layers.py"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+DOUBLE_SCRIPT="$PROJECT_ROOT/utils/expand_model_layers.py"
 
 MODEL_DIR="${MODEL_DIR:-/mnt/xufan_400T/models/LongCat-Flash-Chat}"
 ORIGINAL_LAYERS="${ORIGINAL_LAYERS:-28}"
@@ -75,7 +78,7 @@ esac
 
 echo ""
 CMD=(
-    python3 "$DOUBLE_SCRIPT"
+    env PYTHONPATH="$PROJECT_ROOT" python3 "$DOUBLE_SCRIPT"
     --model_dir "$MODEL_DIR"
     --output_dir "$OUTPUT_DIR"
     --original_layers "$ORIGINAL_LAYERS"

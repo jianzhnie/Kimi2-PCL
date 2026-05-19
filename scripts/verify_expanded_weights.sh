@@ -17,7 +17,10 @@
 
 set -euo pipefail
 
-VERIFY_SCRIPT="$(dirname "$0")/../utils/verify_expanded_weights.py"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+VERIFY_SCRIPT="$PROJECT_ROOT/utils/verify_expanded_weights.py"
 
 TYPE="${1:-}"
 ORIG_DIR="${2:-}"
@@ -37,7 +40,7 @@ echo "Original:  ${ORIG_DIR}"
 echo "Expanded:  ${EXP_DIR}"
 echo "============================================"
 
-python3 "$VERIFY_SCRIPT" \
+env PYTHONPATH="$PROJECT_ROOT" python3 "$VERIFY_SCRIPT" \
     --type "$TYPE" \
     --orig_dir "$ORIG_DIR" \
     --exp_dir "$EXP_DIR" \

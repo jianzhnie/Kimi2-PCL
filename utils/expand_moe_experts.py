@@ -23,72 +23,20 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
 
-# Mapping from safetensors dtype string to element size in bytes
-DTYPE_SIZES: dict[str, int] = {
-    "F64": 8, "I64": 8,
-    "F32": 4, "I32": 4,
-    "F16": 2, "BF16": 2, "I16": 2,
-    "F8_E4M3": 1, "F8_E5M2": 1,
-    "F8_E4M3FN": 1, "F8_E5M2FN": 1,
-    "F8_E4M3FNUZ": 1, "F8_E5M2FNUZ": 1,
-    "I8": 1, "U8": 1, "BOOL": 1,
-}
+from utils.shared import (
+    EXPERT_COUNT_KEYS,
+    auto_detect_shard_size,
+    find_expert_count,
+    get_expert_info,
+    get_nbytes_from_meta,
+    is_router_param,
+    load_config,
+    load_index,
+    read_safetensors_header,
+    tensor_nbytes,
+)
 
-EXPERT_COUNT_KEYS = ["n_routed_experts", "n_experts", "num_experts"]
 TOPK_KEYS = ["moe_topk", "num_experts_per_tok", "top_k"]
-ROUTER_WEIGHT_SUFFIXES = (
-    "mlp.router.classifier.weight",
-    "mlp.gate.weight",
-)
-ROUTER_BIAS_SUFFIXES = (
-    "mlp.router.e_score_correction_bias",
-    "mlp.gate.e_score_correction_bias",
-)
-_ALL_ROUTER_SUFFIXES = ROUTER_WEIGHT_SUFFIXES + ROUTER_BIAS_SUFFIXES
-
-
-def load_config(model_dir: Path) -> dict:
-    with open(model_dir / "config.json") as f:
-        return json.load(f)
-
-
-def load_index(model_dir: Path) -> dict:
-    index_path = model_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        with open(index_path) as f:
-            return json.load(f)
-    return None
-
-
-def get_expert_info(param_name: str) -> tuple[int, int, str] | None:
-    """Extract (layer_idx, expert_idx, rest) from parameter name.
-    Example: model.layers.0.mlp.experts.5.down_proj.weight -> (0, 5, 'down_proj.weight')
-    """
-    m = re.search(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(.*)", param_name)
-    if m:
-        return int(m.group(1)), int(m.group(2)), m.group(3)
-    return None
-
-
-def is_router_param(param_name: str) -> bool:
-    """Check if the parameter is a router weight or expert-bias tensor."""
-    return param_name.endswith(_ALL_ROUTER_SUFFIXES)
-
-
-def find_expert_count(config: dict) -> tuple[str | None, int, int]:
-    """Read the original expert count and zero_expert_num from config.
-
-    Returns (expert_count_key, original_experts, zero_expert_num).
-    original_experts is the number of REAL experts (MLP computation).
-    zero_expert_num is the number of 
-    virtual identity experts.
-    """
-    for key in EXPERT_COUNT_KEYS:
-        value = config.get(key)
-        if isinstance(value, int) and value > 0:
-            zero = config.get("zero_expert_num", 0) or 0
-            return key, value, zero
-    return None, 0, 0
 
 
 def build_expert_target_map(
@@ -105,7 +53,7 @@ def build_expert_target_map(
 
 def validate_expert_layout(index: dict, original_experts: int, zero_expert_num: int) -> dict[int, list[int]]:
     """Validate that each MoE layer has contiguous expert indices.
-    
+
     Expected: [0, original_experts) or [0, original_experts + zero_expert_num).
     """
     experts_by_layer: dict[int, set[int]] = defaultdict(set)
@@ -126,7 +74,7 @@ def validate_expert_layout(index: dict, original_experts: int, zero_expert_num: 
 
     expected_routed = list(range(original_experts))
     expected_total = list(range(original_experts + zero_expert_num))
-    
+
     validated: dict[int, list[int]] = {}
     for layer_idx, expert_indices in sorted(experts_by_layer.items()):
         actual = sorted(expert_indices)
@@ -154,56 +102,6 @@ def validate_router_shape(param_name: str, shape: list[int], total_routed: int) 
             file=sys.stderr,
         )
         sys.exit(1)
-
-
-def tensor_nbytes(tensor: torch.Tensor) -> int:
-    """Return the size of a torch tensor in bytes."""
-    return tensor.element_size() * tensor.nelement()
-
-
-def read_safetensors_header(path: Path) -> dict[str, tuple[str, list[int]]]:
-    """Read only the JSON header of a safetensors file, return {tensor_name: (dtype, shape)}."""
-    with open(path, "rb") as f:
-        header_size = int.from_bytes(f.read(8), "little")
-        header = json.loads(f.read(header_size))
-
-    result: dict[str, tuple[str, list[int]]] = {}
-    for key, meta in header.items():
-        if key == "__metadata__":
-            continue
-        result[key] = (meta["dtype"], meta["shape"])
-    return result
-
-
-def get_nbytes_from_meta(dtype: str, shape: list[int]) -> int:
-    elem_size = DTYPE_SIZES[dtype]  # let KeyError propagate for unknown dtypes
-    numel = 1
-    for dim in shape:
-        numel *= dim
-    return elem_size * numel
-
-
-def auto_detect_shard_size(model_dir: Path, shard_files: list[str]) -> int:
-    """Detect a target shard size from the original shard files."""
-    file_sizes = []
-    for fname in shard_files:
-        fpath = model_dir / fname
-        if fpath.exists():
-            file_sizes.append(fpath.stat().st_size)
-
-    if file_sizes:
-        avg_size = int(sum(file_sizes) / len(file_sizes))
-        print(
-            f"Detected shard size from {len(file_sizes)} existing files: "
-            f"{avg_size / 1e9:.2f} GB (average)"
-        )
-        return avg_size
-
-    print(
-        "WARNING: No shard files found on disk. Using default 8GB target. "
-        "Output shards will match this size, not necessarily the originals."
-    )
-    return 8 * 1024 ** 3
 
 
 def main():
@@ -265,16 +163,16 @@ def main():
 
     target_experts = args.target_experts if args.target_experts is not None else original_experts * 2
 
-    if target_experts % original_experts != 0:
-        print(f"ERROR: Target experts ({target_experts}) must be a multiple of original ({original_experts})")
-        sys.exit(1)
-
-    if target_experts < original_experts:
+    if target_experts <= original_experts:
         print(
             f"ERROR: target_experts ({target_experts}) must be greater than "
             f"original_experts ({original_experts}).",
             file=sys.stderr,
         )
+        sys.exit(1)
+
+    if target_experts % original_experts != 0:
+        print(f"ERROR: Target experts ({target_experts}) must be a multiple of original ({original_experts})")
         sys.exit(1)
 
     expansion_factor = target_experts // original_experts
@@ -312,10 +210,12 @@ def main():
                 topk_updated = True
                 break
         if not topk_updated:
-            # Add moe_topk even if not present (some configs may not have it)
             config["moe_topk"] = args.target_topk
             print(f"Adding topk: moe_topk = {args.target_topk}")
             updated_keys.append("moe_topk")
+
+    if output_dir.exists() and any(output_dir.iterdir()):
+        print(f"WARNING: Output directory already exists and is not empty: {output_dir}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(output_dir / "config.json", "w") as f:
@@ -364,7 +264,6 @@ def main():
                 total_original += 1
 
                 if expert_idx < original_experts:
-                    # Routed expert copies
                     for _ in source_to_targets.get(expert_idx, []):
                         if nbytes + current_bytes > target_shard_size and current_bytes > 0:
                             num_output_shards += 1
@@ -373,7 +272,6 @@ def main():
                         total_output_bytes += nbytes
                         total_duplicated += 1
                 elif zero_expert_num > 0:
-                    # Zero-expert copies (expansion_factor - 1 additional copies)
                     for _ in range(expansion_factor - 1):
                         if nbytes + current_bytes > target_shard_size and current_bytes > 0:
                             num_output_shards += 1
@@ -409,7 +307,7 @@ def main():
         nonlocal output_shard_idx, current_tensors, current_bytes
         if not current_tensors:
             return
-        shard_name = f"model_{output_shard_idx:05d}-of-{num_output_shards:05d}.safetensors"
+        shard_name = f"model-{output_shard_idx:05d}-of-{num_output_shards:05d}.safetensors"
         output_path = output_dir / shard_name
         save_file(current_tensors, str(output_path))
         for t_name in current_tensors:
@@ -427,9 +325,6 @@ def main():
 
                 if is_router_param(key):
                     validate_router_shape(key, list(tensor.shape), total_routed)
-                    # Router tensor stores weights for both real experts and
-                    # zero (identity) experts. Split along dim=0, expand both
-                    # the real-expert and zero-expert portions.
                     if zero_expert_num > 0:
                         real_part = tensor[:original_experts]
                         zero_part = tensor[original_experts:]
@@ -443,11 +338,10 @@ def main():
                         flush_shard()
                     current_tensors[key] = new_tensor
                     current_bytes += new_nbytes
-                
+
                 elif info := get_expert_info(key):
                     layer_idx, expert_idx, rest = info
                     if expert_idx < original_experts:
-                        # Routed expert: keep original and add copies
                         if current_bytes + nbytes > target_shard_size and current_tensors:
                             flush_shard()
                         current_tensors[key] = tensor
@@ -460,10 +354,8 @@ def main():
                             current_tensors[new_key] = tensor.clone()
                             current_bytes += nbytes
                     else:
-                        # Zero-expert: shift to new indices after expanded routed experts,
-                        # and create additional copies for expanded zero-expert slots.
+                        # Zero-expert: shift to new indices after expanded routed experts
                         base_new_idx = expert_idx - original_experts + target_experts
-                        # Original zero-expert at shifted position
                         new_key = f"model.layers.{layer_idx}.mlp.experts.{base_new_idx}.{rest}"
                         if current_bytes + nbytes > target_shard_size and current_tensors:
                             flush_shard()
@@ -479,9 +371,8 @@ def main():
                                 flush_shard()
                             current_tensors[copy_key] = tensor.clone()
                             current_bytes += nbytes
-                
+
                 else:
-                    # Regular param
                     if current_bytes + nbytes > target_shard_size and current_tensors:
                         flush_shard()
                     current_tensors[key] = tensor
@@ -496,8 +387,8 @@ def main():
             "Adjusting shard names and index..."
         )
         for i in range(1, actual_shards + 1):
-            old_name = output_dir / f"model_{i:05d}-of-{num_output_shards:05d}.safetensors"
-            new_name = output_dir / f"model_{i:05d}-of-{actual_shards:05d}.safetensors"
+            old_name = output_dir / f"model-{i:05d}-of-{num_output_shards:05d}.safetensors"
+            new_name = output_dir / f"model-{i:05d}-of-{actual_shards:05d}.safetensors"
             if old_name.exists() and old_name != new_name:
                 old_name.rename(new_name)
         num_output_shards = actual_shards
@@ -519,12 +410,13 @@ def main():
     with open(output_dir / "model.safetensors.index.json", "w") as f:
         json.dump(new_index, f, indent=2)
 
-    # Copy auxiliary files
+    # ── Copy auxiliary files ────────────────────────────────────────────
     skip_suffixes = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".h5")
     skip_names = {"model.safetensors.index.json", "config.json"}
     for fpath in model_dir.iterdir():
         if fpath.is_file() and fpath.suffix not in skip_suffixes and fpath.name not in skip_names:
             shutil.copy2(fpath, output_dir / fpath.name)
+            print(f"  Copied: {fpath.name}")
 
     print("\nVerification:")
     print(f"  Expert count key used: {expert_count_key or 'n_routed_experts'}")

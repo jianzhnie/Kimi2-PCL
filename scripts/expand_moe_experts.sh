@@ -12,7 +12,10 @@
 
 set -euo pipefail
 
-EXPAND_SCRIPT="$(dirname "$0")/../utils/expand_moe_experts.py"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+EXPAND_SCRIPT="$PROJECT_ROOT/utils/expand_moe_experts.py"
 
 TARGET_EXPERTS="${1:-}"
 TARGET_TOPK="${2:-}"
@@ -41,7 +44,7 @@ fi
 
 echo ""
 CMD=(
-    python3 "$EXPAND_SCRIPT"
+    env PYTHONPATH="$PROJECT_ROOT" python3 "$EXPAND_SCRIPT"
     --model_dir "$MODEL_DIR"
     --output_dir "$OUTPUT_DIR"
 )

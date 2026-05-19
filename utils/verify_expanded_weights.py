@@ -9,7 +9,6 @@ Supports:
 
 import argparse
 import json
-import re
 import sys
 import threading
 from collections import defaultdict
@@ -20,70 +19,24 @@ import torch
 from safetensors import safe_open
 from tqdm import tqdm
 
-# --- Constants & Shared Logic ---
-
-EXPERT_COUNT_KEYS = ['n_routed_experts', 'n_experts', 'num_experts']
-ROUTER_SUFFIXES = (
-    'mlp.router.classifier.weight',
-    'mlp.gate.weight',
-    'mlp.router.e_score_correction_bias',
-    'mlp.gate.e_score_correction_bias',
+from utils.shared import (
+    ALL_ROUTER_SUFFIXES,
+    EXPERT_COUNT_KEYS,
+    find_expert_count,
+    get_expert_info,
+    get_layer_index,
+    is_router_param,
+    load_index,
+    set_layer_index,
 )
 
 
 def load_config(model_dir: Path) -> dict:
-    config_path = model_dir / 'config.json'
+    config_path = model_dir / "config.json"
     if not config_path.exists():
-        print(f"ERROR: config.json not found in {model_dir}", file=sys.stderr)
-        return {}
-    try:
-        with open(config_path) as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"ERROR reading config.json in {model_dir}: {e}", file=sys.stderr)
-        return {}
-
-
-def load_index(model_dir: Path):
-    index_path = model_dir / 'model.safetensors.index.json'
-    if index_path.exists():
-        with open(index_path) as f:
-            return json.load(f)
-    return None
-
-
-def get_layer_index(param_name: str) -> int | None:
-    m = re.search(r'model\.layers\.(\d+)\.', param_name)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def set_layer_index(param_name: str, new_index: int) -> str:
-    """Change the layer index in a parameter name. e.g. model.layers.0.xxx → model.layers.5.xxx"""
-    return re.sub(
-        r'model\.layers\.(\d+)\.',
-        f"model.layers.{new_index}.",
-        param_name,
-    )
-
-
-def get_expert_info(param_name: str) -> tuple[int, int, str] | None:
-    m = re.search(r'model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(.*)',
-                  param_name)
-    if m:
-        return int(m.group(1)), int(m.group(2)), m.group(3)
-    return None
-
-
-def find_expert_count(config: dict) -> tuple[int, int]:
-    """Returns (original_experts, zero_expert_num) from config."""
-    for key in EXPERT_COUNT_KEYS:
-        value = config.get(key)
-        if isinstance(value, int) and value > 0:
-            zero = config.get('zero_expert_num', 0) or 0
-            return value, zero
-    return 0, 0
+        raise FileNotFoundError(f"config.json not found in {model_dir}")
+    with open(config_path) as f:
+        return json.load(f)
 
 
 def parse_copy_source(raw: str | None, num_original: int,
@@ -93,7 +46,7 @@ def parse_copy_source(raw: str | None, num_original: int,
     Validates that all source indices are within [0, num_original). Raises ValueError
     on invalid input.
     """
-    if raw is None or raw.strip().lower() == 'seq':
+    if raw is None or raw.strip().lower() == "seq":
         return [i % num_original for i in range(num_new)]
 
     raw = raw.strip()
@@ -108,7 +61,7 @@ def parse_copy_source(raw: str | None, num_original: int,
             raise e
 
     try:
-        parts = [int(p.strip()) for p in raw.split(',')]
+        parts = [int(p.strip()) for p in raw.split(",")]
     except ValueError:
         raise ValueError(f"Invalid --copy_source format: {raw}")
 
@@ -133,16 +86,16 @@ class ModelWeightLoader:
         self.model_dir = model_dir
         self.config = load_config(model_dir)
         self.index = load_index(model_dir)
-        self.weight_map = self.index['weight_map'] if self.index else None
+        self.weight_map = self.index["weight_map"] if self.index else None
 
         if not self.weight_map:
-            files = sorted(list(model_dir.glob('*.safetensors')))
+            files = sorted(list(model_dir.glob("*.safetensors")))
             if not files:
                 raise FileNotFoundError(f"No safetensors found in {model_dir}")
-            
+
             self.weight_map = {}
             for f in files:
-                with safe_open(f, framework='pt') as sf:
+                with safe_open(f, framework="pt") as sf:
                     for k in sf.keys():
                         if k in self.weight_map:
                             print(f"WARNING: Duplicate parameter {k} found in {f.name} and {self.weight_map[k]}")
@@ -155,7 +108,7 @@ class ModelWeightLoader:
 
     @property
     def shards(self):
-        if not hasattr(self._local, 'shards'):
+        if not hasattr(self._local, "shards"):
             self._local.shards = {}
         return self._local.shards
 
@@ -165,14 +118,12 @@ class ModelWeightLoader:
         shard_name = self.weight_map[name]
         if shard_name not in self.shards:
             self.shards[shard_name] = safe_open(self.model_dir / shard_name,
-                                                framework='pt')
+                                                framework="pt")
         return self.shards[shard_name].get_tensor(name)
 
     def close(self):
         """Close all open safetensors handles in the current thread."""
-        if hasattr(self._local, 'shards'):
-            # safe_open handles don't have an explicit close(), 
-            # but deleting the reference allows them to be closed by GC.
+        if hasattr(self._local, "shards"):
             self._local.shards.clear()
 
 
@@ -197,8 +148,7 @@ def verify_layers(orig_loader,
         li = get_layer_index(name)
         if li is not None:
             exp_layer_indices.add(li)
-            # Normalize name: model.layers.5.xxx -> xxx
-            norm_name = re.sub(r'model\.layers\.\d+\.', '', name)
+            norm_name = name.split(f"model.layers.{li}.", 1)[-1]
             exp_layer_params[li].add(norm_name)
         else:
             exp_non_layer_params.add(name)
@@ -216,7 +166,7 @@ def verify_layers(orig_loader,
     for name in orig_loader.weight_map:
         li = get_layer_index(name)
         if li is not None:
-            norm_name = re.sub(r'model\.layers\.\d+\.', '', name)
+            norm_name = name.split(f"model.layers.{li}.", 1)[-1]
             orig_layer_params[li].add(norm_name)
         else:
             orig_non_layer_params.add(name)
@@ -233,7 +183,7 @@ def verify_layers(orig_loader,
         if op != ep:
             return [
                 f"Param name mismatch in layer {li}: "
-                f"orig-only={op-ep}, exp-only={ep-op}"
+                f"orig-only={op - ep}, exp-only={ep - op}"
             ]
 
     # Check new layers (original_layers to target_layers-1)
@@ -244,7 +194,7 @@ def verify_layers(orig_loader,
         if sp != ep:
             return [
                 f"Param name mismatch in new layer {new_li} (←src layer {src}): "
-                f"src-only={sp-ep}, exp-only={ep-sp}"
+                f"src-only={sp - ep}, exp-only={ep - sp}"
             ]
 
     print(f"  Structural check passed: "
@@ -260,7 +210,7 @@ def verify_layers(orig_loader,
     def verify_shard(shard_name):
         local_mismatches = []
         with safe_open(exp_loader.model_dir / shard_name,
-                       framework='pt') as sf_exp:
+                       framework="pt") as sf_exp:
             for exp_name in exp_loader.params_by_shard[shard_name]:
                 l_idx = get_layer_index(exp_name)
 
@@ -297,15 +247,15 @@ def verify_layers(orig_loader,
         }
         for future in tqdm(as_completed(futures),
                            total=len(futures),
-                           desc='Verifying Shards'):
+                           desc="Verifying Shards"):
             future.result()
 
     return mismatches
 
 
-def verify_experts(orig_loader, exp_loader, router_suffixes=ROUTER_SUFFIXES, workers=8):
-    orig_experts, orig_zero = find_expert_count(orig_loader.config)
-    exp_experts, exp_zero = find_expert_count(exp_loader.config)
+def verify_experts(orig_loader, exp_loader, router_suffixes=ALL_ROUTER_SUFFIXES, workers=8):
+    _, orig_experts, orig_zero = find_expert_count(orig_loader.config)
+    _, exp_experts, exp_zero = find_expert_count(exp_loader.config)
 
     if orig_experts == 0 or exp_experts == 0:
         return [
@@ -372,7 +322,6 @@ def verify_experts(orig_loader, exp_loader, router_suffixes=ROUTER_SUFFIXES, wor
     target_total_experts = exp_experts + exp_zero
 
     for layer_idx in exp_experts_by_layer:
-        # Check expert indices
         actual_indices = sorted(exp_experts_by_layer[layer_idx])
         expected_indices = list(range(target_total_experts))
         if actual_indices != expected_indices:
@@ -382,13 +331,12 @@ def verify_experts(orig_loader, exp_loader, router_suffixes=ROUTER_SUFFIXES, wor
                 f"got {actual_indices[:8]}{'...' if len(actual_indices) > 8 else ''}"
             ]
 
-        # Check expert parameter names (e.g., w1.weight, w2.weight)
         op = orig_expert_params.get(layer_idx, set())
         ep = exp_expert_params.get(layer_idx, set())
         if op != ep:
             return [
                 f"Layer {layer_idx}: expert parameter name mismatch. "
-                f"orig-only={op-ep}, exp-only={ep-op}"
+                f"orig-only={op - ep}, exp-only={ep - op}"
             ]
 
     print(
@@ -405,7 +353,7 @@ def verify_experts(orig_loader, exp_loader, router_suffixes=ROUTER_SUFFIXES, wor
     def verify_shard(shard_name):
         local_mismatches = []
         with safe_open(exp_loader.model_dir / shard_name,
-                       framework='pt') as sf_exp:
+                       framework="pt") as sf_exp:
             for exp_name in exp_loader.params_by_shard[shard_name]:
                 # 1. Router parameters
                 if exp_name.endswith(router_suffixes):
@@ -505,7 +453,7 @@ def verify_experts(orig_loader, exp_loader, router_suffixes=ROUTER_SUFFIXES, wor
         }
         for future in tqdm(as_completed(futures),
                            total=len(futures),
-                           desc='Verifying Shards'):
+                           desc="Verifying Shards"):
             future.result()
 
     return mismatches
@@ -513,42 +461,42 @@ def verify_experts(orig_loader, exp_loader, router_suffixes=ROUTER_SUFFIXES, wor
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Verify expanded model weights')
-    parser.add_argument('--orig_dir',
+        description="Verify expanded model weights")
+    parser.add_argument("--orig_dir",
                         type=str,
                         required=True,
-                        help='Original model directory')
-    parser.add_argument('--exp_dir',
+                        help="Original model directory")
+    parser.add_argument("--exp_dir",
                         type=str,
                         required=True,
-                        help='Expanded model directory')
-    parser.add_argument('--type',
+                        help="Expanded model directory")
+    parser.add_argument("--type",
                         type=str,
-                        choices=['layers', 'experts'],
+                        choices=["layers", "experts"],
                         required=True,
-                        help='Expansion type')
+                        help="Expansion type")
 
-    parser.add_argument('--orig_layers',
+    parser.add_argument("--orig_layers",
                         type=int,
                         default=28,
-                        help='Original number of layers')
-    parser.add_argument('--target_layers',
+                        help="Original number of layers")
+    parser.add_argument("--target_layers",
                         type=int,
                         default=56,
-                        help='Target number of layers')
-    parser.add_argument('--copy_source',
+                        help="Target number of layers")
+    parser.add_argument("--copy_source",
                         type=str,
-                        default='seq',
-                        help='Copy source mapping (seq, idx, or comma list)')
-    parser.add_argument('--router_suffixes',
+                        default="seq",
+                        help="Copy source mapping (seq, idx, or comma list)")
+    parser.add_argument("--router_suffixes",
                         type=str,
                         default=None,
-                        help='Comma-separated custom router suffixes')
+                        help="Comma-separated custom router suffixes")
 
-    parser.add_argument('--workers',
+    parser.add_argument("--workers",
                         type=int,
                         default=8,
-                        help='Number of parallel workers')
+                        help="Number of parallel workers")
     args = parser.parse_args()
 
     orig_dir = Path(args.orig_dir)
@@ -565,7 +513,7 @@ def main():
         print(f"ERROR initializing loaders: {e}")
         sys.exit(1)
 
-    if args.type == 'layers':
+    if args.type == "layers":
         try:
             mismatches = verify_layers(
                 orig_loader,
@@ -579,10 +527,10 @@ def main():
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)
     else:
-        router_suffixes = ROUTER_SUFFIXES
+        router_suffixes = ALL_ROUTER_SUFFIXES
         if args.router_suffixes:
             router_suffixes = tuple(s.strip()
-                                    for s in args.router_suffixes.split(','))
+                                    for s in args.router_suffixes.split(","))
 
         mismatches = verify_experts(
             orig_loader,
@@ -602,8 +550,8 @@ def main():
             print(f"  ... and {len(mismatches) - 50} more")
         sys.exit(1)
     else:
-        print('\n✅ Verification SUCCESSFUL! All weights match perfectly.')
+        print("\n✅ Verification SUCCESSFUL! All weights match perfectly.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

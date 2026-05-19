@@ -26,47 +26,17 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from tqdm import tqdm
 
-# Mapping from safetensors dtype string to element size in bytes
-DTYPE_SIZES: dict[str, int] = {
-    "F64": 8, "I64": 8,
-    "F32": 4, "I32": 4,
-    "F16": 2, "BF16": 2, "I16": 2,
-    "F8_E4M3": 1, "F8_E5M2": 1,
-    "F8_E4M3FN": 1, "F8_E5M2FN": 1,
-    "F8_E4M3FNUZ": 1, "F8_E5M2FNUZ": 1,
-    "I8": 1, "U8": 1, "BOOL": 1,
-}
-
-
-def load_config(model_dir: Path) -> dict:
-    with open(model_dir / "config.json") as f:
-        return json.load(f)
-
-
-def load_index(model_dir: Path) -> dict:
-    index_path = model_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        with open(index_path) as f:
-            return json.load(f)
-    return None
-
-
-def get_layer_index(param_name: str) -> int | None:
-    """Extract layer index from parameter name. Returns None for non-layer params."""
-    # Use search instead of match to handle potential prefixes like 'transformer.'
-    m = re.search(r"model\.layers\.(\d+)\.", param_name)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def set_layer_index(param_name: str, new_index: int) -> str:
-    """Change the layer index in a parameter name. e.g. model.layers.0.xxx → model.layers.5.xxx"""
-    return re.sub(
-        r"model\.layers\.(\d+)\.",
-        f"model.layers.{new_index}.",
-        param_name,
-    )
+from utils.shared import (
+    DTYPE_SIZES,
+    auto_detect_shard_size,
+    get_layer_index,
+    get_nbytes_from_meta,
+    load_config,
+    load_index,
+    read_safetensors_header,
+    set_layer_index,
+    tensor_nbytes,
+)
 
 
 def parse_copy_source(raw: str | None, num_original: int, num_new: int) -> list[int]:
@@ -164,63 +134,6 @@ def build_reverse_map(source_list: list[int], num_original: int) -> dict[int, li
         new_idx = num_original + offset
         rev[src].append(new_idx)
     return dict(rev)
-
-
-def auto_detect_shard_size(model_dir: Path, shard_files: list[str]) -> int:
-    """Detect the target shard size from existing shard files on disk.
-
-    Returns the average file size in bytes. Falls back to estimating from the
-    safetensors index if files aren't available yet.
-    """
-    # Try actual file sizes first
-    file_sizes = []
-    for fname in shard_files:
-        fpath = model_dir / fname
-        if fpath.exists():
-            file_sizes.append(fpath.stat().st_size)
-
-    if file_sizes:
-        avg_size = int(sum(file_sizes) / len(file_sizes))
-        print(f"Detected shard size from {len(file_sizes)} existing files: "
-              f"{avg_size / 1e9:.2f} GB (average)")
-        return avg_size
-
-    # Fallback: typical size for large models (will print a warning)
-    print("WARNING: No shard files found on disk. Using default 8GB target. "
-          "Output shards will match this size, not necessarily the originals.")
-    return 8 * 1024 ** 3
-
-
-def read_safetensors_header(path: Path) -> dict[str, int]:
-    """Read only the JSON header of a safetensors file, return {tensor_name: nbytes}.
-
-    The safetensors format is:
-        8 bytes: header_size (little-endian u64)
-        header_size bytes: JSON dict with keys → {dtype, shape, data_offsets}
-        remaining bytes: raw tensor data
-
-    This function reads only the header, not the tensor data, so it's fast
-    even for multi-GB files.
-    """
-    with open(path, "rb") as f:
-        header_size = int.from_bytes(f.read(8), "little")
-        header = json.loads(f.read(header_size))
-
-    result: dict[str, int] = {}
-    for key, meta in header.items():
-        if key == "__metadata__":
-            continue
-        elem_size = DTYPE_SIZES[meta["dtype"]]
-        numel = 1
-        for dim in meta["shape"]:
-            numel *= dim
-        result[key] = elem_size * numel
-    return result
-
-
-def tensor_nbytes(tensor: torch.Tensor) -> int:
-    """Return the size of a torch tensor in bytes."""
-    return tensor.element_size() * tensor.nelement()
 
 
 def main():
@@ -326,7 +239,10 @@ def main():
         if key in config:
             config[key] = target_layers
             updated_keys.append(key)
-    
+
+    if output_dir.exists() and any(output_dir.iterdir()):
+        print(f"WARNING: Output directory already exists and is not empty: {output_dir}")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(output_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
@@ -361,7 +277,8 @@ def main():
             continue
 
         header = read_safetensors_header(shard_path)
-        for key, nbytes in header.items():
+        for key, (dtype, shape) in header.items():
+            nbytes = get_nbytes_from_meta(dtype, shape)
             # Original
             if nbytes + current_bytes > target_size_bytes and current_bytes > 0:
                 num_output_shards += 1
@@ -398,7 +315,7 @@ def main():
         if not current_tensors:
             return
 
-        shard_name = f"model_{output_shard_idx:05d}-of-{num_output_shards:05d}.safetensors"
+        shard_name = f"model-{output_shard_idx:05d}-of-{num_output_shards:05d}.safetensors"
         output_path = output_dir / shard_name
         n_tensors = len(current_tensors)
         size_gb = current_bytes / 1e9
@@ -453,8 +370,8 @@ def main():
               f"Adjusting index...")
         # Fix up shard file names and the count for the index
         for i in range(1, actual_shards + 1):
-            old_name = output_dir / f"model_{i:05d}-of-{num_output_shards:05d}.safetensors"
-            new_name = output_dir / f"model_{i:05d}-of-{actual_shards:05d}.safetensors"
+            old_name = output_dir / f"model-{i:05d}-of-{num_output_shards:05d}.safetensors"
+            new_name = output_dir / f"model-{i:05d}-of-{actual_shards:05d}.safetensors"
             if old_name.exists() and old_name != new_name:
                 old_name.rename(new_name)
         num_output_shards = actual_shards
