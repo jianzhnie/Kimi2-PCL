@@ -215,3 +215,4 @@ models/k2_base.py
 prompts/
 hf_infer/
 archived/
+.claude/
