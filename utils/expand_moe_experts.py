@@ -378,16 +378,19 @@ def _pre_scan_assignments(
     expansion_factor: int,
     source_to_targets: dict[int, list[int]],
     target_experts: int,
-) -> tuple[dict[int, list[tuple[str, str, str, str]]], int, int]:
+) -> tuple[dict[int, list[tuple[str, str, str, str]]], int, int, int, int]:
     """Pre-scan all shard headers and assign each output tensor to an output shard.
 
-    Returns (shard_assignments, num_output_shards, total_output_bytes) where
-    shard_assignments maps output_shard_idx → [(input_shard, input_key, output_key, action)].
+    Returns (shard_assignments, num_output_shards, total_output_bytes,
+             total_original, total_duplicated) where shard_assignments maps
+    output_shard_idx → [(input_shard, input_key, output_key, action)].
     """
     total_routed = original_experts + zero_expert_num
     current_shard = 0
     current_bytes = 0
     total_output_bytes = 0
+    total_original = 0
+    total_duplicated = 0
     assignments: dict[int, list[tuple[str, str, str, str]]] = defaultdict(list)
 
     for shard_file in tqdm(shard_files, desc="Pre-scanning"):
@@ -408,9 +411,13 @@ def _pre_scan_assignments(
                     (shard_file, key, output_key, action))
                 current_bytes += output_nbytes
                 total_output_bytes += output_nbytes
+                if action == "clone":
+                    total_duplicated += 1
+                else:
+                    total_original += 1
 
     num_output_shards = current_shard + 1 if assignments else 0
-    return dict(assignments), num_output_shards, total_output_bytes
+    return dict(assignments), num_output_shards, total_output_bytes, total_original, total_duplicated
 
 
 def _write_output_shard(args):
@@ -431,26 +438,31 @@ def _write_output_shard(args):
         by_input[sfile].append((in_key, out_key, action))
 
     tensors: dict[str, torch.Tensor] = {}
-    for sfile, items in by_input.items():
-        with safe_open(str(model_dir / sfile), framework="pt", device="cpu") as sf:
-            for in_key, out_key, action in items:
-                tensor = sf.get_tensor(in_key)
-                if action == "keep":
-                    tensors[out_key] = tensor
-                elif action == "clone":
-                    tensors[out_key] = tensor.clone()
-                elif action == "router_weight":
-                    tensors[out_key] = expand_router_weight(
-                        tensor, original_experts, zero_expert_num,
-                        expansion_factor, noise_scale,
-                    )
-                elif action == "router_bias":
-                    tensors[out_key] = expand_router_bias(
-                        tensor, original_experts, zero_expert_num,
-                        expansion_factor,
-                    )
+    try:
+        for sfile, items in by_input.items():
+            with safe_open(str(model_dir / sfile), framework="pt", device="cpu") as sf:
+                for in_key, out_key, action in items:
+                    tensor = sf.get_tensor(in_key)
+                    if action == "keep":
+                        tensors[out_key] = tensor
+                    elif action == "clone":
+                        tensors[out_key] = tensor.clone()
+                    elif action == "router_weight":
+                        tensors[out_key] = expand_router_weight(
+                            tensor, original_experts, zero_expert_num,
+                            expansion_factor, noise_scale,
+                        )
+                    elif action == "router_bias":
+                        tensors[out_key] = expand_router_bias(
+                            tensor, original_experts, zero_expert_num,
+                            expansion_factor,
+                        )
 
-    save_file(tensors, str(output_path))
+        save_file(tensors, str(output_path))
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to write output shard {output_path.name}: {e}"
+        ) from e
     return [(name, output_path.name) for name in tensors]
 
 
@@ -544,47 +556,34 @@ def main():
         json.dump(new_config, f, indent=2, ensure_ascii=False)
     print("Updated config.json written.")
 
-    # ── Pass 1: Plan output layout ──────────────────────────────────────
-    print("\nPass 1/2: Scanning headers to determine output layout...")
     target_shard_size = auto_detect_shard_size(model_dir, shard_files)
     print(f"Target shard size: {target_shard_size / 1e9:.2f} GB")
-
-    num_output_shards, total_output_bytes, total_original, total_duplicated = plan_output_layout(
-        model_dir, shard_files, target_shard_size,
-        original_experts, zero_expert_num, target_experts,
-        expansion_factor, source_to_targets,
-    )
-
-    print(
-        f"Output plan: {total_original:,} original + {total_duplicated:,} duplicated "
-        f"= {total_original + total_duplicated:,} tensors"
-    )
-    print(
-        f"Planned output size: {total_output_bytes / 1e9:.2f} GB across "
-        f"{num_output_shards} shard(s) "
-        f"(~{total_output_bytes / num_output_shards / 1e9:.2f} GB each)"
-    )
 
     workers = args.workers if args.workers > 0 else (__import__("os").cpu_count() or 4)
     if workers > 1:
         print(f"Parallel mode: {workers} workers for output shard writing")
 
-    # ── Pass 2: Process and write ───────────────────────────────────────
     new_weight_map: dict[str, str] = {}
 
     if workers > 1:
-        # ---- Parallel path ----
-        assignments_by_shard, num_output_shards_ps, _ = _pre_scan_assignments(
+        # ---- Parallel path: single scan for planning + assignment ----
+        print("\nPass 1/2: Scanning headers and assigning tensors to output shards...")
+        (assignments_by_shard, num_output_shards, total_output_bytes,
+         total_original, total_duplicated) = _pre_scan_assignments(
             model_dir, shard_files, target_shard_size,
             original_experts, zero_expert_num, expansion_factor,
             source_to_targets, target_experts,
         )
-        if num_output_shards_ps != num_output_shards:
-            print(
-                f"  Pre-scan predicted {num_output_shards_ps} shards "
-                f"(Pass 1 predicted {num_output_shards}), using pre-scan value."
-            )
-            num_output_shards = num_output_shards_ps
+
+        print(
+            f"Output plan: {total_original:,} original + {total_duplicated:,} duplicated "
+            f"= {total_original + total_duplicated:,} tensors"
+        )
+        print(
+            f"Planned output size: {total_output_bytes / 1e9:.2f} GB across "
+            f"{num_output_shards} shard(s) "
+            f"(~{total_output_bytes / num_output_shards / 1e9:.2f} GB each)"
+        )
 
         tasks = []
         for shard_idx in sorted(assignments_by_shard):
@@ -600,9 +599,11 @@ def main():
                 args.noise_scale,
             ))
 
+        print("\nPass 2/2: Writing output shards...")
+        chunksize = max(1, len(tasks) // workers)
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = list(tqdm(
-                executor.map(_write_output_shard, tasks),
+                executor.map(_write_output_shard, tasks, chunksize=chunksize),
                 total=len(tasks),
                 desc="Writing output shards",
             ))
@@ -610,7 +611,24 @@ def main():
                 for name, shard_name in weight_entries:
                     new_weight_map[name] = shard_name
     else:
-        # ---- Serial path (original behaviour) ----
+        # ---- Serial path ----
+        print("\nPass 1/2: Scanning headers to determine output layout...")
+        num_output_shards, total_output_bytes, total_original, total_duplicated = plan_output_layout(
+            model_dir, shard_files, target_shard_size,
+            original_experts, zero_expert_num, target_experts,
+            expansion_factor, source_to_targets,
+        )
+
+        print(
+            f"Output plan: {total_original:,} original + {total_duplicated:,} duplicated "
+            f"= {total_original + total_duplicated:,} tensors"
+        )
+        print(
+            f"Planned output size: {total_output_bytes / 1e9:.2f} GB across "
+            f"{num_output_shards} shard(s) "
+            f"(~{total_output_bytes / num_output_shards / 1e9:.2f} GB each)"
+        )
+
         output_shard_idx = 1
         current_tensors: dict[str, torch.Tensor] = {}
         current_bytes = 0
