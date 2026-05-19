@@ -27,71 +27,16 @@ from safetensors.torch import save_file
 from tqdm import tqdm
 
 from utils.shared import (
-    DTYPE_SIZES,
     auto_detect_shard_size,
     get_layer_index,
     get_nbytes_from_meta,
     load_config,
     load_index,
+    parse_copy_source,
     read_safetensors_header,
     set_layer_index,
     tensor_nbytes,
 )
-
-
-def parse_copy_source(raw: str | None, num_original: int, num_new: int) -> list[int]:
-    """Parse --copy_source into a list mapping: new_layer_idx → source_layer_idx.
-
-    new_layer_idx runs from num_original to num_original + num_new - 1.
-
-    Formats:
-      None / "seq"  →  sequential: [0, 1, 2, …, wrapping if num_new > num_original]
-      "5"           →  all new layers copy from layer 5
-      "0,0,1,1,…"   →  explicit list, must have exactly num_new entries
-    """
-    if raw is None or raw.strip().lower() == "seq":
-        return [i % num_original for i in range(num_new)]
-
-    raw = raw.strip()
-    # Single integer → all new layers copy from that source
-    try:
-        single = int(raw)
-        if single < 0 or single >= num_original:
-            print(
-                f"ERROR: --copy_source {single} is out of range "
-                f"[0, {num_original - 1}].",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        return [single] * num_new
-    except ValueError:
-        pass
-
-    # Comma-separated list
-    parts = [p.strip() for p in raw.split(",")]
-    if len(parts) != num_new:
-        print(
-            f"ERROR: --copy_source list has {len(parts)} entries, "
-            f"expected {num_new} (one per new layer).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    try:
-        result = [int(p) for p in parts]
-    except ValueError as e:
-        print(f"ERROR: Invalid integer in --copy_source: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Validate all source indices are in range
-    for i, src in enumerate(result):
-        if src < 0 or src >= num_original:
-            print(
-                f"ERROR: --copy_source[{i}] = {src} is out of range "
-                f"[0, {num_original - 1}].",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-    return result
 
 
 def validate_layer_layout(index: dict, original_layers: int) -> list[int]:
@@ -211,7 +156,11 @@ def main():
     actual_max = actual_layers[-1]
 
     # ── Parse copy source mapping ────────────────────────────────────────
-    source_list = parse_copy_source(args.copy_source, original_layers, num_new)
+    try:
+        source_list = parse_copy_source(args.copy_source, original_layers, num_new)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
     # Reverse map: source_layer → [target new layer indices]
     source_to_targets = build_reverse_map(source_list, original_layers)
 

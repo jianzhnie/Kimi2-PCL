@@ -8,7 +8,6 @@ Supports:
 """
 
 import argparse
-import json
 import sys
 import threading
 from collections import defaultdict
@@ -21,59 +20,15 @@ from tqdm import tqdm
 
 from utils.shared import (
     ALL_ROUTER_SUFFIXES,
-    EXPERT_COUNT_KEYS,
     find_expert_count,
     get_expert_info,
     get_layer_index,
-    is_router_param,
+    load_config,
     load_index,
+    make_expert_key,
+    parse_copy_source,
     set_layer_index,
 )
-
-
-def load_config(model_dir: Path) -> dict:
-    config_path = model_dir / "config.json"
-    if not config_path.exists():
-        raise FileNotFoundError(f"config.json not found in {model_dir}")
-    with open(config_path) as f:
-        return json.load(f)
-
-
-def parse_copy_source(raw: str | None, num_original: int,
-                      num_new: int) -> list[int]:
-    """Parse --copy_source into a mapping: offset_from_original -> source_layer_idx.
-
-    Validates that all source indices are within [0, num_original). Raises ValueError
-    on invalid input.
-    """
-    if raw is None or raw.strip().lower() == "seq":
-        return [i % num_original for i in range(num_new)]
-
-    raw = raw.strip()
-    try:
-        single = int(raw)
-        if single < 0 or single >= num_original:
-            raise ValueError(
-                f"--copy_source {single} is out of range [0, {num_original - 1}].")
-        return [single] * num_new
-    except ValueError as e:
-        if "out of range" in str(e):
-            raise e
-
-    try:
-        parts = [int(p.strip()) for p in raw.split(",")]
-    except ValueError:
-        raise ValueError(f"Invalid --copy_source format: {raw}")
-
-    if len(parts) != num_new:
-        raise ValueError(
-            f"--copy_source list has {len(parts)} entries, expected {num_new} (one per new layer).")
-
-    for i, src in enumerate(parts):
-        if src < 0 or src >= num_original:
-            raise ValueError(
-                f"--copy_source[{i}] = {src} is out of range [0, {num_original - 1}].")
-    return parts
 
 
 # --- ModelWeightLoader ---
@@ -404,15 +359,11 @@ def verify_experts(orig_loader, exp_loader, router_suffixes=ALL_ROUTER_SUFFIXES,
                         src_name = exp_name
                     elif e_idx < exp_experts:
                         src_e_idx = e_idx % orig_experts
-                        src_name = (
-                            f"model.layers.{l_idx}.mlp.experts.{src_e_idx}.{rest}"
-                        )
+                        src_name = make_expert_key(l_idx, src_e_idx, rest)
                     else:
                         # Zero-expert: source is the corresponding original zero-expert
                         src_e_idx = orig_experts + ((e_idx - exp_experts) % orig_zero)
-                        src_name = (
-                            f"model.layers.{l_idx}.mlp.experts.{src_e_idx}.{rest}"
-                        )
+                        src_name = make_expert_key(l_idx, src_e_idx, rest)
 
                     t_exp = sf_exp.get_tensor(exp_name)
                     t_orig = orig_loader.get_tensor(src_name)

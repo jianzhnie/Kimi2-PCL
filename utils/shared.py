@@ -29,7 +29,10 @@ ALL_ROUTER_SUFFIXES = ROUTER_WEIGHT_SUFFIXES + ROUTER_BIAS_SUFFIXES
 
 
 def load_config(model_dir: Path) -> dict:
-    with open(model_dir / "config.json") as f:
+    config_path = model_dir / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"config.json not found in {model_dir}")
+    with open(config_path) as f:
         return json.load(f)
 
 
@@ -123,6 +126,54 @@ def read_safetensors_header(path: Path) -> dict[str, tuple[str, list[int]]]:
             continue
         result[key] = (meta["dtype"], meta["shape"])
     return result
+
+
+def make_expert_key(layer_idx: int, expert_idx: int, rest: str) -> str:
+    """Construct an expert parameter key from its components."""
+    return f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{rest}"
+
+
+def parse_copy_source(raw: str | None, num_original: int, num_new: int) -> list[int]:
+    """Parse --copy_source into a mapping: offset → source_layer_index.
+
+    offset runs from 0 to num_new - 1 (maps to target layers num_original + offset).
+
+    Formats:
+      None / "seq"  →  sequential: offset i → layer (i mod num_original)
+      "5"           →  all new layers copy from layer 5
+      "0,0,1,1,…"   →  explicit list, must have exactly num_new entries
+
+    Raises ValueError on invalid input.
+    """
+    if raw is None or raw.strip().lower() == "seq":
+        return [i % num_original for i in range(num_new)]
+
+    raw = raw.strip()
+    try:
+        single = int(raw)
+        if single < 0 or single >= num_original:
+            raise ValueError(
+                f"--copy_source {single} is out of range [0, {num_original - 1}]")
+        return [single] * num_new
+    except ValueError as e:
+        if "out of range" in str(e):
+            raise
+
+    try:
+        parts = [int(p.strip()) for p in raw.split(",")]
+    except ValueError:
+        raise ValueError(f"Invalid --copy_source format: {raw}")
+
+    if len(parts) != num_new:
+        raise ValueError(
+            f"--copy_source list has {len(parts)} entries, expected {num_new} "
+            f"(one per new layer)")
+
+    for i, src in enumerate(parts):
+        if src < 0 or src >= num_original:
+            raise ValueError(
+                f"--copy_source[{i}] = {src} is out of range [0, {num_original - 1}]")
+    return parts
 
 
 def auto_detect_shard_size(model_dir: Path, shard_files: list[str]) -> int:

@@ -45,6 +45,7 @@ from utils.shared import (
     is_router_weight,
     load_config,
     load_index,
+    make_expert_key,
     read_safetensors_header,
     tensor_nbytes,
 )
@@ -66,11 +67,6 @@ def build_expert_target_map(
         src_idx = new_idx % original_experts
         targets[src_idx].append(new_idx)
     return dict(targets)
-
-
-def make_expert_key(layer_idx: int, expert_idx: int, rest: str) -> str:
-    """Construct an expert parameter key from its components."""
-    return f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{rest}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
